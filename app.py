@@ -716,10 +716,10 @@ def api_state():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify(state)
 
+# Start trading thread when module loads (works with both direct and gunicorn)
+_trader_thread = threading.Thread(target=trading_loop, daemon=True)
+_trader_thread.start()
+
 if __name__ == "__main__":
-    # Start trading in background thread
-    t = threading.Thread(target=trading_loop, daemon=True)
-    t.start()
-    # Start web server
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
