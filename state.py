@@ -1,11 +1,12 @@
 """
 Shared state between strategy.py and dashboard.py
-Persisted to hl_state.json so both processes share data
+Uses a simple JSON file — works on Railway with persistent volume
+or falls back to in-memory for the dashboard to read via /api/state
 """
-import json, os
+import json, os, time
 from datetime import datetime, timezone
 
-STATE_FILE = "hl_state.json"
+STATE_FILE = "/tmp/hl_state.json"  # /tmp is shared between processes on Railway
 
 DEFAULT = {
     "status":         "starting",
@@ -21,6 +22,23 @@ DEFAULT = {
     "trades":         [],
     "diagnostics":    [],
     "weekly_pnl":     {},
+    "health": {
+        "api_connected":    False,
+        "last_ping":        None,
+        "assets_ok":        {},
+        "params": {
+            "ema":          "5/13/34",
+            "stop_pct":     "5%",
+            "trail_pct":    "1%",
+            "vol_filter":   "1.5x",
+            "sep_filter":   "0.003",
+            "brk_bars":     "12",
+            "candle_tf":    "15m",
+            "check_every":  "60s",
+            "leverage":     "3x",
+            "assets":       "BTC,ETH,SOL,BNB",
+        }
+    },
     "tax": {
         "total_pnl":      0.0,
         "total_tax":      0.0,
@@ -32,20 +50,26 @@ DEFAULT = {
 }
 
 def load():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                return json.load(f)
-        except:
-            pass
+    for path in [STATE_FILE, "hl_state.json"]:
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                    # Merge with defaults to handle new fields
+                    merged = dict(DEFAULT)
+                    merged.update(data)
+                    return merged
+            except:
+                pass
     return dict(DEFAULT)
 
 def save(st):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(st, f, indent=2, default=str)
-    except:
-        pass
+    for path in [STATE_FILE, "hl_state.json"]:
+        try:
+            with open(path, "w") as f:
+                json.dump(st, f, indent=2, default=str)
+        except:
+            pass
 
 def add_diagnostic(st, level, event, cause, action):
     entry = {
@@ -77,6 +101,5 @@ def add_trade(st, asset, action, direction, entry, exit_p, size, lev, pnl, reaso
     st["trades"] = st["trades"][:500]
     if pnl is not None:
         wk = datetime.now(timezone.utc).strftime("%Y-W%W")
-        st["weekly_pnl"][wk] = round(
-            st["weekly_pnl"].get(wk, 0) + pnl, 4)
+        st["weekly_pnl"][wk] = round(st["weekly_pnl"].get(wk, 0) + pnl, 4)
     save(st)
