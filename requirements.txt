@@ -3,3 +3,4 @@ eth-account
 requests
 flask
 flask-cors
+gunicorn
