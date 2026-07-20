@@ -379,23 +379,18 @@ def evaluate_signal(candles,asset):
     ef=ema(closes,EMA_FAST); em2=ema(closes,EMA_MID); es=ema(closes,EMA_SLOW)
     vs=sma(vols,20); u=bbu(closes); l=bbl(closes); i=len(candles)-1
 
-    # EMA stack
+    # EMA stack — FORCED LONG FOR EXECUTION TEST
+    d="LONG"  # TEMP: remove this line after confirming trading loop fires
     if ef[i] and em2[i] and es[i]:
         if   ef[i]>em2[i]>es[i]: d="LONG"
         elif ef[i]<em2[i]<es[i]: d="SHORT"
-        else: d=None
-    else: d=None
-    filters["ema_stack"]={"pass":d is not None,"value":d or "flat",
-                          "detail":f"EMA5={ef[i]:.2f} EMA13={em2[i]:.2f} EMA34={es[i]:.2f}" if ef[i] else "no data"}
-
-    if not d:
-        return None,None,0,0,filters
+        else: d="LONG"  # TEMP: force LONG even when flat
+    filters["ema_stack"]={"pass":True,"value":f"FORCED LONG (test)","detail":"EMA override active"}
 
     # Separation
     sep=abs(ef[i]-es[i])/es[i] if es[i] else 0
-    sep_ok=sep>=SEP_FILTER
-    filters["separation"]={"pass":sep_ok,"value":f"{sep:.4f}","need":f">={SEP_FILTER}"}
-    if not sep_ok: return None,None,0,0,filters
+    sep_ok=True  # TEMP: bypassed for execution test
+    filters["separation"]={"pass":sep_ok,"value":f"{sep:.4f} (bypassed)","need":f">={SEP_FILTER}"}
 
     # Volume
     vol=vols[i]; vr=vol/vs[i] if vs[i] else 0
