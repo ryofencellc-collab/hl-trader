@@ -1375,104 +1375,111 @@ def force_trade():
 @app.route("/force-trade-all")
 def force_trade_all():
     if not session.get("ok"): return redirect("/")
-    all_results={}
-    for asset in ASSETS:
-        results=[]; fill_price=0; close_price=0; qty=0; price=0
-        def step(name,fn,a=asset):
+
+    def test_asset(asset):
+        results=[]; state={"price":0,"qty":0,"fill":0,"close":0}
+
+        def step(name,fn):
             try:
-                ok,detail=fn(); results.append({"name":name,"ok":ok,"detail":detail}); return ok
+                ok,detail=fn()
+                results.append({"name":name,"ok":ok,"detail":detail})
+                return ok
             except Exception as e:
-                results.append({"name":name,"ok":False,"detail":str(e)}); return False
+                results.append({"name":name,"ok":False,"detail":str(e)})
+                return False
 
-        def s1(a=asset):
-            nonlocal price
-            mids=info.all_mids(); price=float(mids.get(a,0))
-            return price>0,f"${price:,.4f}"
-        step(f"Get {asset} price",s1)
+        def get_price():
+            mids=info.all_mids()
+            state["price"]=float(mids.get(asset,0))
+            return state["price"]>0,f"${state['price']:,.4f}"
+        step(f"Get {asset} price",get_price)
 
-        def s2(a=asset):
-            nonlocal qty
+        def calc_size():
             meta=info.meta()
-            dec=next((x.get("szDecimals",5) for x in meta["universe"] if x["name"]==a),5)
-            raw=10.0/price if price>0 else 0
-            qty=round(raw,dec)
-            if qty*price<10: qty=round(qty*1.1+10/price,dec)
-            return qty*price>=10,f"{qty} {a} (${qty*price:.2f} notional)"
-        step(f"Calculate {asset} size (min $10)",s2)
+            dec=next((x.get("szDecimals",5) for x in meta["universe"] if x["name"]==asset),5)
+            p=state["price"]
+            if p<=0: return False,"No price"
+            raw=round(10.0/p,dec)
+            if raw*p<10: raw=round(raw+1/p,dec)
+            state["qty"]=raw
+            return raw*p>=10,f"{raw} {asset} (${raw*p:.2f} notional)"
+        step(f"Calculate size (min $10)",calc_size)
 
-        def s3(a=asset):
-            nonlocal fill_price
-            r=exchange.market_open(a,True,qty)
+        def place_order():
+            r=exchange.market_open(asset,True,state["qty"])
             ok=r and r.get("status")=="ok"
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if ok else []
+            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
             if statuses and "error" in statuses[0]:
-                return False,f"Exchange error: {statuses[0]['error']}"
+                return False,f"Rejected: {statuses[0]['error']}"
             if ok and statuses and "filled" in statuses[0]:
-                fill_price=float(statuses[0]["filled"]["avgPx"])
-            return ok,f"Filled @ ${fill_price:,.4f}" if ok else str(r)
-        step(f"Place {asset} LONG order",s3)
+                state["fill"]=float(statuses[0]["filled"]["avgPx"])
+            return ok,f"Filled @ ${state['fill']:,.4f}" if ok else f"Failed: {r}"
+        step(f"Place LONG order",place_order)
 
-        def s4(a=asset):
+        def verify_entry():
             time.sleep(15)
             s=info.user_state(MAIN_WALLET)
             for p in s.get("assetPositions",[]):
-                if p["position"]["coin"]==a and float(p["position"]["szi"])!=0:
+                if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
                     return True,f"Confirmed @ ${float(p['position']['entryPx']):,.4f}"
-            return False,f"NOT visible after 15s — order rejected or delayed"
-        step(f"Verify {asset} on exchange",s4)
+            return False,"NOT visible after 15s"
+        step(f"Verify on exchange",verify_entry)
 
-        def s5(a=asset):
+        def hold():
             time.sleep(10)
-            mids=info.all_mids(); cur=float(mids.get(a,fill_price))
-            pnl=(cur-fill_price)*qty if fill_price>0 else 0
+            mids=info.all_mids()
+            cur=float(mids.get(asset,state["fill"]))
+            pnl=(cur-state["fill"])*state["qty"] if state["fill"]>0 else 0
             return True,f"Held 10s | cur=${cur:,.4f} | P&L=${pnl:+.4f}"
-        step(f"Hold {asset} position",s5)
+        step(f"Hold position",hold)
 
-        def s6(a=asset):
-            nonlocal close_price
-            r=exchange.market_close(a)
+        def close_pos():
+            r=exchange.market_close(asset)
             ok=r and r.get("status")=="ok"
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if ok else []
+            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
             if statuses and "error" in statuses[0]:
-                return False,f"Exchange error: {statuses[0]['error']}"
+                return False,f"Rejected: {statuses[0]['error']}"
             if ok and statuses and "filled" in statuses[0]:
-                close_price=float(statuses[0]["filled"]["avgPx"])
-            return ok,f"Closed @ ${close_price:,.4f}" if ok else str(r)
-        step(f"Close {asset} position",s6)
+                state["close"]=float(statuses[0]["filled"]["avgPx"])
+            return ok,f"Closed @ ${state['close']:,.4f}" if ok else f"Failed: {r}"
+        step(f"Close position",close_pos)
 
-        def s7(a=asset):
+        def verify_closed():
             time.sleep(5)
             s=info.user_state(MAIN_WALLET)
             still=[p for p in s.get("assetPositions",[])
-                   if p["position"]["coin"]==a and float(p["position"]["szi"])!=0]
-            return len(still)==0,f"Confirmed closed ✅" if len(still)==0 else f"Still open ❌"
-        step(f"Verify {asset} closed",s7)
+                   if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
+            return len(still)==0,"Confirmed closed ✅" if len(still)==0 else "Still open ❌"
+        step(f"Verify closed",verify_closed)
 
-        def s8(a=asset):
-            if fill_price>0 and close_price>0:
-                pnl=(close_price-fill_price)*qty
-                return True,f"Entry ${fill_price:,.4f} → Exit ${close_price:,.4f} | P&L ${pnl:+.4f}"
-            return False,"Could not calculate P&L"
-        step(f"P&L calculation",s8)
+        def calc_pnl():
+            f=state["fill"]; c=state["close"]; q=state["qty"]
+            if f>0 and c>0:
+                pnl=(c-f)*q
+                return True,f"Entry ${f:,.4f} → Exit ${c:,.4f} | P&L ${pnl:+.4f}"
+            return False,"Could not calculate"
+        step(f"P&L calculation",calc_pnl)
 
-        passed=sum(1 for r in results if r["ok"])
-        all_results[asset]={"results":results,"passed":passed,"total":len(results)}
+        return results
+
+    all_results={}
+    for asset in ASSETS:
+        all_results[asset]=test_asset(asset)
         time.sleep(2)
 
-    # Build HTML
-    total_pass=sum(1 for r in all_results.values() if r["passed"]==r["total"])
+    total_pass=sum(1 for results in all_results.values() if all(r["ok"] for r in results))
     all_pass=total_pass==len(ASSETS)
 
     assets_html=""
-    for asset,data in all_results.items():
-        passed=data["passed"]; total=data["total"]; ok=passed==total
+    for asset,results in all_results.items():
+        passed=sum(1 for r in results if r["ok"]); total=len(results); ok=passed==total
         rows="".join(f'''
         <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1E2D42">
           <div style="font-size:14px;flex-shrink:0">{"✅" if r["ok"] else "❌"}</div>
           <div style="flex:1"><div style="font-size:12px;font-weight:600">{r["name"]}</div>
           <div style="font-size:11px;color:#4A5878;font-family:monospace">{r["detail"]}</div></div>
           <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba({"0,214,143" if r["ok"] else "255,71,87"},0.15);color:{"#00D68F" if r["ok"] else "#FF4757"}">{"PASS" if r["ok"] else "FAIL"}</span>
-        </div>''' for r in data["results"])
+        </div>''' for r in results)
         assets_html+=f'''
         <div style="background:#0F1520;border:2px solid {"#00D68F" if ok else "#FF4757"};border-radius:16px;padding:16px;margin-bottom:12px">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
