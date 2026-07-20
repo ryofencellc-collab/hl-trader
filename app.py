@@ -407,38 +407,21 @@ def evaluate_signal(candles,asset):
         brk_ok=True; brk_val="bypassed (BRK_BARS=0)"
     filters["breakout"]={"pass":brk_ok,"value":brk_val}
 
-    # BB filter
+    # BB filter — BYPASSED FOR EXECUTION TEST
     if cfg["bb"]:
-        if u[i] and l[i]:
-            bb_ok=(closes[i]>u[i] if d=="LONG" else closes[i]<l[i])
-            bb_val=(f"close {closes[i]:.2f} {'>' if d=='LONG' else '<'} BB {'upper' if d=='LONG' else 'lower'} {(u[i] if d=='LONG' else l[i]):.2f}")
-        else: bb_ok=False; bb_val="BB not calculated"
-        filters["bb_breakout"]={"pass":bb_ok,"value":bb_val}
+        filters["bb_breakout"]={"pass":True,"value":"bypassed (execution test)"}
     else:
         filters["bb_breakout"]={"pass":True,"value":"not required"}
 
-    # Strong close
+    # Strong close — BYPASSED FOR EXECUTION TEST
     if cfg["sc"]:
-        br=float(candles[i]["h"])-float(candles[i]["l"])
-        if br>0:
-            cp=(closes[i]-float(candles[i]["l"]))/br
-            sc_ok=(cp>=0.70 if d=="LONG" else cp<=0.30)
-            sc_val=f"close pct={cp:.2f} ({'≥0.70' if d=='LONG' else '≤0.30'} needed)"
-        else: sc_ok=False; sc_val="zero range candle"
-        filters["strong_close"]={"pass":sc_ok,"value":sc_val}
+        filters["strong_close"]={"pass":True,"value":"bypassed (execution test)"}
     else:
         filters["strong_close"]={"pass":True,"value":"not required"}
 
-    # Regime
+    # Regime — BYPASSED FOR EXECUTION TEST
     if cfg["regime"]:
-        try:
-            lkp,atr_v=atr_lookup(candles)
-            if lkp[i] and atr_v[i]:
-                reg_ok=atr_v[i]>lkp[i]*1.2
-                reg_val=f"ATR={atr_v[i]:.4f} vs MA={lkp[i]:.4f} (need >1.2x)"
-            else: reg_ok=True; reg_val="ATR MA not ready — skipping"
-        except: reg_ok=True; reg_val="error — skipping"
-        filters["regime"]={"pass":reg_ok,"value":reg_val}
+        filters["regime"]={"pass":True,"value":"bypassed (execution test)"}
     else:
         filters["regime"]={"pass":True,"value":"not required"}
 
