@@ -515,8 +515,14 @@ def enter_trade(asset,direction,price,vol,vs,ef,es):
 
     try:
         r=exchange.market_open(asset,direction=="LONG",qty)
+        log(f"📋 Exchange response for {asset}: {r}")
         if r and r.get("status")=="ok":
             statuses=r.get("response",{}).get("data",{}).get("statuses",[])
+            log(f"📋 Statuses for {asset}: {statuses}")
+            if statuses and "error" in statuses[0]:
+                add_diag("ERROR",f"Order rejected {asset}",statuses[0]["error"],"Skipping")
+                add_audit(asset,"ORDER REJECTED",f"Exchange error: {statuses[0]['error']}")
+                return
             fill=price
             if statuses and "filled" in statuses[0]:
                 fill=float(statuses[0]["filled"]["avgPx"])
