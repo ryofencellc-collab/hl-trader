@@ -1065,6 +1065,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <a href="/force-trade" style="display:block;text-align:center;background:#0F1520;border:1px solid #FFB800;border-radius:12px;padding:12px;color:#FFB800;font-size:12px;font-weight:700;text-decoration:none">⚡ Force</a>
     <a href="/signal-check" style="display:block;text-align:center;background:#0F1520;border:1px solid #3D9EFF;border-radius:12px;padding:12px;color:#3D9EFF;font-size:12px;font-weight:700;text-decoration:none">📡 Signals</a>
   </div>
+  <a href="/execution-test" style="display:block;text-align:center;background:rgba(255,184,0,0.15);border:2px solid #FFB800;border-radius:12px;padding:14px;color:#FFB800;font-size:14px;font-weight:700;text-decoration:none;margin-bottom:12px">⚡ EXECUTION TEST — All 6 Assets</a>
   <a href="/log" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:12px;color:#4A5878;font-size:13px;text-decoration:none;margin-bottom:12px">📋 Export Log</a>
   <div class="card">
     {row("Cycle",f"#{s['cycle']}")}{row("Last check",s["last_check"] or "—")}{row("Next check",s["next_check"] or "—")}{row("Mode",mode)}{row("Assets",", ".join(s["assets"]))}
@@ -1771,6 +1772,143 @@ def exit_test():
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
     <a href="/exit-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #00D68F;border-radius:12px;padding:14px;color:#00D68F;font-size:13px;font-weight:600;text-decoration:none">🔄 Run Again</a>
     <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#4A5878;font-size:13px;font-weight:600;text-decoration:none">← Tests</a>
+  </div>
+</div></body></html>'''
+
+@app.route("/execution-test")
+def execution_test():
+    if not session.get("ok"): return redirect("/")
+    """
+    Pure execution test — no filters, no market conditions.
+    For each asset: wait 30s, enter, wait 30s, exit, confirm.
+    Answers: can the system place AND close trades on all 6 assets?
+    """
+    results={}
+
+    def test_asset(asset):
+        steps=[]; st={"fill":0,"close":0,"qty":0}
+
+        def step(name,fn):
+            try:
+                ok,detail=fn()
+                steps.append({"name":name,"ok":ok,"detail":detail})
+                return ok
+            except Exception as e:
+                steps.append({"name":name,"ok":False,"detail":str(e)})
+                return False
+
+        def get_size():
+            mids=info.all_mids()
+            price=float(mids.get(asset,0))
+            if price<=0: return False,f"No price for {asset}"
+            meta=info.meta()
+            dec=next((x.get("szDecimals",5) for x in meta["universe"] if x["name"]==asset),5)
+            # Minimum $10 order
+            qty=round(10.0/price,dec)
+            while qty*price<10: qty=round(qty+10/price,dec)
+            st["qty"]=qty
+            return True,f"${price:,.4f} | size={qty} (${qty*price:.2f})"
+        step("Get price & size",get_size)
+
+        def enter():
+            r=exchange.market_open(asset,True,st["qty"])
+            ok=r and r.get("status")=="ok"
+            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
+            if statuses and "error" in statuses[0]:
+                return False,f"Rejected: {statuses[0]['error']}"
+            if ok and statuses and "filled" in statuses[0]:
+                st["fill"]=float(statuses[0]["filled"]["avgPx"])
+            return ok,f"Filled @ ${st['fill']:,.4f}" if ok else f"Failed: {r}"
+        step("Place LONG order",enter)
+
+        def verify_open():
+            time.sleep(15)
+            s=info.user_state(MAIN_WALLET)
+            for p in s.get("assetPositions",[]):
+                if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
+                    return True,f"Confirmed open @ ${float(p['position']['entryPx']):,.4f}"
+            return False,"NOT visible after 15s"
+        step("Verify open on exchange",verify_open)
+
+        def hold():
+            time.sleep(30)
+            mids=info.all_mids()
+            cur=float(mids.get(asset,st["fill"]))
+            pnl=(cur-st["fill"])*st["qty"] if st["fill"]>0 else 0
+            return True,f"Held 30s | cur=${cur:,.4f} | P&L=${pnl:+.4f}"
+        step("Hold 30 seconds",hold)
+
+        def close():
+            r=exchange.market_close(asset)
+            ok=r and r.get("status")=="ok"
+            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
+            if statuses and "error" in statuses[0]:
+                return False,f"Rejected: {statuses[0]['error']}"
+            if ok and statuses and "filled" in statuses[0]:
+                st["close"]=float(statuses[0]["filled"]["avgPx"])
+            return ok,f"Closed @ ${st['close']:,.4f}" if ok else f"Failed: {r}"
+        step("Close position",close)
+
+        def verify_closed():
+            time.sleep(10)
+            s=info.user_state(MAIN_WALLET)
+            still=[p for p in s.get("assetPositions",[])
+                   if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
+            closed=len(still)==0
+            pnl=(st["close"]-st["fill"])*st["qty"] if st["fill"]>0 and st["close"]>0 else 0
+            return closed,f"{'Confirmed closed ✅' if closed else 'Still open ❌'} | P&L=${pnl:+.4f}"
+        step("Verify closed + P&L",verify_closed)
+
+        return steps
+
+    for asset in ASSETS:
+        results[asset]=test_asset(asset)
+        time.sleep(1)
+
+    # Build results HTML
+    total_assets=len(ASSETS)
+    passed_assets=sum(1 for steps in results.values() if all(s["ok"] for s in steps))
+    all_pass=passed_assets==total_assets
+
+    assets_html=""
+    for asset,steps in results.items():
+        passed=sum(1 for s in steps if s["ok"]); total=len(steps); ok=passed==total
+        rows="".join(f'''
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1E2D42">
+          <div style="font-size:14px;flex-shrink:0">{"✅" if s["ok"] else "❌"}</div>
+          <div style="flex:1">
+            <div style="font-size:12px;font-weight:600">{s["name"]}</div>
+            <div style="font-size:11px;color:#4A5878;font-family:monospace">{s["detail"]}</div>
+          </div>
+          <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba({"0,214,143" if s["ok"] else "255,71,87"},0.15);color:{"#00D68F" if s["ok"] else "#FF4757"}">{"PASS" if s["ok"] else "FAIL"}</span>
+        </div>''' for s in steps)
+        assets_html+=f'''
+        <div style="background:#0F1520;border:2px solid {"#00D68F" if ok else "#FF4757"};border-radius:16px;padding:16px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+            <div style="font-family:monospace;font-size:16px;font-weight:700">{asset}-PERP</div>
+            <span style="font-size:12px;font-weight:700;padding:4px 12px;border-radius:8px;background:rgba({"0,214,143" if ok else "255,71,87"},0.15);color:{"#00D68F" if ok else "#FF4757"}">{passed}/{total} {"✅" if ok else "❌"}</span>
+          </div>
+          <div style="padding:0 4px">{rows}</div>
+        </div>'''
+
+    return f'''<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>Execution Test</title></head>
+<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
+<div style="max-width:600px;margin:0 auto">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+    <a href="/" style="color:#4A5878;text-decoration:none;font-size:13px">← Dashboard</a>
+    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#FFB800">Execution Test</div>
+  </div>
+  <div style="background:{"rgba(0,214,143,0.1)" if all_pass else "rgba(255,71,87,0.1)"};border:2px solid {"#00D68F" if all_pass else "#FF4757"};border-radius:16px;padding:20px;text-align:center;margin-bottom:20px">
+    <div style="font-size:36px;margin-bottom:8px">{"✅" if all_pass else "❌"}</div>
+    <div style="font-family:monospace;font-size:22px;font-weight:700;color:{"#00D68F" if all_pass else "#FF4757"}">{passed_assets}/{total_assets} ASSETS PASSED</div>
+    <div style="font-size:13px;color:#4A5878;margin-top:6px">{"All assets can place AND close trades ✅" if all_pass else "Execution issues found — check failed assets"}</div>
+  </div>
+  {assets_html}
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+    <a href="/execution-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #FFB800;border-radius:12px;padding:14px;color:#FFB800;font-size:13px;font-weight:600;text-decoration:none">🔄 Run Again</a>
+    <a href="/" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#4A5878;font-size:13px;font-weight:600;text-decoration:none">← Dashboard</a>
   </div>
 </div></body></html>'''
 
