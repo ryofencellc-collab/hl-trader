@@ -398,12 +398,13 @@ def evaluate_signal(candles,asset):
     filters["volume"]={"pass":vol_ok,"value":f"{vr:.2f}x","need":f">={VOL_FILTER}x"}
 
     # Breakout
-    if i>=BRK_BARS:
+    if i>=BRK_BARS and BRK_BARS>0:
         brk_ok=(closes[i]>max(highs[i-BRK_BARS:i]) if d=="LONG"
                 else closes[i]<min(lows[i-BRK_BARS:i]))
         brk_val=(f"close {closes[i]:.2f} > {max(highs[i-BRK_BARS:i]):.2f}" if d=="LONG"
                  else f"close {closes[i]:.2f} < {min(lows[i-BRK_BARS:i]):.2f}")
-    else: brk_ok=False; brk_val="insufficient bars"
+    else:
+        brk_ok=True; brk_val="bypassed (BRK_BARS=0)"
     filters["breakout"]={"pass":brk_ok,"value":brk_val}
 
     # BB filter
