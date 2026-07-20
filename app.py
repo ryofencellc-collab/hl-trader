@@ -26,7 +26,7 @@ PASSWORD        = os.environ.get("DASHBOARD_PASSWORD","hl2026")
 NTFY_TOPIC      = "hl-trader-lunchm0ney"
 NTFY_URL        = f"https://ntfy.sh/{NTFY_TOPIC}"
 
-ASSETS          = ["BTC","ETH","SOL","BNB","XRP","DOGE","AVAX","LINK"]
+ASSETS          = ["BTC","ETH","SOL","BNB","DOGE","AVAX"]  # XRP+LINK not on testnet — added on mainnet
 TOTAL_USDC      = 1998.0
 BASE_POS        = TOTAL_USDC / len(ASSETS)   # ~$249.75 per asset
 LEVERAGE        = 10
@@ -99,10 +99,8 @@ state = {
                   "eth_cfg":"trail|no_overnight|varsz",
                   "sol_cfg":"partial1%@25%|cd5|BB|SC|varsz",
                   "bnb_cfg":"tp1%|SC",
-                  "xrp_cfg":"trail|no_overnight|SC|varsz|regime",
                   "doge_cfg":"trail|BB|SC|varsz|regime",
                   "avax_cfg":"trail|SC|varsz",
-                  "link_cfg":"partial4%@25%|no_overnight|BB|SC|varsz|regime",
               }},
     "tax":{"total_pnl":0.0,"total_tax":0.0,"total_net":0.0,
            "winning_trades":0,"losing_trades":0,"total_trades":0},
@@ -574,7 +572,7 @@ def trading_loop():
          f"Leverage: {LEVERAGE}x\nAssets: {', '.join(ASSETS)}",
          tags="rocket")
 
-    retry_count=0; cycle=0; api_down_since=None
+    retry_count={}; cycle=0; api_down_since=None
 
     while True:
         with lock:
@@ -727,11 +725,12 @@ def trading_loop():
                 retry_count=0
 
             except Exception as e:
-                retry_count+=1
-                add_diag("ERROR",f"Error {asset}",str(e),f"Retry {retry_count}/5")
-                if retry_count>5:
-                    add_diag("CRITICAL","Too many errors",f"{retry_count}","Pausing 5min")
-                    time.sleep(300); retry_count=0
+                retry_count[asset]=retry_count.get(asset,0)+1
+                add_diag("ERROR",f"Error {asset}",str(e),f"Retry {retry_count[asset]}/5")
+                if retry_count[asset]>5:
+                    add_diag("WARNING",f"{asset} skipped",f"{retry_count[asset]} consecutive errors",
+                             f"Skipping {asset} — other assets unaffected")
+                    retry_count[asset]=0
 
             time.sleep(0.5)
 
