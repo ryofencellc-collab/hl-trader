@@ -619,6 +619,7 @@ def trading_loop():
             with lock: state["status"]="waiting"; state["next_check"]=f"in {CHECK_EVERY}s"
             time.sleep(CHECK_EVERY); continue
 
+        log(f"🔄 Cycle #{cycle} starting | checking {len(ASSETS)} assets")
         for asset in ASSETS:
             cfg=ASSET_CFG[asset]
             bar_count[asset]=bar_count.get(asset,0)+1
@@ -655,7 +656,10 @@ def trading_loop():
                         "fresh":age_s<1200,
                     }
 
-                if last_candle.get(asset)==ts_val: continue
+                if last_candle.get(asset)==ts_val:
+                    log(f"⏭  {asset}: same candle {ts_val} — skipping")
+                    continue
+                log(f"🕯  {asset}: NEW candle {ts_val} | price=${cur:,.2f} | age={age_s}s")
                 last_candle[asset]=ts_val
 
                 if cfg["no_ov"] and 6<=datetime.now(timezone.utc).hour<10:
