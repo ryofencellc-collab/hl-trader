@@ -479,7 +479,14 @@ def enter_trade(asset,direction,price,vol,vs,ef,es):
     log(f"🔥 ENTER_TRADE CALLED: {asset} {direction} @ ${price:,.4f} — attempting order")
     cfg=ASSET_CFG[asset]
     pos_usd=get_pos_usd(vol,vs,ef,es)
-    qty=round((pos_usd*LEVERAGE)/price,6)
+    # Get correct decimal places for this asset from exchange
+    try:
+        meta=info.meta()
+        dec=next((a.get("szDecimals",5) for a in meta["universe"] if a["name"]==asset),5)
+    except:
+        dec=5
+    qty=round((pos_usd*LEVERAGE)/price,dec)
+    log(f"📋 {asset} size: {qty} (dec={dec}, pos_usd=${pos_usd:.2f}, notional=${qty*price:.2f})")
     stop=round(price*(1-STOP_PCT) if direction=="LONG" else price*(1+STOP_PCT),2)
     trail=round(price*(1-TRAIL_PCT) if direction=="LONG" else price*(1+TRAIL_PCT),2)
     liq=liq_price(price,direction)
