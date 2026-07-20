@@ -497,6 +497,7 @@ def liq_price(entry,direction):
 # TRADING
 # ══════════════════════════════════════════════════
 def enter_trade(asset,direction,price,vol,vs,ef,es):
+    log(f"🔥 ENTER_TRADE CALLED: {asset} {direction} @ ${price:,.4f} — attempting order")
     cfg=ASSET_CFG[asset]
     pos_usd=get_pos_usd(vol,vs,ef,es)
     qty=round((pos_usd*LEVERAGE)/price,6)
