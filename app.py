@@ -38,7 +38,7 @@ TAX_RATE        = 0.35
 
 EMA_FAST=5; EMA_MID=13; EMA_SLOW=34
 STOP_PCT=0.05; TRAIL_PCT=0.01
-VOL_FILTER=1.5; SEP_FILTER=0.003; BRK_BARS=12
+VOL_FILTER=0.1; SEP_FILTER=0.003; BRK_BARS=12  # VOL_FILTER TEMP — reset to 1.5 after execution confirmed
 CANDLE_TF="15m"; CANDLE_LIMIT=200
 
 ASSET_CFG = {
@@ -149,9 +149,10 @@ def add_trade(asset,action,direction,entry,exit_p,size,pnl,reason):
 # ══════════════════════════════════════════════════
 def ntfy(title,message,priority="default",tags=""):
     try:
-        headers={"Title":title,"Priority":priority}
+        headers={"Title":title.encode("utf-8").decode("latin-1","ignore"),
+                 "Priority":priority}
         if tags: headers["Tags"]=tags
-        req.post(NTFY_URL,data=message,headers=headers,timeout=5)
+        req.post(NTFY_URL,data=message.encode("utf-8"),headers=headers,timeout=5)
     except Exception as e:
         log(f"⚠️ ntfy failed: {e}")
 
