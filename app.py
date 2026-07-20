@@ -1289,60 +1289,62 @@ def test_suite():
 @app.route("/force-trade")
 def force_trade():
     if not session.get("ok"): return redirect("/")
-    results=[]; asset="BTC"; test_usd=20.0; price=0; qty=0; fill_price=0; close_price=0
+    results=[]; asset="BTC"; test_usd=20.0
+    st={"price":0,"qty":0,"fill":0,"close":0}
     def step(name,fn):
         try:
             ok,detail=fn(); results.append({"name":name,"ok":ok,"detail":detail}); return ok
         except Exception as e:
             results.append({"name":name,"ok":False,"detail":str(e)}); return False
     def s1():
-        nonlocal price; mids=info.all_mids(); price=float(mids.get(asset,0)); return price>0,f"${price:,.2f}"
+        mids=info.all_mids(); st["price"]=float(mids.get(asset,0))
+        return st["price"]>0,f"${st['price']:,.2f}"
     step("Get BTC price",s1)
     def s2():
-        nonlocal qty; meta=info.meta()
+        meta=info.meta()
         dec=next((a.get("szDecimals",5) for a in meta["universe"] if a["name"]==asset),5)
-        qty=round(test_usd/price,dec) if price>0 else 0
-        return qty>0,f"{qty} BTC (${qty*price:.2f})"
+        st["qty"]=round(test_usd/st["price"],dec) if st["price"]>0 else 0
+        return st["qty"]>0,f"{st['qty']} BTC (${st['qty']*st['price']:.2f})"
     step("Calculate size",s2)
     def s3():
-        nonlocal fill_price; r=exchange.market_open(asset,True,qty)
+        r=exchange.market_open(asset,True,st["qty"])
         ok=r and r.get("status")=="ok"
         if ok:
             statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if statuses and "filled" in statuses[0]: fill_price=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Filled @ ${fill_price:,.2f}" if ok else str(r)
+            if statuses and "filled" in statuses[0]: st["fill"]=float(statuses[0]["filled"]["avgPx"])
+        return ok,f"Filled @ ${st['fill']:,.2f}" if ok else str(r)
     step("Place BTC LONG",s3)
     def s4():
-        time.sleep(5); s=info.user_state(MAIN_WALLET)
+        time.sleep(15); s=info.user_state(MAIN_WALLET)
         for p in s.get("assetPositions",[]):
             if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
                 return True,f"Confirmed @ ${float(p['position']['entryPx']):,.2f}"
         return False,"NOT visible on exchange"
     step("Verify on exchange",s4)
     def s5():
-        time.sleep(30); mids=info.all_mids(); cur=float(mids.get(asset,fill_price))
-        pnl=(cur-fill_price)*qty; return True,f"Held 30s | cur=${cur:,.2f} | P&L=${pnl:+.4f}"
+        time.sleep(30); mids=info.all_mids(); cur=float(mids.get(asset,st["fill"]))
+        pnl=(cur-st["fill"])*st["qty"]; return True,f"Held 30s | cur=${cur:,.2f} | P&L=${pnl:+.4f}"
     step("Hold 30 seconds",s5)
     def s6():
-        nonlocal close_price; r=exchange.market_close(asset); ok=r and r.get("status")=="ok"
+        r=exchange.market_close(asset); ok=r and r.get("status")=="ok"
         if ok:
             statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if statuses and "filled" in statuses[0]: close_price=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Closed @ ${close_price:,.2f}" if ok else str(r)
+            if statuses and "filled" in statuses[0]: st["close"]=float(statuses[0]["filled"]["avgPx"])
+        return ok,f"Closed @ ${st['close']:,.2f}" if ok else str(r)
     step("Close position",s6)
     def s7():
-        time.sleep(3); s=info.user_state(MAIN_WALLET)
+        time.sleep(5); s=info.user_state(MAIN_WALLET)
         still=[p for p in s.get("assetPositions",[]) if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
         return len(still)==0,"Confirmed closed ✅" if len(still)==0 else "Still open ❌"
     step("Verify closed",s7)
     def s8():
-        if fill_price>0 and close_price>0:
-            pnl=(close_price-fill_price)*qty
-            return True,f"Entry: ${fill_price:,.2f} | Exit: ${close_price:,.2f} | P&L: ${pnl:+.4f}"
+        if st["fill"]>0 and st["close"]>0:
+            pnl=(st["close"]-st["fill"])*st["qty"]
+            return True,f"Entry: ${st['fill']:,.2f} | Exit: ${st['close']:,.2f} | P&L: ${pnl:+.4f}"
         return False,"Could not calculate"
     step("Calculate P&L",s8)
     def s9():
-        pnl=(close_price-fill_price)*qty if fill_price and close_price else 0
+        pnl=(st["close"]-st["fill"])*st["qty"] if st["fill"] and st["close"] else 0
         r=req.post(NTFY_URL,data=f"Force trade: {sum(1 for r in results if r['ok'])}/{len(results)} | P&L: ${pnl:+.4f}",
                    headers={"Title":"Force Trade Test","Tags":"test_tube"},timeout=5)
         return r.status_code==200,"Alert sent ✅"
@@ -1637,7 +1639,7 @@ def exit_test():
     3. EMA cross — confirms exit fires on EMA flip
     Then closes the position and confirms.
     """
-    results=[]; fill_price=0; qty=0; asset="BTC"
+    results=[]; asset="BTC"; st={"price":0,"qty":0,"fill":0}
 
     def step(name,fn):
         try:
@@ -1647,30 +1649,28 @@ def exit_test():
 
     # Step 1: Get price
     def s1():
-        nonlocal fill_price
-        mids=info.all_mids(); p=float(mids.get(asset,0)); fill_price=p
+        mids=info.all_mids(); p=float(mids.get(asset,0))
+        st["price"]=p; st["fill"]=p
         return p>0,f"BTC @ ${p:,.2f}"
     step("Get BTC price",s1)
 
     # Step 2: Calculate size
     def s2():
-        nonlocal qty
         meta=info.meta()
         dec=next((a.get("szDecimals",5) for a in meta["universe"] if a["name"]==asset),5)
-        qty=round(20/fill_price,dec)
-        return qty>0,f"{qty} BTC (${qty*fill_price:.2f})"
+        st["qty"]=round(20/st["price"],dec) if st["price"]>0 else 0
+        return st["qty"]>0,f"{st['qty']} BTC (${st['qty']*st['price']:.2f})"
     step("Calculate test size ($20)",s2)
 
     # Step 3: Open position
     def s3():
-        nonlocal fill_price
-        r=exchange.market_open(asset,True,qty)
+        r=exchange.market_open(asset,True,st["qty"])
         ok=r and r.get("status")=="ok"
         if ok:
             statuses=r.get("response",{}).get("data",{}).get("statuses",[])
             if statuses and "filled" in statuses[0]:
-                fill_price=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Opened LONG @ ${fill_price:,.2f}"
+                st["fill"]=float(statuses[0]["filled"]["avgPx"])
+        return ok,f"Opened LONG @ ${st['fill']:,.2f}"
     step("Open BTC LONG position",s3)
 
     # Step 4: Verify on exchange
@@ -1685,10 +1685,10 @@ def exit_test():
 
     # Step 5: Verify stop loss calculation
     def s5():
-        stop=round(fill_price*(1-STOP_PCT),2)
-        liq=liq_price(fill_price,"LONG")
-        dist_stop=round((fill_price-stop)/fill_price*100,2)
-        dist_liq=round((fill_price-liq)/fill_price*100,2)
+        stop=round(st["fill"]*(1-STOP_PCT),2)
+        liq=liq_price(st["fill"],"LONG")
+        dist_stop=round((st["fill"]-stop)/st["fill"]*100,2)
+        dist_liq=round((st["fill"]-liq)/st["fill"]*100,2)
         return True,(f"Hard stop: ${stop:,.2f} ({dist_stop}% below entry) | "
                      f"Liq: ${liq:,.2f} ({dist_liq}% below) | "
                      f"Stop fires BEFORE liquidation: {'✅' if stop>liq else '❌'}")
@@ -1696,8 +1696,8 @@ def exit_test():
 
     # Step 6: Verify trail stop logic
     def s6():
-        trail=round(fill_price*(1-TRAIL_PCT),2)
-        new_peak=fill_price*1.02
+        trail=round(st["fill"]*(1-TRAIL_PCT),2)
+        new_peak=st["fill"]*1.02
         new_trail=round(new_peak*(1-TRAIL_PCT),2)
         return True,(f"Initial trail: ${trail:,.2f} | "
                      f"After 2% move up to ${new_peak:,.2f}: trail moves to ${new_trail:,.2f} | "
