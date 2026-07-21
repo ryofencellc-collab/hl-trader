@@ -538,26 +538,44 @@ def enter_trade(asset,direction,price,vol,vs,ef,es):
             fill=price
             if statuses and "filled" in statuses[0]:
                 fill=float(statuses[0]["filled"]["avgPx"])
-            confirmed,actual=verify_entry(asset)
-            if not confirmed:
-                add_diag("ERROR",f"Entry NOT confirmed {asset}","Order placed but not visible","NOT logging")
-                add_audit(asset,"ENTRY FAILED",f"Order placed @ ${fill:,.2f} but not visible on exchange")
-                return
-            fill=actual if actual>0 else fill
-            stop=round(fill*(1-STOP_PCT) if direction=="LONG" else fill*(1+STOP_PCT),2)
-            trail=round(fill*(1-TRAIL_PCT) if direction=="LONG" else fill*(1+TRAIL_PCT),2)
-            liq=liq_price(fill,direction)
-            qty2=round((pos_usd*LEVERAGE)/fill,6)
-            entry_times[asset]=ts()
-            positions[asset]={"direction":direction,"entry":fill,"size":qty2,
-                              "pos_usd":pos_usd,"stop":stop,"trail_peak":fill,
-                              "trail_stop":trail,"liq":liq,"partial_done":False,
-                              "partial_pnl":0.0,"qty_rem":qty2,"current_price":fill,"unrealized_pnl":0.0}
-            add_trade(asset,"ENTER",direction,fill,None,qty2,None,"signal")
-            add_audit(asset,"✅ ENTERED",f"{direction} @ ${fill:,.2f} | stop=${stop:,.2f} | trail=${trail:,.2f} | liq=${liq:,.2f} | CONFIRMED on exchange")
-            ntfy_trade_entered(asset,direction,fill,qty2,stop,trail,pos_usd)
-            log(f"✅ ENTERED {direction} {asset} @ ${fill:,.2f} | CONFIRMED | liq=${liq:,.2f}")
-            with lock: state["positions"]={k:v for k,v in positions.items()}
+
+            # NON-BLOCKING: run verification in background thread
+            # Main loop continues checking other assets immediately
+            def verify_and_confirm(a,d,f,pu,q,stp,trl,lq,et):
+                confirmed,actual=verify_entry(a)
+                if not confirmed:
+                    add_diag("ERROR",f"Entry NOT confirmed {a}","Order placed but not visible","NOT logging")
+                    add_audit(a,"ENTRY FAILED",f"Order placed @ ${f:,.2f} but not visible on exchange")
+                    return
+                f2=actual if actual>0 else f
+                stp2=round(f2*(1-STOP_PCT) if d=="LONG" else f2*(1+STOP_PCT),2)
+                trl2=round(f2*(1-TRAIL_PCT) if d=="LONG" else f2*(1+TRAIL_PCT),2)
+                lq2=liq_price(f2,d)
+                try:
+                    meta2=info.meta()
+                    dec2=next((x.get("szDecimals",5) for x in meta2["universe"] if x["name"]==a),5)
+                except:
+                    dec2=5
+                q2=round((pu*LEVERAGE)/f2,dec2)
+                entry_times[a]=et
+                positions[a]={"direction":d,"entry":f2,"size":q2,
+                              "pos_usd":pu,"stop":stp2,"trail_peak":f2,
+                              "trail_stop":trl2,"liq":lq2,"partial_done":False,
+                              "partial_pnl":0.0,"qty_rem":q2,"current_price":f2,"unrealized_pnl":0.0}
+                add_trade(a,"ENTER",d,f2,None,q2,None,"signal")
+                add_audit(a,"✅ ENTERED",f"{d} @ ${f2:,.2f} | stop=${stp2:,.2f} | trail=${trl2:,.2f} | liq=${lq2:,.2f} | CONFIRMED")
+                ntfy_trade_entered(a,d,f2,q2,stp2,trl2,pu)
+                log(f"✅ ENTERED {d} {a} @ ${f2:,.2f} | CONFIRMED | liq=${lq2:,.2f}")
+                with lock: state["positions"]={k:v for k,v in positions.items()}
+
+            t=threading.Thread(
+                target=verify_and_confirm,
+                args=(asset,direction,fill,pos_usd,qty,stop,trail,liq,ts()),
+                daemon=True
+            )
+            t.start()
+            log(f"🔄 {asset} verification running in background — main loop continues")
+            return  # Return immediately, don't block
         else:
             add_diag("ERROR",f"Entry failed {asset}",str(r),"Skipping")
             add_audit(asset,"ENTRY FAILED",f"Exchange rejected order: {r}")
