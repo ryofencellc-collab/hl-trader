@@ -1108,7 +1108,6 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <button class="ctrl" style="background:rgba(255,71,87,0.15);color:#FF4757;border:2px solid rgba(255,71,87,0.4);margin:0" onclick="confirm_action('close_all','Close ALL positions?','Immediately market-closes everything.')">⚡ Close All</button>
   </div>
   <button class="ctrl" style="background:rgba(255,71,87,0.25);color:#FF4757;border:2px solid #FF4757;font-size:14px" onclick="confirm_action('kill','KILL SWITCH?','Stops all trading. Positions stay open on HyperLiquid.')">🛑 KILL SWITCH</button>
-  <button class="ctrl" style="background:rgba(0,180,255,0.15);color:#00B4FF;border:2px solid rgba(0,180,255,0.4);margin-top:8px" onclick="runExecTest()">🧪 Execution Test</button>
   <div class="card" style="border-color:{'rgba(0,214,143,0.3)' if tax['total_net']>=0 else 'rgba(255,71,87,0.3)'}">
     <div style="font-size:10px;font-weight:700;color:#4A5878;text-transform:uppercase;margin-bottom:6px">Net P&L</div>
     <div style="font-family:monospace;font-size:28px;font-weight:700;color:{'#00D68F' if tax['total_net']>=0 else '#FF4757'}">${tax["total_net"]:.2f}</div>
@@ -1206,7 +1205,6 @@ function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent
 function closeOv(){{document.getElementById("ov").classList.remove("show");pend=null}}
 document.getElementById("oy").onclick=function(){{if(pend)doAction(pend);closeOv()}}
 function doAction(a){{fetch("/control",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{action:a}})}}).then(r=>r.json()).then(d=>{{if(d.ok)location.reload();else alert("Error: "+d.error)}})}}
-function runExecTest(){{if(!confirm("Run execution test? Places a small real order on each asset and immediately closes it."))return;fetch("/exec-test",{{method:"POST"}}).then(r=>r.json()).then(d=>{{alert("Result:\n\n"+d.result);location.reload();}}).catch(e=>alert("Error: "+e));}}
 setTimeout(()=>location.reload(),30000);
 </script>
 </body></html>'''
@@ -1348,43 +1346,6 @@ def tax_guide():
 def api_state():
     if not session.get("ok"): return jsonify({"error":"unauthorized"}),401
     return jsonify(state)
-
-@app.route("/exec-test",methods=["POST"])
-def exec_test():
-    if not session.get("ok"): return jsonify({"error":"unauthorized"}),401
-    results=[]; test_size={"BTC":0.00032,"ETH":0.011,"SOL":0.13,"BNB":0.018,"DOGE":280,"AVAX":3.1}
-    for asset in ASSETS:
-        if asset in positions:
-            results.append(f"{asset}: SKIP — position already open")
-            continue
-        try:
-            # Enter
-            sz=test_size.get(asset,1)
-            r=exchange.market_open(asset,True,sz)
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if not statuses or "error" in statuses[0]:
-                results.append(f"{asset}: ENTRY FAILED — {statuses[0].get('error','unknown') if statuses else 'no response'}")
-                continue
-            fill=float(statuses[0].get("filled",{}).get("avgPx",0))
-            time.sleep(3)
-            # Verify via userFills
-            since_ms=int(time.time()*1000)-10000
-            fr=req.post(HL_INFO_URL,json={"type":"userFills","user":MAIN_WALLET},timeout=10)
-            fills=fr.json()
-            recent=[f for f in fills if int(f.get("time",0))>since_ms and f.get("coin")==asset and "Open" in f.get("dir","")]
-            verified=len(recent)>0
-            # Exit
-            exchange.market_close(asset)
-            time.sleep(2)
-            status="✅ FULL CYCLE" if verified else "⚠️ ENTRY PLACED BUT NOT VERIFIED"
-            results.append(f"{asset}: {status} — entry@${fill:,.4f} | fills={len(recent)}")
-            add_audit(asset,"🧪 EXEC TEST",f"{status} @ ${fill:,.4f}")
-        except Exception as e:
-            results.append(f"{asset}: ERROR — {e}")
-        time.sleep(1)
-    result_str="\n".join(results)
-    log(f"🧪 Execution test complete:\n{result_str}")
-    return jsonify({"result":result_str})
 
 @app.route("/log")
 def log_export():
