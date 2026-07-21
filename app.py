@@ -123,36 +123,17 @@ def add_diag(level,event,cause,action):
     icons={"INFO":"ℹ️","WARNING":"⚠️","ERROR":"❌","CRITICAL":"🚨"}
     log(f"{icons.get(level,'📋')} [{level}] {event} | {cause} | {action}")
 
-AUDIT_FILE="/tmp/hl_audit.csv"
-
 def add_audit(asset,event,detail,filters=None):
-    """Full audit trail — every candle evaluation visible on dashboard + saved to disk"""
+    """Full audit trail — every candle evaluation visible on dashboard"""
+    # Sanitize at source so nothing breaks the HTML dashboard
+    safe=str(detail).replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")
     entry={
         "time":ts(),"asset":asset,"event":event,
-        "detail":detail,"filters":filters or {}
+        "detail":safe,"filters":filters or {}
     }
     with lock:
         state["audit"].insert(0,entry)
-        state["audit"]=state["audit"][:2000]
-    # Persist to disk so it survives restarts
-    try:
-        with open(AUDIT_FILE,"a") as f:
-            f.write(f"{entry['time']}|{asset}|{event}|{detail}\n")
-    except: pass
-
-def load_audit_from_disk():
-    """Load audit trail from disk on startup"""
-    try:
-        if not os.path.exists(AUDIT_FILE): return
-        lines=open(AUDIT_FILE).readlines()
-        for line in reversed(lines[-2000:]):
-            parts=line.strip().split("|",3)
-            if len(parts)==4:
-                state["audit"].append({"time":parts[0],"asset":parts[1],
-                                       "event":parts[2],"detail":parts[3],"filters":{}})
-        log(f"📂 Loaded {len(state['audit'])} audit entries from disk")
-    except Exception as e:
-        log(f"⚠️ Could not load audit from disk: {e}")
+        state["audit"]=state["audit"][:500]
 
 def add_trade(asset,action,direction,entry,exit_p,size,pnl,reason):
     t={"time":ts(),"asset":asset,"action":action,"direction":direction,
@@ -1436,7 +1417,6 @@ def log_export():
     lines.append("\n"+"="*60)
     return Response("\n".join(lines),mimetype="text/plain")
 
-load_audit_from_disk()
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
 
