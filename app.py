@@ -21,18 +21,18 @@ from hyperliquid.utils import constants
 # CONFIG
 # ══════════════════════════════════════════════════
 DRY_RUN         = False
-TESTNET         = True
+TESTNET         = False
 MAIN_WALLET     = "0xa90566c8d886CA63c1194101a7dA2Fa129D26B58"
-API_PRIVATE_KEY = "0x5b75aa092ea3bd1ee77983ab5b8268607120a0145de6df11174b3f72f91b9ea0"
+API_PRIVATE_KEY = "0x9cd8627ff5c807e8dd1ba0ce0e5936c0f8eb133123fccd49807509abf3f3ff07"
 API_URL         = constants.TESTNET_API_URL if TESTNET else constants.MAINNET_API_URL
 PASSWORD        = os.environ.get("DASHBOARD_PASSWORD","hl2026")
 NTFY_TOPIC      = "hl-trader-lunchm0ney"
 NTFY_URL        = f"https://ntfy.sh/{NTFY_TOPIC}"
 
 ASSETS          = ["BTC","ETH","SOL","BNB","DOGE","AVAX"]
-TOTAL_USDC      = 1998.0
+TOTAL_USDC      = 5.0
 BASE_POS        = TOTAL_USDC / len(ASSETS)
-LEVERAGE        = 10
+LEVERAGE        = 2
 CHECK_EVERY     = 60
 TAX_RATE        = 0.35
 
