@@ -1223,10 +1223,7 @@ function restoreTab(){{var t=localStorage.getItem("hl_active_tab");if(t){{var el
 let pend=null;
 function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent=t;document.getElementById("os").textContent=s;document.getElementById("ov").classList.add("show")}}
 function closeOv(){{document.getElementById("ov").classList.remove("show");pend=null}}
-document.getElementById("oy").onclick=function(){{if(pend)doAction(pend);closeOv()}}
 function doAction(a){{fetch("/control",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{action:a}})}}).then(r=>r.json()).then(d=>{{if(d.ok)location.reload();else alert("Error: "+d.error)}})}}
-document.addEventListener("DOMContentLoaded",function(){{restoreTab();}});
-setTimeout(()=>location.reload(),30000);
 function runExecTest(){{
   if(!confirm("Run execution test? This places a real small order on each asset and immediately closes it. Confirms the full entry→verify→exit cycle."))return;
   fetch("/exec-test",{{method:"POST"}}).then(r=>r.json()).then(d=>{{
@@ -1234,6 +1231,12 @@ function runExecTest(){{
     location.reload();
   }}).catch(e=>alert("Error: "+e));
 }}
+document.addEventListener("DOMContentLoaded",function(){{
+  var oy=document.getElementById("oy");
+  if(oy)oy.onclick=function(){{if(pend)doAction(pend);closeOv()}};
+  restoreTab();
+}});
+setTimeout(()=>location.reload(),30000);
 </script>
 </body></html>'''
 
