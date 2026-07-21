@@ -1218,8 +1218,8 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 </div>
 <button class="rfb" onclick="location.reload()">↻</button>
 <script>
-function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active");localStorage.setItem("hl_active_tab",id);}}
-function restoreTab(){{var t=localStorage.getItem("hl_active_tab");if(t){{var el=document.querySelector('[onclick*="'+t+'"]');if(el)show(t,el);}}}}
+function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active");localStorage.setItem("hl_tab",id);}}
+function restoreTab(){{var t=localStorage.getItem("hl_tab");if(t){{var sec=document.getElementById(t);if(sec){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(tb=>tb.classList.remove("active"));sec.classList.add("active");var tabs=document.querySelectorAll(".tab");tabs.forEach(function(tb){{if(tb.getAttribute("onclick")&&tb.getAttribute("onclick").indexOf(t)>-1)tb.classList.add("active");}});}}}}}}
 let pend=null;
 function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent=t;document.getElementById("os").textContent=s;document.getElementById("ov").classList.add("show")}}
 function closeOv(){{document.getElementById("ov").classList.remove("show");pend=null}}
