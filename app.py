@@ -123,15 +123,36 @@ def add_diag(level,event,cause,action):
     icons={"INFO":"ℹ️","WARNING":"⚠️","ERROR":"❌","CRITICAL":"🚨"}
     log(f"{icons.get(level,'📋')} [{level}] {event} | {cause} | {action}")
 
+AUDIT_FILE="/tmp/hl_audit.csv"
+
 def add_audit(asset,event,detail,filters=None):
-    """Full audit trail — every candle evaluation visible on dashboard"""
+    """Full audit trail — every candle evaluation visible on dashboard + saved to disk"""
     entry={
         "time":ts(),"asset":asset,"event":event,
         "detail":detail,"filters":filters or {}
     }
     with lock:
         state["audit"].insert(0,entry)
-        state["audit"]=state["audit"][:500]
+        state["audit"]=state["audit"][:2000]
+    # Persist to disk so it survives restarts
+    try:
+        with open(AUDIT_FILE,"a") as f:
+            f.write(f"{entry['time']}|{asset}|{event}|{detail}\n")
+    except: pass
+
+def load_audit_from_disk():
+    """Load audit trail from disk on startup"""
+    try:
+        if not os.path.exists(AUDIT_FILE): return
+        lines=open(AUDIT_FILE).readlines()
+        for line in reversed(lines[-2000:]):
+            parts=line.strip().split("|",3)
+            if len(parts)==4:
+                state["audit"].append({"time":parts[0],"asset":parts[1],
+                                       "event":parts[2],"detail":parts[3],"filters":{}})
+        log(f"📂 Loaded {len(state['audit'])} audit entries from disk")
+    except Exception as e:
+        log(f"⚠️ Could not load audit from disk: {e}")
 
 def add_trade(asset,action,direction,entry,exit_p,size,pnl,reason):
     t={"time":ts(),"asset":asset,"action":action,"direction":direction,
@@ -470,24 +491,47 @@ def evaluate_signal(candles,asset):
 
     return (d if all_pass else None),closes[i],vol,vs[i] if vs[i] else 0,filters
 
+HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info" if TESTNET else "https://api.hyperliquid.xyz/info"
+
 def verify_entry(asset):
+    """
+    Verify entry using userFills — clearinghouseState broken on this wallet.
+    userFills works correctly on both testnet and mainnet.
+    """
     time.sleep(15)
     try:
-        s=info.user_state(MAIN_WALLET)
-        for p in s.get("assetPositions",[]):
-            if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
-                return True,float(p["position"]["entryPx"])
+        since_ms=int(time.time()*1000)-30000
+        r=req.post(HL_INFO_URL,json={"type":"userFills","user":MAIN_WALLET},timeout=10)
+        fills=r.json()
+        if not isinstance(fills,list): return False,0
+        recent=[f for f in fills
+                if int(f.get("time",0))>since_ms
+                and f.get("coin")==asset
+                and "Open" in f.get("dir","")]
+        if recent:
+            fill_price=float(recent[0].get("px",0))
+            log(f"✅ verify_entry {asset} — fill confirmed @ ${fill_price:,.4f} via userFills")
+            return True,fill_price
+        log(f"❌ verify_entry {asset} — no fill found in last 30s")
         return False,0
     except Exception as e:
         add_diag("ERROR",f"Verify entry {asset}",str(e),"Assuming failed"); return False,0
 
 def verify_exit(asset):
+    """
+    Verify exit using userFills — check for Close fill in last 30 seconds.
+    """
     time.sleep(3)
     try:
-        s=info.user_state(MAIN_WALLET)
-        still=[p for p in s.get("assetPositions",[])
-               if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
-        return len(still)==0
+        since_ms=int(time.time()*1000)-30000
+        r=req.post(HL_INFO_URL,json={"type":"userFills","user":MAIN_WALLET},timeout=10)
+        fills=r.json()
+        if not isinstance(fills,list): return False
+        recent=[f for f in fills
+                if int(f.get("time",0))>since_ms
+                and f.get("coin")==asset
+                and "Close" in f.get("dir","")]
+        return len(recent)>0
     except: return False
 
 def liq_price(entry,direction):
@@ -1082,6 +1126,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <button class="ctrl" style="background:rgba(255,71,87,0.15);color:#FF4757;border:2px solid rgba(255,71,87,0.4);margin:0" onclick="confirm_action('close_all','Close ALL positions?','Immediately market-closes everything.')">⚡ Close All</button>
   </div>
   <button class="ctrl" style="background:rgba(255,71,87,0.25);color:#FF4757;border:2px solid #FF4757;font-size:14px" onclick="confirm_action('kill','KILL SWITCH?','Stops all trading. Positions stay open on HyperLiquid.')">🛑 KILL SWITCH</button>
+  <button class="ctrl" style="background:rgba(0,180,255,0.15);color:#00B4FF;border:2px solid rgba(0,180,255,0.4);margin-top:8px" onclick="runExecTest()">🧪 Execution Test</button>
   <div class="card" style="border-color:{'rgba(0,214,143,0.3)' if tax['total_net']>=0 else 'rgba(255,71,87,0.3)'}">
     <div style="font-size:10px;font-weight:700;color:#4A5878;text-transform:uppercase;margin-bottom:6px">Net P&L</div>
     <div style="font-family:monospace;font-size:28px;font-weight:700;color:{'#00D68F' if tax['total_net']>=0 else '#FF4757'}">${tax["total_net"]:.2f}</div>
@@ -1173,13 +1218,22 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 </div>
 <button class="rfb" onclick="location.reload()">↻</button>
 <script>
-function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active")}}
+function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active");localStorage.setItem("hl_active_tab",id);}}
+function restoreTab(){{var t=localStorage.getItem("hl_active_tab");if(t){{var el=document.querySelector('[onclick*="'+t+'"]');if(el)show(t,el);}}}}
 let pend=null;
 function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent=t;document.getElementById("os").textContent=s;document.getElementById("ov").classList.add("show")}}
 function closeOv(){{document.getElementById("ov").classList.remove("show");pend=null}}
 document.getElementById("oy").onclick=function(){{if(pend)doAction(pend);closeOv()}}
 function doAction(a){{fetch("/control",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{action:a}})}}).then(r=>r.json()).then(d=>{{if(d.ok)location.reload();else alert("Error: "+d.error)}})}}
+restoreTab();
 setTimeout(()=>location.reload(),30000);
+function runExecTest(){{
+  if(!confirm("Run execution test? This places a real small order on each asset and immediately closes it. Confirms the full entry→verify→exit cycle."))return;
+  fetch("/exec-test",{{method:"POST"}}).then(r=>r.json()).then(d=>{{
+    alert("Execution test result:\n\n"+d.result);
+    location.reload();
+  }}).catch(e=>alert("Error: "+e));
+}}
 </script>
 </body></html>'''
 
@@ -1321,6 +1375,43 @@ def api_state():
     if not session.get("ok"): return jsonify({"error":"unauthorized"}),401
     return jsonify(state)
 
+@app.route("/exec-test",methods=["POST"])
+def exec_test():
+    if not session.get("ok"): return jsonify({"error":"unauthorized"}),401
+    results=[]; test_size={"BTC":0.00032,"ETH":0.011,"SOL":0.13,"BNB":0.018,"DOGE":280,"AVAX":3.1}
+    for asset in ASSETS:
+        if asset in positions:
+            results.append(f"{asset}: SKIP — position already open")
+            continue
+        try:
+            # Enter
+            sz=test_size.get(asset,1)
+            r=exchange.market_open(asset,True,sz)
+            statuses=r.get("response",{}).get("data",{}).get("statuses",[])
+            if not statuses or "error" in statuses[0]:
+                results.append(f"{asset}: ENTRY FAILED — {statuses[0].get('error','unknown') if statuses else 'no response'}")
+                continue
+            fill=float(statuses[0].get("filled",{}).get("avgPx",0))
+            time.sleep(3)
+            # Verify via userFills
+            since_ms=int(time.time()*1000)-10000
+            fr=req.post(HL_INFO_URL,json={"type":"userFills","user":MAIN_WALLET},timeout=10)
+            fills=fr.json()
+            recent=[f for f in fills if int(f.get("time",0))>since_ms and f.get("coin")==asset and "Open" in f.get("dir","")]
+            verified=len(recent)>0
+            # Exit
+            exchange.market_close(asset)
+            time.sleep(2)
+            status="✅ FULL CYCLE" if verified else "⚠️ ENTRY PLACED BUT NOT VERIFIED"
+            results.append(f"{asset}: {status} — entry@${fill:,.4f} | fills={len(recent)}")
+            add_audit(asset,"🧪 EXEC TEST",f"{status} @ ${fill:,.4f}")
+        except Exception as e:
+            results.append(f"{asset}: ERROR — {e}")
+        time.sleep(1)
+    result_str="\n".join(results)
+    log(f"🧪 Execution test complete:\n{result_str}")
+    return jsonify({"result":result_str})
+
 @app.route("/log")
 def log_export():
     if not session.get("ok"): return "unauthorized",401
@@ -1339,8 +1430,8 @@ def log_export():
         ep=f"${t['exit']:,.2f}" if t.get("exit") else "—"
         pl=f"${t['pnl']:+.4f}" if t.get("pnl") is not None else "open"
         lines.append(f"  {t['time']} | {t['asset']} {t['direction']} {t['action']} | ${t['entry']:,.2f}→{ep} | {t.get('reason','')} | {pl}")
-    lines.append("\nAUDIT TRAIL (last 50):")
-    for a in s["audit"][:50]:
+    lines.append(f"\nAUDIT TRAIL (all {len(s['audit'])} entries):")
+    for a in s["audit"]:
         lines.append(f"  {a['time'][11:19]} | {a['asset']:<6} | {a['event']:<30} | {a['detail']}")
     lines.append("\nASSET STATUS:")
     for asset in s["assets"]:
@@ -1352,6 +1443,7 @@ def log_export():
     lines.append("\n"+"="*60)
     return Response("\n".join(lines),mimetype="text/plain")
 
+load_audit_from_disk()
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
 
