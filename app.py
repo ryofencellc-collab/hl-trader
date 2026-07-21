@@ -1027,7 +1027,7 @@ def build_dashboard():
             <span style="font-size:12px;font-weight:600">{event}</span>
             <span style="font-size:10px;color:#4A5878;margin-left:auto;white-space:nowrap">{a["time"][11:19]}</span>
           </div>
-          <div style="font-size:11px;color:#4A5878;font-family:monospace;margin-bottom:3px">{a["detail"].replace("<","&lt;").replace(">","&gt;").replace("'","&#39;").replace('"',"&quot;")}</div>
+          <div style="font-size:11px;color:#4A5878;font-family:monospace;margin-bottom:3px">{a["detail"].replace(chr(10)," ").replace(chr(13)," ").replace("<","&lt;").replace(">","&gt;").replace("'","&#39;").replace('"',"&quot;")}</div>
           {f'<div style="display:flex;flex-wrap:wrap;gap:2px">{filter_html}</div>' if filter_html else ""}
         </div>'''
 
@@ -1037,8 +1037,8 @@ def build_dashboard():
         c=cs.get(d["level"],"74,88,120")
         diag_html+=f'''<div style="display:flex;gap:10px;padding:10px 0;border-bottom:1px solid #1E2D42">
           <span style="font-size:10px;font-weight:700;padding:3px 6px;border-radius:4px;white-space:nowrap;background:rgba({c},0.15);color:rgb({c})">{d["level"]}</span>
-          <div style="flex:1"><div style="font-weight:600;font-size:12px">{d["event"]}</div>
-          <div style="font-size:11px;color:#4A5878">{d["cause"]}</div>
+          <div style="flex:1"><div style="font-weight:600;font-size:12px">{d["event"].replace("<","&lt;").replace(">","&gt;")}</div>
+          <div style="font-size:11px;color:#4A5878">{d["cause"].replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ")}</div>
           <div style="font-size:10px;color:#4A5878;font-family:monospace">{d["time"]}</div></div></div>'''
 
     asset_html=""
