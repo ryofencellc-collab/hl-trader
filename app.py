@@ -1199,7 +1199,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 
 </div>
 <button class="rfb" onclick="location.reload()">↻</button>
-<script>
+<script defer>
 function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active")}}
 let pend=null;
 function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent=t;document.getElementById("os").textContent=s;document.getElementById("ov").classList.add("show")}}
