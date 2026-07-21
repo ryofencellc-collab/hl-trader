@@ -1038,7 +1038,7 @@ def build_dashboard():
         diag_html+=f'''<div style="display:flex;gap:10px;padding:10px 0;border-bottom:1px solid #1E2D42">
           <span style="font-size:10px;font-weight:700;padding:3px 6px;border-radius:4px;white-space:nowrap;background:rgba({c},0.15);color:rgb({c})">{d["level"]}</span>
           <div style="flex:1"><div style="font-weight:600;font-size:12px">{d["event"].replace("<","&lt;").replace(">","&gt;")}</div>
-          <div style="font-size:11px;color:#4A5878">{d["cause"].replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ")}</div>
+          <div style="font-size:11px;color:#4A5878">{d["cause"].replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")}</div>
           <div style="font-size:10px;color:#4A5878;font-family:monospace">{d["time"]}</div></div></div>'''
 
     asset_html=""
@@ -1224,7 +1224,7 @@ function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent
 function closeOv(){{document.getElementById("ov").classList.remove("show");pend=null}}
 function doAction(a){{fetch("/control",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{action:a}})}}).then(r=>r.json()).then(d=>{{if(d.ok)location.reload();else alert("Error: "+d.error)}})}}
 function runExecTest(){{
-  if(!confirm("Run execution test? This places a real small order on each asset and immediately closes it. Confirms the full entry→verify→exit cycle."))return;
+  if(!confirm("Run execution test? Places a real small order on each asset and immediately closes it. Confirms entry, verify, and exit cycle."))return;
   fetch("/exec-test",{{method:"POST"}}).then(r=>r.json()).then(d=>{{
     alert("Execution test result:\n\n"+d.result);
     location.reload();
