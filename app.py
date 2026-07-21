@@ -1219,23 +1219,13 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 </div>
 <button class="rfb" onclick="location.reload()">↻</button>
 <script>
-function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active");localStorage.setItem("hl_tab",id);}}
-function restoreTab(){{var t=localStorage.getItem("hl_tab");if(!t)return;var sec=document.getElementById(t);if(!sec)return;document.querySelectorAll(".sec").forEach(function(s){{s.classList.remove("active")}});document.querySelectorAll(".tab").forEach(function(tb){{tb.classList.remove("active")}});sec.classList.add("active");document.querySelectorAll(".tab").forEach(function(tb){{if(tb.getAttribute("onclick")&&tb.getAttribute("onclick").indexOf(t)>-1)tb.classList.add("active")}});}}let pend=null;
+function show(id,el){{document.querySelectorAll(".sec").forEach(s=>s.classList.remove("active"));document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));document.getElementById(id).classList.add("active");el.classList.add("active")}}
+let pend=null;
 function confirm_action(a,t,s){{pend=a;document.getElementById("ot").textContent=t;document.getElementById("os").textContent=s;document.getElementById("ov").classList.add("show")}}
 function closeOv(){{document.getElementById("ov").classList.remove("show");pend=null}}
+document.getElementById("oy").onclick=function(){{if(pend)doAction(pend);closeOv()}}
 function doAction(a){{fetch("/control",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{action:a}})}}).then(r=>r.json()).then(d=>{{if(d.ok)location.reload();else alert("Error: "+d.error)}})}}
-function runExecTest(){{
-  if(!confirm("Run execution test? Places a real small order on each asset and immediately closes it. Confirms entry, verify, and exit cycle."))return;
-  fetch("/exec-test",{{method:"POST"}}).then(r=>r.json()).then(d=>{{
-    alert("Execution test result:\n\n"+d.result);
-    location.reload();
-  }}).catch(e=>alert("Error: "+e));
-}}
-document.addEventListener("DOMContentLoaded",function(){{
-  var oy=document.getElementById("oy");
-  if(oy)oy.onclick=function(){{if(pend)doAction(pend);closeOv()}};
-  restoreTab();
-}});
+function runExecTest(){{if(!confirm("Run execution test? Places a small real order on each asset and immediately closes it."))return;fetch("/exec-test",{{method:"POST"}}).then(r=>r.json()).then(d=>{{alert("Result:\n\n"+d.result);location.reload();}}).catch(e=>alert("Error: "+e));}}
 setTimeout(()=>location.reload(),30000);
 </script>
 </body></html>'''
