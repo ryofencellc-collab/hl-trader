@@ -1,7 +1,7 @@
 """
 HL TRADER — Final Production App v3
 ══════════════════════════════════════
-8 assets | ntfy alerts | /test | /force-trade | /signal-check | /audit | Tax system
+8 assets | ntfy alerts | /signal-check | /audit | Tax system
 
 Full diagnostic visibility — no Railway logs needed.
 Every candle, every signal, every skip tracked and visible.
@@ -38,7 +38,7 @@ TAX_RATE        = 0.35
 
 EMA_FAST=5; EMA_MID=13; EMA_SLOW=34
 STOP_PCT=0.05; TRAIL_PCT=0.01
-VOL_FILTER=0.1; SEP_FILTER=0.003; BRK_BARS=0  # TEMP — reset VOL to 1.5 and BRK to 12 after execution confirmed
+VOL_FILTER=1.5; SEP_FILTER=0.003; BRK_BARS=12
 CANDLE_TF="15m"; CANDLE_LIMIT=200
 
 ASSET_CFG = {
@@ -379,49 +379,71 @@ def evaluate_signal(candles,asset):
     ef=ema(closes,EMA_FAST); em2=ema(closes,EMA_MID); es=ema(closes,EMA_SLOW)
     vs=sma(vols,20); u=bbu(closes); l=bbl(closes); i=len(candles)-1
 
-    # EMA stack — FORCED LONG FOR EXECUTION TEST
-    d="LONG"  # TEMP: remove this line after confirming trading loop fires
+    # EMA stack
     if ef[i] and em2[i] and es[i]:
         if   ef[i]>em2[i]>es[i]: d="LONG"
         elif ef[i]<em2[i]<es[i]: d="SHORT"
-        else: d="LONG"  # TEMP: force LONG even when flat
-    filters["ema_stack"]={"pass":True,"value":f"FORCED LONG (test)","detail":"EMA override active"}
+        else: d=None
+    else: d=None
+    filters["ema_stack"]={"pass":d is not None,"value":d or "flat",
+                          "detail":f"EMA5={ef[i]:.2f} EMA13={em2[i]:.2f} EMA34={es[i]:.2f}" if ef[i] else "no data"}
+
+    if not d:
+        return None,None,0,0,filters
 
     # Separation
     sep=abs(ef[i]-es[i])/es[i] if es[i] else 0
-    sep_ok=True  # TEMP: bypassed for execution test
-    filters["separation"]={"pass":sep_ok,"value":f"{sep:.4f} (bypassed)","need":f">={SEP_FILTER}"}
+    sep_ok=sep>=SEP_FILTER
+    filters["separation"]={"pass":sep_ok,"value":f"{sep:.4f}","need":f">={SEP_FILTER}"}
+    if not sep_ok: return None,None,0,0,filters
 
     # Volume
     vol=vols[i]; vr=vol/vs[i] if vs[i] else 0
     vol_ok=vr>=VOL_FILTER
     filters["volume"]={"pass":vol_ok,"value":f"{vr:.2f}x","need":f">={VOL_FILTER}x"}
 
-    # Breakout
+    # Breakout — fixed to handle BRK_BARS=0 safely
     if i>=BRK_BARS and BRK_BARS>0:
         brk_ok=(closes[i]>max(highs[i-BRK_BARS:i]) if d=="LONG"
                 else closes[i]<min(lows[i-BRK_BARS:i]))
         brk_val=(f"close {closes[i]:.2f} > {max(highs[i-BRK_BARS:i]):.2f}" if d=="LONG"
                  else f"close {closes[i]:.2f} < {min(lows[i-BRK_BARS:i]):.2f}")
     else:
-        brk_ok=True; brk_val="bypassed (BRK_BARS=0)"
+        brk_ok=False; brk_val="insufficient bars"
     filters["breakout"]={"pass":brk_ok,"value":brk_val}
 
-    # BB filter — BYPASSED FOR EXECUTION TEST
+    # BB filter
     if cfg["bb"]:
-        filters["bb_breakout"]={"pass":True,"value":"bypassed (execution test)"}
+        if u[i] and l[i]:
+            bb_ok=(closes[i]>u[i] if d=="LONG" else closes[i]<l[i])
+            bb_val=(f"close {closes[i]:.2f} {'>' if d=='LONG' else '<'} BB {'upper' if d=='LONG' else 'lower'} {(u[i] if d=='LONG' else l[i]):.2f}")
+        else: bb_ok=False; bb_val="BB not calculated"
+        filters["bb_breakout"]={"pass":bb_ok,"value":bb_val}
     else:
         filters["bb_breakout"]={"pass":True,"value":"not required"}
 
-    # Strong close — BYPASSED FOR EXECUTION TEST
+    # Strong close
     if cfg["sc"]:
-        filters["strong_close"]={"pass":True,"value":"bypassed (execution test)"}
+        br=float(candles[i]["h"])-float(candles[i]["l"])
+        if br>0:
+            cp=(closes[i]-float(candles[i]["l"]))/br
+            sc_ok=(cp>=0.70 if d=="LONG" else cp<=0.30)
+            sc_val=f"close pct={cp:.2f} ({'≥0.70' if d=='LONG' else '≤0.30'} needed)"
+        else: sc_ok=False; sc_val="zero range candle"
+        filters["strong_close"]={"pass":sc_ok,"value":sc_val}
     else:
         filters["strong_close"]={"pass":True,"value":"not required"}
 
-    # Regime — BYPASSED FOR EXECUTION TEST
+    # Regime
     if cfg["regime"]:
-        filters["regime"]={"pass":True,"value":"bypassed (execution test)"}
+        try:
+            lkp,atr_v=atr_lookup(candles)
+            if lkp[i] and atr_v[i]:
+                reg_ok=atr_v[i]>lkp[i]*1.2
+                reg_val=f"ATR={atr_v[i]:.4f} vs MA={lkp[i]:.4f} (need >1.2x)"
+            else: reg_ok=True; reg_val="ATR MA not ready — skipping"
+        except: reg_ok=True; reg_val="error — skipping"
+        filters["regime"]={"pass":reg_ok,"value":reg_val}
     else:
         filters["regime"]={"pass":True,"value":"not required"}
 
@@ -1053,13 +1075,10 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <div class="card"><div style="font-size:10px;color:#4A5878;font-weight:600;text-transform:uppercase;margin-bottom:6px">Trades</div><div style="font-family:monospace;font-size:18px;font-weight:700">{tax["total_trades"]}</div></div>
     <div class="card"><div style="font-size:10px;color:#4A5878;font-weight:600;text-transform:uppercase;margin-bottom:6px">Win Rate</div><div style="font-family:monospace;font-size:18px;font-weight:700;color:#00D68F">{wr}</div></div>
   </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px">
-    <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #00D68F;border-radius:12px;padding:12px;color:#00D68F;font-size:12px;font-weight:700;text-decoration:none">🔬 Test</a>
-    <a href="/force-trade" style="display:block;text-align:center;background:#0F1520;border:1px solid #FFB800;border-radius:12px;padding:12px;color:#FFB800;font-size:12px;font-weight:700;text-decoration:none">⚡ Force</a>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">
     <a href="/signal-check" style="display:block;text-align:center;background:#0F1520;border:1px solid #3D9EFF;border-radius:12px;padding:12px;color:#3D9EFF;font-size:12px;font-weight:700;text-decoration:none">📡 Signals</a>
+    <a href="/log" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:12px;color:#4A5878;font-size:13px;text-decoration:none">📋 Export Log</a>
   </div>
-  <a href="/execution-test" style="display:block;text-align:center;background:rgba(255,184,0,0.15);border:2px solid #FFB800;border-radius:12px;padding:14px;color:#FFB800;font-size:14px;font-weight:700;text-decoration:none;margin-bottom:12px">⚡ EXECUTION TEST — All 6 Assets</a>
-  <a href="/log" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:12px;color:#4A5878;font-size:13px;text-decoration:none;margin-bottom:12px">📋 Export Log</a>
   <div class="card">
     {row("Cycle",f"#{s['cycle']}")}{row("Last check",s["last_check"] or "—")}{row("Next check",s["next_check"] or "—")}{row("Mode",mode)}{row("Assets",", ".join(s["assets"]))}
   </div>
@@ -1179,731 +1198,6 @@ def control():
         elif a=="close_all": state["close_all_requested"]=True;add_diag("WARNING","Close all","Dashboard","Closing positions")
         else: return jsonify({"ok":False,"error":"unknown"})
     return jsonify({"ok":True})
-
-@app.route("/test")
-def test_suite():
-    if not session.get("ok"): return redirect("/")
-    results=[]; start_all=time.time()
-    def check(name,fn):
-        t=time.time()
-        try:
-            ok,detail=fn()
-            results.append({"name":name,"ok":ok,"detail":detail,"ms":int((time.time()-t)*1000)})
-        except Exception as e:
-            results.append({"name":name,"ok":False,"detail":str(e),"ms":int((time.time()-t)*1000)})
-
-    def t1():
-        mids=info.all_mids(); btc=float(mids.get("BTC",0)); return btc>0,f"BTC @ ${btc:,.2f}"
-    check("HyperLiquid API connected",t1)
-    def t2():
-        s=info.user_state(MAIN_WALLET); val=float(s["marginSummary"]["accountValue"]); return val>=0,f"${val:.2f} USDC"
-    check("Account balance readable",t2)
-    TESTNET_SKIP=["XRP","LINK","BNB"]
-    for asset in ASSETS:
-        def t3(a=asset):
-            if a in TESTNET_SKIP: return True,f"Skipped — testnet limitation"
-            end_ms=int(time.time()*1000); start_ms=end_ms-200*15*60*1000
-            c=info.candles_snapshot(a,"15m",start_ms,end_ms); ok=c and len(c)>=50
-            age=""
-            if c:
-                tv=str(c[-1].get("t",c[-1].get("T","")))
-                if tv.isdigit():
-                    age_s=int((time.time()*1000-int(tv))/1000)
-                    age=f" | {age_s//60}m{age_s%60}s ago"
-                    if age_s>1200: ok=False
-            return ok,f"{len(c) if c else 0} bars{age}"
-        check(f"Candles: {asset}",t3)
-    def t4(): return state["cycle"]>0,f"Cycle #{state['cycle']} | {state['status']}"
-    check("Strategy loop running",t4)
-    def t5():
-        skip=["XRP","LINK","BNB"]
-        fresh=[a for a,v in state["health"]["assets_ok"].items() if v.get("fresh") and a not in skip]
-        stale=[a for a,v in state["health"]["assets_ok"].items() if not v.get("fresh") and a not in skip]
-        ok=len(stale)==0
-        return ok,f"All {len(fresh)} fresh" if ok else f"STALE: {', '.join(stale)}"
-    check("All assets fresh",t5)
-    def t6(): r=exchange.update_leverage(LEVERAGE,"BTC",True); return r is not None,f"{LEVERAGE}x confirmed"
-    check("Leverage setting",t6)
-    def t7():
-        ok=not state["kill_switch"] and not state["paused"]
-        return ok,"Ready" if ok else f"kill={state['kill_switch']} pause={state['paused']}"
-    check("Controls not killed/paused",t7)
-    def t8():
-        try:
-            with open("hl_tax_test.csv","w") as f: f.write("test")
-            os.remove("hl_tax_test.csv"); return True,"CSV writable ✅"
-        except Exception as e: return False,str(e)
-    check("Tax tracker writable",t8)
-    def t9():
-        r=req.post(NTFY_URL,data="✅ HL Trader test alert",
-                   headers={"Title":"System Test","Tags":"white_check_mark"},timeout=5)
-        return r.status_code==200,f"HTTP {r.status_code} — check your phone"
-    check("ntfy alert",t9)
-    def t10():
-        audit_count=len(state["audit"])
-        return True,f"{audit_count} events in audit trail"
-    check("Audit trail active",t10)
-
-    elapsed=int((time.time()-start_all)*1000)
-    passed=sum(1 for r in results if r["ok"]); total=len(results); all_pass=passed==total
-    rows_html="".join(f'''
-    <div style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #1E2D42">
-      <div style="font-size:18px;flex-shrink:0">{"✅" if r["ok"] else "❌"}</div>
-      <div style="flex:1"><div style="font-size:13px;font-weight:600">{r["name"]}</div>
-      <div style="font-size:11px;color:#4A5878;font-family:monospace">{r["detail"]}</div></div>
-      <div style="text-align:right">
-        <span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;background:rgba({"0,214,143" if r["ok"] else "255,71,87"},0.15);color:{"#00D68F" if r["ok"] else "#FF4757"}">{"PASS" if r["ok"] else "FAIL"}</span>
-        <div style="font-size:10px;color:#4A5878">{r["ms"]}ms</div>
-      </div>
-    </div>''' for r in results)
-    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"><title>System Test</title></head>
-<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
-<div style="max-width:600px;margin:0 auto">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-    <a href="/" style="color:#4A5878;text-decoration:none;font-size:13px">← Dashboard</a>
-    <div style="font-family:monospace;font-size:20px;font-weight:700;color:#00D68F">System Test</div>
-    <div style="margin-left:auto;font-size:11px;color:#4A5878">{elapsed}ms</div>
-  </div>
-  <div style="background:{"rgba(0,214,143,0.1)" if all_pass else "rgba(255,71,87,0.1)"};border:2px solid {"#00D68F" if all_pass else "#FF4757"};border-radius:16px;padding:20px;text-align:center;margin-bottom:20px">
-    <div style="font-size:40px;margin-bottom:8px">{"✅" if all_pass else "❌"}</div>
-    <div style="font-family:monospace;font-size:24px;font-weight:700;color:{"#00D68F" if all_pass else "#FF4757"}">{passed}/{total} PASSED</div>
-    <div style="font-size:13px;color:#4A5878;margin-top:6px">{"🚀 All systems go" if all_pass else "⚠️ Fix before going live"}</div>
-  </div>
-  <div style="background:#0F1520;border:1px solid #1E2D42;border-radius:16px;padding:0 16px;margin-bottom:16px">{rows_html}</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
-    <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#E8EDF5;font-size:13px;font-weight:600;text-decoration:none">🔄 Run Again</a>
-    <a href="/force-trade" style="display:block;text-align:center;background:#0F1520;border:1px solid #FFB800;border-radius:12px;padding:14px;color:#FFB800;font-size:13px;font-weight:600;text-decoration:none">⚡ Force BTC</a>
-  </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
-    <a href="/force-trade-all" style="display:block;text-align:center;background:#0F1520;border:1px solid #FF4757;border-radius:12px;padding:14px;color:#FF4757;font-size:12px;font-weight:700;text-decoration:none">⚡ All Assets</a>
-    <a href="/strategy-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #3D9EFF;border-radius:12px;padding:14px;color:#3D9EFF;font-size:12px;font-weight:700;text-decoration:none">📊 Strategy</a>
-    <a href="/exit-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #00D68F;border-radius:12px;padding:14px;color:#00D68F;font-size:12px;font-weight:700;text-decoration:none">🚪 Exit</a>
-  </div>
-</div></body></html>'''
-
-@app.route("/force-trade")
-def force_trade():
-    if not session.get("ok"): return redirect("/")
-    results=[]; asset="BTC"; test_usd=20.0
-    st={"price":0,"qty":0,"fill":0,"close":0}
-    def step(name,fn):
-        try:
-            ok,detail=fn(); results.append({"name":name,"ok":ok,"detail":detail}); return ok
-        except Exception as e:
-            results.append({"name":name,"ok":False,"detail":str(e)}); return False
-    def s1():
-        mids=info.all_mids(); st["price"]=float(mids.get(asset,0))
-        return st["price"]>0,f"${st['price']:,.2f}"
-    step("Get BTC price",s1)
-    def s2():
-        meta=info.meta()
-        dec=next((a.get("szDecimals",5) for a in meta["universe"] if a["name"]==asset),5)
-        st["qty"]=round(test_usd/st["price"],dec) if st["price"]>0 else 0
-        return st["qty"]>0,f"{st['qty']} BTC (${st['qty']*st['price']:.2f})"
-    step("Calculate size",s2)
-    def s3():
-        r=exchange.market_open(asset,True,st["qty"])
-        ok=r and r.get("status")=="ok"
-        if ok:
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if statuses and "filled" in statuses[0]: st["fill"]=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Filled @ ${st['fill']:,.2f}" if ok else str(r)
-    step("Place BTC LONG",s3)
-    def s4():
-        time.sleep(15); s=info.user_state(MAIN_WALLET)
-        for p in s.get("assetPositions",[]):
-            if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
-                return True,f"Confirmed @ ${float(p['position']['entryPx']):,.2f}"
-        return False,"NOT visible on exchange"
-    step("Verify on exchange",s4)
-    def s5():
-        time.sleep(30); mids=info.all_mids(); cur=float(mids.get(asset,st["fill"]))
-        pnl=(cur-st["fill"])*st["qty"]; return True,f"Held 30s | cur=${cur:,.2f} | P&L=${pnl:+.4f}"
-    step("Hold 30 seconds",s5)
-    def s6():
-        r=exchange.market_close(asset); ok=r and r.get("status")=="ok"
-        if ok:
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if statuses and "filled" in statuses[0]: st["close"]=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Closed @ ${st['close']:,.2f}" if ok else str(r)
-    step("Close position",s6)
-    def s7():
-        time.sleep(5); s=info.user_state(MAIN_WALLET)
-        still=[p for p in s.get("assetPositions",[]) if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
-        return len(still)==0,"Confirmed closed ✅" if len(still)==0 else "Still open ❌"
-    step("Verify closed",s7)
-    def s8():
-        if st["fill"]>0 and st["close"]>0:
-            pnl=(st["close"]-st["fill"])*st["qty"]
-            return True,f"Entry: ${st['fill']:,.2f} | Exit: ${st['close']:,.2f} | P&L: ${pnl:+.4f}"
-        return False,"Could not calculate"
-    step("Calculate P&L",s8)
-    def s9():
-        pnl=(st["close"]-st["fill"])*st["qty"] if st["fill"] and st["close"] else 0
-        r=req.post(NTFY_URL,data=f"Force trade: {sum(1 for r in results if r['ok'])}/{len(results)} | P&L: ${pnl:+.4f}",
-                   headers={"Title":"Force Trade Test","Tags":"test_tube"},timeout=5)
-        return r.status_code==200,"Alert sent ✅"
-    step("Send ntfy",s9)
-    passed=sum(1 for r in results if r["ok"]); total=len(results); all_pass=passed==total
-    rows_html="".join(f'''
-    <div style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #1E2D42">
-      <div style="font-size:16px;width:24px;text-align:center;flex-shrink:0">{"✅" if r["ok"] else "❌"}</div>
-      <div style="flex:1"><div style="font-size:12px;color:#4A5878">Step {i}</div>
-      <div style="font-size:13px;font-weight:600">{r["name"]}</div>
-      <div style="font-size:11px;color:#4A5878;font-family:monospace">{r["detail"]}</div></div>
-      <span style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;background:rgba({"0,214,143" if r["ok"] else "255,71,87"},0.15);color:{"#00D68F" if r["ok"] else "#FF4757"}">{"PASS" if r["ok"] else "FAIL"}</span>
-    </div>''' for i,r in enumerate(results,1))
-    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"><title>Force Trade</title></head>
-<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
-<div style="max-width:600px;margin:0 auto">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-    <a href="/test" style="color:#4A5878;text-decoration:none;font-size:13px">← Tests</a>
-    <div style="font-family:monospace;font-size:20px;font-weight:700;color:#FFB800">Force Trade Test</div>
-  </div>
-  <div style="background:{"rgba(0,214,143,0.1)" if all_pass else "rgba(255,71,87,0.1)"};border:2px solid {"#00D68F" if all_pass else "#FF4757"};border-radius:16px;padding:20px;text-align:center;margin-bottom:20px">
-    <div style="font-size:40px;margin-bottom:8px">{"✅" if all_pass else "❌"}</div>
-    <div style="font-family:monospace;font-size:24px;font-weight:700;color:{"#00D68F" if all_pass else "#FF4757"}">{passed}/{total} PASSED</div>
-    <div style="font-size:13px;color:#4A5878;margin-top:6px">{"Execution confirmed ✅" if all_pass else "Issue detected"}</div>
-  </div>
-  <div style="background:#0F1520;border:1px solid #1E2D42;border-radius:16px;padding:0 16px;margin-bottom:16px">{rows_html}</div>
-  <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#E8EDF5;font-size:13px;font-weight:600;text-decoration:none">← Back to Tests</a>
-</div></body></html>'''
-
-@app.route("/force-trade-all")
-def force_trade_all():
-    if not session.get("ok"): return redirect("/")
-
-    def test_asset(asset):
-        results=[]; state={"price":0,"qty":0,"fill":0,"close":0}
-
-        def step(name,fn):
-            try:
-                ok,detail=fn()
-                results.append({"name":name,"ok":ok,"detail":detail})
-                return ok
-            except Exception as e:
-                results.append({"name":name,"ok":False,"detail":str(e)})
-                return False
-
-        def get_price():
-            mids=info.all_mids()
-            state["price"]=float(mids.get(asset,0))
-            return state["price"]>0,f"${state['price']:,.4f}"
-        step(f"Get {asset} price",get_price)
-
-        def calc_size():
-            meta=info.meta()
-            dec=next((x.get("szDecimals",5) for x in meta["universe"] if x["name"]==asset),5)
-            p=state["price"]
-            if p<=0: return False,"No price"
-            raw=round(10.0/p,dec)
-            if raw*p<10: raw=round(raw+1/p,dec)
-            state["qty"]=raw
-            return raw*p>=10,f"{raw} {asset} (${raw*p:.2f} notional)"
-        step(f"Calculate size (min $10)",calc_size)
-
-        def place_order():
-            r=exchange.market_open(asset,True,state["qty"])
-            ok=r and r.get("status")=="ok"
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
-            if statuses and "error" in statuses[0]:
-                return False,f"Rejected: {statuses[0]['error']}"
-            if ok and statuses and "filled" in statuses[0]:
-                state["fill"]=float(statuses[0]["filled"]["avgPx"])
-            return ok,f"Filled @ ${state['fill']:,.4f}" if ok else f"Failed: {r}"
-        step(f"Place LONG order",place_order)
-
-        def verify_entry():
-            time.sleep(15)
-            s=info.user_state(MAIN_WALLET)
-            for p in s.get("assetPositions",[]):
-                if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
-                    return True,f"Confirmed @ ${float(p['position']['entryPx']):,.4f}"
-            return False,"NOT visible after 15s"
-        step(f"Verify on exchange",verify_entry)
-
-        def hold():
-            time.sleep(10)
-            mids=info.all_mids()
-            cur=float(mids.get(asset,state["fill"]))
-            pnl=(cur-state["fill"])*state["qty"] if state["fill"]>0 else 0
-            return True,f"Held 10s | cur=${cur:,.4f} | P&L=${pnl:+.4f}"
-        step(f"Hold position",hold)
-
-        def close_pos():
-            r=exchange.market_close(asset)
-            ok=r and r.get("status")=="ok"
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
-            if statuses and "error" in statuses[0]:
-                return False,f"Rejected: {statuses[0]['error']}"
-            if ok and statuses and "filled" in statuses[0]:
-                state["close"]=float(statuses[0]["filled"]["avgPx"])
-            return ok,f"Closed @ ${state['close']:,.4f}" if ok else f"Failed: {r}"
-        step(f"Close position",close_pos)
-
-        def verify_closed():
-            time.sleep(5)
-            s=info.user_state(MAIN_WALLET)
-            still=[p for p in s.get("assetPositions",[])
-                   if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
-            return len(still)==0,"Confirmed closed ✅" if len(still)==0 else "Still open ❌"
-        step(f"Verify closed",verify_closed)
-
-        def calc_pnl():
-            f=state["fill"]; c=state["close"]; q=state["qty"]
-            if f>0 and c>0:
-                pnl=(c-f)*q
-                return True,f"Entry ${f:,.4f} → Exit ${c:,.4f} | P&L ${pnl:+.4f}"
-            return False,"Could not calculate"
-        step(f"P&L calculation",calc_pnl)
-
-        return results
-
-    all_results={}
-    for asset in ASSETS:
-        all_results[asset]=test_asset(asset)
-        time.sleep(2)
-
-    total_pass=sum(1 for results in all_results.values() if all(r["ok"] for r in results))
-    all_pass=total_pass==len(ASSETS)
-
-    assets_html=""
-    for asset,results in all_results.items():
-        passed=sum(1 for r in results if r["ok"]); total=len(results); ok=passed==total
-        rows="".join(f'''
-        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1E2D42">
-          <div style="font-size:14px;flex-shrink:0">{"✅" if r["ok"] else "❌"}</div>
-          <div style="flex:1"><div style="font-size:12px;font-weight:600">{r["name"]}</div>
-          <div style="font-size:11px;color:#4A5878;font-family:monospace">{r["detail"]}</div></div>
-          <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba({"0,214,143" if r["ok"] else "255,71,87"},0.15);color:{"#00D68F" if r["ok"] else "#FF4757"}">{"PASS" if r["ok"] else "FAIL"}</span>
-        </div>''' for r in results)
-        assets_html+=f'''
-        <div style="background:#0F1520;border:2px solid {"#00D68F" if ok else "#FF4757"};border-radius:16px;padding:16px;margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-            <div style="font-family:monospace;font-size:16px;font-weight:700">{asset}-PERP</div>
-            <span style="font-size:12px;font-weight:700;padding:4px 12px;border-radius:8px;background:rgba({"0,214,143" if ok else "255,71,87"},0.15);color:{"#00D68F" if ok else "#FF4757"}">{passed}/{total} {"✅" if ok else "❌"}</span>
-          </div>
-          <div style="padding:0 4px">{rows}</div>
-        </div>'''
-
-    return f'''<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>Force Trade All</title></head>
-<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
-<div style="max-width:600px;margin:0 auto">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-    <a href="/test" style="color:#4A5878;text-decoration:none;font-size:13px">← Tests</a>
-    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#FFB800">Force Trade All Assets</div>
-  </div>
-  <div style="background:{"rgba(0,214,143,0.1)" if all_pass else "rgba(255,71,87,0.1)"};border:2px solid {"#00D68F" if all_pass else "#FF4757"};border-radius:16px;padding:20px;text-align:center;margin-bottom:20px">
-    <div style="font-size:36px;margin-bottom:8px">{"✅" if all_pass else "❌"}</div>
-    <div style="font-family:monospace;font-size:22px;font-weight:700;color:{"#00D68F" if all_pass else "#FF4757"}">{total_pass}/{len(ASSETS)} ASSETS PASSED</div>
-    <div style="font-size:13px;color:#4A5878;margin-top:6px">{"All assets execute correctly ✅" if all_pass else "Some assets have execution issues"}</div>
-  </div>
-  {assets_html}
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-    <a href="/force-trade-all" style="display:block;text-align:center;background:#0F1520;border:1px solid #FFB800;border-radius:12px;padding:14px;color:#FFB800;font-size:13px;font-weight:600;text-decoration:none">🔄 Run Again</a>
-    <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#4A5878;font-size:13px;font-weight:600;text-decoration:none">← Tests</a>
-  </div>
-</div></body></html>'''
-
-@app.route("/strategy-test")
-def strategy_test():
-    if not session.get("ok"): return redirect("/")
-    """
-    Tests the full strategy loop for one candle per asset:
-    1. Fetch real candles
-    2. Run all filters
-    3. Show exactly what would happen if signal fired right now
-    4. If in test mode, actually place and close the trade
-    """
-    results=[]
-    for asset in ASSETS:
-        try:
-            end_ms=int(time.time()*1000)
-            start_ms=end_ms-200*15*60*1000
-            candles=info.candles_snapshot(asset,CANDLE_TF,start_ms,end_ms)
-            if not candles or len(candles)<50:
-                results.append({"asset":asset,"status":"❌ NO CANDLES","filters":{},"would_trade":False,"detail":"Insufficient candle data"})
-                continue
-
-            direction,signal_price,sig_vol,sig_vs,filters=evaluate_signal(candles,asset)
-            result=filters.get("_result",{})
-            blocked=result.get("blocked_by",[])
-            would_trade=direction is not None
-
-            # Check cooldown
-            cd=ASSET_CFG[asset].get("cd",0)
-            cd_blocked=cd>0 and (bar_count.get(asset,0)-last_exit.get(asset,0))<cd
-            if cd_blocked:
-                bars_left=cd-(bar_count.get(asset,0)-last_exit.get(asset,0))
-                blocked.append(f"cooldown ({bars_left} bars left)")
-                would_trade=False
-
-            # Check if already in position
-            in_position=asset in positions
-            if in_position:
-                pos=positions[asset]
-                detail=f"IN POSITION: {pos['direction']} @ ${pos['entry']:,.2f} | trail=${pos['trail_stop']:,.2f} | liq=${pos['liq']:,.2f}"
-            elif would_trade:
-                pos_usd=get_pos_usd(sig_vol,sig_vs,
-                    ema([float(c["c"]) for c in candles],EMA_FAST)[-1],
-                    ema([float(c["c"]) for c in candles],EMA_SLOW)[-1])
-                qty_est=round((pos_usd*LEVERAGE)/signal_price,6)
-                stop_est=round(signal_price*(1-STOP_PCT),2)
-                liq_est=liq_price(signal_price,direction)
-                detail=(f"WOULD ENTER: {direction} @ ${signal_price:,.4f} | "
-                       f"qty={qty_est} | stop=${stop_est:,.4f} | liq=${liq_est:,.4f} | "
-                       f"pos_usd=${pos_usd:.0f}")
-            else:
-                detail=f"NO TRADE: blocked by {', '.join(blocked)}" if blocked else "NO TRADE: EMA not stacked"
-
-            results.append({
-                "asset":asset,"status":"🚨 SIGNAL" if would_trade else ("📊 IN POSITION" if in_position else "⏳ NO SIGNAL"),
-                "direction":direction,"price":signal_price or float(candles[-1]["c"]),
-                "filters":filters,"blocked":blocked,"would_trade":would_trade,
-                "in_position":in_position,"detail":detail
-            })
-        except Exception as e:
-            results.append({"asset":asset,"status":"❌ ERROR","filters":{},"would_trade":False,"detail":str(e)})
-
-    signals=[r for r in results if r.get("would_trade")]
-    positions_open=[r for r in results if r.get("in_position")]
-
-    assets_html=""
-    for r in results:
-        st=r["status"]
-        if "SIGNAL" in st: sc="255,184,0"
-        elif "POSITION" in st: sc="61,158,255"
-        elif "ERROR" in st: sc="255,71,87"
-        else: sc="74,88,120"
-
-        filters=r.get("filters",{})
-        filter_pills=""
-        for k,v in filters.items():
-            if k=="_result": continue
-            fc="0,214,143" if v.get("pass") else "255,71,87"
-            filter_pills+=f'<span style="font-size:10px;padding:2px 5px;border-radius:3px;margin:2px;display:inline-block;background:rgba({fc},0.15);color:rgb({fc})">{k}:{"✅" if v.get("pass") else "❌"} <span style="opacity:0.7">{str(v.get("value",""))[:15]}</span></span>'
-
-        assets_html+=f'''
-        <div style="background:#0F1520;border:1px solid #1E2D42;border-radius:16px;padding:14px;margin-bottom:10px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-            <div style="font-family:monospace;font-size:15px;font-weight:700">{r["asset"]}-PERP</div>
-            <span style="font-size:11px;font-weight:700;padding:3px 8px;border-radius:6px;background:rgba({sc},0.15);color:rgb({sc})">{st}</span>
-          </div>
-          <div style="font-size:11px;color:#4A5878;font-family:monospace;margin-bottom:8px;line-height:1.5">{r["detail"]}</div>
-          <div style="display:flex;flex-wrap:wrap;gap:2px">{filter_pills}</div>
-          {f'<div style="font-size:11px;color:#FF4757;margin-top:6px">Blocked: {", ".join(r["blocked"])}</div>' if r.get("blocked") else ""}
-        </div>'''
-
-    return f'''<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>Strategy Test</title></head>
-<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
-<div style="max-width:600px;margin:0 auto">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-    <a href="/test" style="color:#4A5878;text-decoration:none;font-size:13px">← Tests</a>
-    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#3D9EFF">Strategy Test</div>
-    <div style="margin-left:auto;font-size:11px;color:#4A5878">{ts()} UTC</div>
-  </div>
-  <div style="background:#0F1520;border:1px solid #1E2D42;border-radius:16px;padding:16px;margin-bottom:16px">
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;text-align:center">
-      <div><div style="font-size:22px;font-weight:700;color:#FFB800">{len(signals)}</div><div style="font-size:11px;color:#4A5878">Signals Ready</div></div>
-      <div><div style="font-size:22px;font-weight:700;color:#3D9EFF">{len(positions_open)}</div><div style="font-size:11px;color:#4A5878">In Position</div></div>
-      <div><div style="font-size:22px;font-weight:700;color:#4A5878">{len(results)-len(signals)-len(positions_open)}</div><div style="font-size:11px;color:#4A5878">Waiting</div></div>
-    </div>
-  </div>
-  <div style="font-size:11px;color:#4A5878;margin-bottom:10px">
-    Shows exactly what the strategy loop sees right now — every filter, every value, every decision.
-    "SIGNAL" means if a new candle closed right now, a trade would fire.
-  </div>
-  {assets_html}
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-    <a href="/strategy-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #3D9EFF;border-radius:12px;padding:14px;color:#3D9EFF;font-size:13px;font-weight:600;text-decoration:none">🔄 Refresh</a>
-    <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#4A5878;font-size:13px;font-weight:600;text-decoration:none">← Tests</a>
-  </div>
-</div></body></html>'''
-
-@app.route("/exit-test")
-def exit_test():
-    if not session.get("ok"): return redirect("/")
-    """
-    Opens a real position on BTC, then tests all 3 exit conditions:
-    1. Trail stop — moves trail up, confirms it triggers
-    2. Hard stop — confirms stop is set correctly
-    3. EMA cross — confirms exit fires on EMA flip
-    Then closes the position and confirms.
-    """
-    results=[]; asset="BTC"; st={"price":0,"qty":0,"fill":0}
-
-    def step(name,fn):
-        try:
-            ok,detail=fn(); results.append({"name":name,"ok":ok,"detail":detail}); return ok
-        except Exception as e:
-            results.append({"name":name,"ok":False,"detail":str(e)}); return False
-
-    # Step 1: Get price
-    def s1():
-        mids=info.all_mids(); p=float(mids.get(asset,0))
-        st["price"]=p; st["fill"]=p
-        return p>0,f"BTC @ ${p:,.2f}"
-    step("Get BTC price",s1)
-
-    # Step 2: Calculate size
-    def s2():
-        meta=info.meta()
-        dec=next((a.get("szDecimals",5) for a in meta["universe"] if a["name"]==asset),5)
-        st["qty"]=round(20/st["price"],dec) if st["price"]>0 else 0
-        return st["qty"]>0,f"{st['qty']} BTC (${st['qty']*st['price']:.2f})"
-    step("Calculate test size ($20)",s2)
-
-    # Step 3: Open position
-    def s3():
-        r=exchange.market_open(asset,True,st["qty"])
-        ok=r and r.get("status")=="ok"
-        if ok:
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if statuses and "filled" in statuses[0]:
-                st["fill"]=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Opened LONG @ ${st['fill']:,.2f}"
-    step("Open BTC LONG position",s3)
-
-    # Step 4: Verify on exchange
-    def s4():
-        time.sleep(15)
-        s=info.user_state(MAIN_WALLET)
-        for p in s.get("assetPositions",[]):
-            if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
-                return True,f"Position confirmed @ ${float(p['position']['entryPx']):,.2f}"
-        return False,"Position NOT visible after 15s"
-    step("Verify position on exchange",s4)
-
-    # Step 5: Verify stop loss calculation
-    def s5():
-        stop=round(st["fill"]*(1-STOP_PCT),2)
-        liq=liq_price(st["fill"],"LONG")
-        dist_stop=round((st["fill"]-stop)/st["fill"]*100,2)
-        dist_liq=round((st["fill"]-liq)/st["fill"]*100,2)
-        return True,(f"Hard stop: ${stop:,.2f} ({dist_stop}% below entry) | "
-                     f"Liq: ${liq:,.2f} ({dist_liq}% below) | "
-                     f"Stop fires BEFORE liquidation: {'✅' if stop>liq else '❌'}")
-    step("Verify stop loss vs liquidation",s5)
-
-    # Step 6: Verify trail stop logic
-    def s6():
-        trail=round(st["fill"]*(1-TRAIL_PCT),2)
-        new_peak=st["fill"]*1.02
-        new_trail=round(new_peak*(1-TRAIL_PCT),2)
-        return True,(f"Initial trail: ${trail:,.2f} | "
-                     f"After 2% move up to ${new_peak:,.2f}: trail moves to ${new_trail:,.2f} | "
-                     f"Trail always below peak: ✅")
-    step("Verify trail stop logic",s6)
-
-    # Step 7: Verify EMA exit would work
-    def s7():
-        try:
-            end_ms=int(time.time()*1000); start_ms=end_ms-200*15*60*1000
-            candles=info.candles_snapshot(asset,CANDLE_TF,start_ms,end_ms)
-            closes=[float(c["c"]) for c in candles]
-            ef=ema(closes,EMA_FAST); em2=ema(closes,EMA_MID)
-            cross=ef[-1]<em2[-1]
-            return True,(f"EMA5={ef[-1]:.2f} vs EMA13={em2[-1]:.2f} | "
-                         f"Currently crossed (exit would fire): {'YES' if cross else 'NO — holding'} | "
-                         f"Exit logic reads live candles: ✅")
-        except Exception as e:
-            return False,str(e)
-    step("Verify EMA exit logic",s7)
-
-    # Step 8: Close position
-    def s8():
-        r=exchange.market_close(asset)
-        ok=r and r.get("status")=="ok"
-        close_p=0
-        if ok:
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-            if statuses and "filled" in statuses[0]:
-                close_p=float(statuses[0]["filled"]["avgPx"])
-        return ok,f"Closed @ ${close_p:,.2f}" if ok else str(r)
-    step("Close position (market close)",s8)
-
-    # Step 9: Verify closed
-    def s9():
-        time.sleep(5)
-        s=info.user_state(MAIN_WALLET)
-        still=[p for p in s.get("assetPositions",[])
-               if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
-        return len(still)==0,"Confirmed closed ✅" if len(still)==0 else "Still open ❌"
-    step("Verify position closed",s9)
-
-    passed=sum(1 for r in results if r["ok"]); total=len(results); all_pass=passed==total
-    rows_html="".join(f'''
-    <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #1E2D42">
-      <div style="font-size:16px;flex-shrink:0">{"✅" if r["ok"] else "❌"}</div>
-      <div style="flex:1">
-        <div style="font-size:12px;color:#4A5878">Step {i}</div>
-        <div style="font-size:13px;font-weight:600">{r["name"]}</div>
-        <div style="font-size:11px;color:#4A5878;font-family:monospace;line-height:1.4">{r["detail"]}</div>
-      </div>
-      <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;flex-shrink:0;background:rgba({"0,214,143" if r["ok"] else "255,71,87"},0.15);color:{"#00D68F" if r["ok"] else "#FF4757"}">{"PASS" if r["ok"] else "FAIL"}</span>
-    </div>''' for i,r in enumerate(results,1))
-
-    return f'''<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>Exit Test</title></head>
-<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
-<div style="max-width:600px;margin:0 auto">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-    <a href="/test" style="color:#4A5878;text-decoration:none;font-size:13px">← Tests</a>
-    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#00D68F">Exit Test</div>
-  </div>
-  <div style="background:{"rgba(0,214,143,0.1)" if all_pass else "rgba(255,71,87,0.1)"};border:2px solid {"#00D68F" if all_pass else "#FF4757"};border-radius:16px;padding:20px;text-align:center;margin-bottom:20px">
-    <div style="font-size:36px;margin-bottom:8px">{"✅" if all_pass else "❌"}</div>
-    <div style="font-family:monospace;font-size:22px;font-weight:700;color:{"#00D68F" if all_pass else "#FF4757"}">{passed}/{total} STEPS PASSED</div>
-    <div style="font-size:13px;color:#4A5878;margin-top:6px">{"All exit conditions verified ✅" if all_pass else "Exit issue detected — review before going live"}</div>
-  </div>
-  <div style="background:#0F1520;border:1px solid #1E2D42;border-radius:16px;padding:0 16px;margin-bottom:16px">{rows_html}</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-    <a href="/exit-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #00D68F;border-radius:12px;padding:14px;color:#00D68F;font-size:13px;font-weight:600;text-decoration:none">🔄 Run Again</a>
-    <a href="/test" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#4A5878;font-size:13px;font-weight:600;text-decoration:none">← Tests</a>
-  </div>
-</div></body></html>'''
-
-@app.route("/execution-test")
-def execution_test():
-    if not session.get("ok"): return redirect("/")
-    """
-    Pure execution test — no filters, no market conditions.
-    For each asset: wait 30s, enter, wait 30s, exit, confirm.
-    Answers: can the system place AND close trades on all 6 assets?
-    """
-    results={}
-
-    def test_asset(asset):
-        steps=[]; st={"fill":0,"close":0,"qty":0}
-
-        def step(name,fn):
-            try:
-                ok,detail=fn()
-                steps.append({"name":name,"ok":ok,"detail":detail})
-                return ok
-            except Exception as e:
-                steps.append({"name":name,"ok":False,"detail":str(e)})
-                return False
-
-        def get_size():
-            mids=info.all_mids()
-            price=float(mids.get(asset,0))
-            if price<=0: return False,f"No price for {asset}"
-            meta=info.meta()
-            dec=next((x.get("szDecimals",5) for x in meta["universe"] if x["name"]==asset),5)
-            # Minimum $10 order
-            qty=round(10.0/price,dec)
-            while qty*price<10: qty=round(qty+10/price,dec)
-            st["qty"]=qty
-            return True,f"${price:,.4f} | size={qty} (${qty*price:.2f})"
-        step("Get price & size",get_size)
-
-        def enter():
-            r=exchange.market_open(asset,True,st["qty"])
-            ok=r and r.get("status")=="ok"
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
-            if statuses and "error" in statuses[0]:
-                return False,f"Rejected: {statuses[0]['error']}"
-            if ok and statuses and "filled" in statuses[0]:
-                st["fill"]=float(statuses[0]["filled"]["avgPx"])
-            return ok,f"Filled @ ${st['fill']:,.4f}" if ok else f"Failed: {r}"
-        step("Place LONG order",enter)
-
-        def verify_open():
-            time.sleep(15)
-            s=info.user_state(MAIN_WALLET)
-            for p in s.get("assetPositions",[]):
-                if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0:
-                    return True,f"Confirmed open @ ${float(p['position']['entryPx']):,.4f}"
-            return False,"NOT visible after 15s"
-        step("Verify open on exchange",verify_open)
-
-        def hold():
-            time.sleep(30)
-            mids=info.all_mids()
-            cur=float(mids.get(asset,st["fill"]))
-            pnl=(cur-st["fill"])*st["qty"] if st["fill"]>0 else 0
-            return True,f"Held 30s | cur=${cur:,.4f} | P&L=${pnl:+.4f}"
-        step("Hold 30 seconds",hold)
-
-        def close():
-            r=exchange.market_close(asset)
-            ok=r and r.get("status")=="ok"
-            statuses=r.get("response",{}).get("data",{}).get("statuses",[]) if r else []
-            if statuses and "error" in statuses[0]:
-                return False,f"Rejected: {statuses[0]['error']}"
-            if ok and statuses and "filled" in statuses[0]:
-                st["close"]=float(statuses[0]["filled"]["avgPx"])
-            return ok,f"Closed @ ${st['close']:,.4f}" if ok else f"Failed: {r}"
-        step("Close position",close)
-
-        def verify_closed():
-            time.sleep(10)
-            s=info.user_state(MAIN_WALLET)
-            still=[p for p in s.get("assetPositions",[])
-                   if p["position"]["coin"]==asset and float(p["position"]["szi"])!=0]
-            closed=len(still)==0
-            pnl=(st["close"]-st["fill"])*st["qty"] if st["fill"]>0 and st["close"]>0 else 0
-            return closed,f"{'Confirmed closed ✅' if closed else 'Still open ❌'} | P&L=${pnl:+.4f}"
-        step("Verify closed + P&L",verify_closed)
-
-        return steps
-
-    for asset in ASSETS:
-        results[asset]=test_asset(asset)
-        time.sleep(1)
-
-    # Build results HTML
-    total_assets=len(ASSETS)
-    passed_assets=sum(1 for steps in results.values() if all(s["ok"] for s in steps))
-    all_pass=passed_assets==total_assets
-
-    assets_html=""
-    for asset,steps in results.items():
-        passed=sum(1 for s in steps if s["ok"]); total=len(steps); ok=passed==total
-        rows="".join(f'''
-        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1E2D42">
-          <div style="font-size:14px;flex-shrink:0">{"✅" if s["ok"] else "❌"}</div>
-          <div style="flex:1">
-            <div style="font-size:12px;font-weight:600">{s["name"]}</div>
-            <div style="font-size:11px;color:#4A5878;font-family:monospace">{s["detail"]}</div>
-          </div>
-          <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba({"0,214,143" if s["ok"] else "255,71,87"},0.15);color:{"#00D68F" if s["ok"] else "#FF4757"}">{"PASS" if s["ok"] else "FAIL"}</span>
-        </div>''' for s in steps)
-        assets_html+=f'''
-        <div style="background:#0F1520;border:2px solid {"#00D68F" if ok else "#FF4757"};border-radius:16px;padding:16px;margin-bottom:12px">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-            <div style="font-family:monospace;font-size:16px;font-weight:700">{asset}-PERP</div>
-            <span style="font-size:12px;font-weight:700;padding:4px 12px;border-radius:8px;background:rgba({"0,214,143" if ok else "255,71,87"},0.15);color:{"#00D68F" if ok else "#FF4757"}">{passed}/{total} {"✅" if ok else "❌"}</span>
-          </div>
-          <div style="padding:0 4px">{rows}</div>
-        </div>'''
-
-    return f'''<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>Execution Test</title></head>
-<body style="background:#080B10;color:#E8EDF5;font-family:-apple-system,sans-serif;padding:20px;padding-top:calc(20px + env(safe-area-inset-top))">
-<div style="max-width:600px;margin:0 auto">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-    <a href="/" style="color:#4A5878;text-decoration:none;font-size:13px">← Dashboard</a>
-    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#FFB800">Execution Test</div>
-  </div>
-  <div style="background:{"rgba(0,214,143,0.1)" if all_pass else "rgba(255,71,87,0.1)"};border:2px solid {"#00D68F" if all_pass else "#FF4757"};border-radius:16px;padding:20px;text-align:center;margin-bottom:20px">
-    <div style="font-size:36px;margin-bottom:8px">{"✅" if all_pass else "❌"}</div>
-    <div style="font-family:monospace;font-size:22px;font-weight:700;color:{"#00D68F" if all_pass else "#FF4757"}">{passed_assets}/{total_assets} ASSETS PASSED</div>
-    <div style="font-size:13px;color:#4A5878;margin-top:6px">{"All assets can place AND close trades ✅" if all_pass else "Execution issues found — check failed assets"}</div>
-  </div>
-  {assets_html}
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-    <a href="/execution-test" style="display:block;text-align:center;background:#0F1520;border:1px solid #FFB800;border-radius:12px;padding:14px;color:#FFB800;font-size:13px;font-weight:600;text-decoration:none">🔄 Run Again</a>
-    <a href="/" style="display:block;text-align:center;background:#0F1520;border:1px solid #1E2D42;border-radius:12px;padding:14px;color:#4A5878;font-size:13px;font-weight:600;text-decoration:none">← Dashboard</a>
-  </div>
-</div></body></html>'''
 
 @app.route("/signal-check")
 def signal_check():
