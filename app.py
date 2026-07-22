@@ -1325,6 +1325,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 
 <div id="tn" class="sec">
   <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin-bottom:10px">🧪 Testnet — Binance Candles + Testnet Execution</div>
+  <a href="/log-testnet" style="display:block;text-align:center;background:#0F1520;border:1px solid #00B4FF;border-radius:12px;padding:12px;color:#00B4FF;font-weight:600;text-decoration:none;margin-bottom:12px">📋 Export Testnet Log</a>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
     <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">BALANCE</div><div style="font-size:20px;font-weight:700">${tn_state["balance"]:,.2f}</div></div>
     <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">OPEN</div><div style="font-size:20px;font-weight:700">{len(tn_state["positions"])}</div></div>
@@ -1545,6 +1546,32 @@ def log_export():
     lines.append("\nDIAGNOSTICS:")
     for d in s["diagnostics"][:20]:
         lines.append(f"  {d['time']} [{d['level']}] {d['event']} | {d['cause']}")
+    lines.append("\n"+"="*60)
+    return Response("\n".join(lines),mimetype="text/plain")
+
+@app.route("/log-testnet")
+def log_export_testnet():
+    if not session.get("ok"): return "unauthorized",401
+    s=tn_state
+    lines=["="*60,"HL TRADER v3 — TESTNET LOG (Binance Candles)",f"Generated: {ts()} UTC","="*60]
+    lines.append(f"\nCycle #{s['cycle']} | Balance: ${s['balance']:,.2f}")
+    lines.append(f"Trades: {s['tax']['total_trades']} | W:{s['tax']['winning_trades']} L:{s['tax']['losing_trades']}")
+    lines.append(f"Gross P&L: ${s['tax']['total_pnl']:+,.4f}")
+    lines.append("\nOPEN POSITIONS:")
+    for asset,pos in s["positions"].items():
+        lines.append(f"  {asset}: {pos['direction']} @ ${pos['entry']:,.4f} | now=${pos.get('current_price',pos['entry']):,.4f}")
+    if not s["positions"]: lines.append("  None")
+    lines.append("\nTRADE HISTORY:")
+    for t in s["trades"]:
+        ep=f"${t['exit']:,.4f}" if t.get("exit") else "—"
+        pl=f"${t['pnl']:+,.4f}" if t.get("pnl") is not None else "open"
+        lines.append(f"  {t['time']} | {t['asset']} {t['direction']} {t['action']} | ${t['entry']:,.4f}→{ep} | {t.get('reason','—')} | {pl}")
+    lines.append(f"\nISSUES ({len(s.get('issues',[]))}):")
+    for iss in s.get("issues",[]):
+        lines.append(f"  {iss['time']} | {iss['asset']} | {iss['issue']} | {iss['detail']}")
+    lines.append(f"\nAUDIT TRAIL (all {len(s['audit'])} entries):")
+    for a in s["audit"]:
+        lines.append(f"  {a['time']} | {a['asset']:<6} | {a['event']:<30} | {a['detail']}")
     lines.append("\n"+"="*60)
     return Response("\n".join(lines),mimetype="text/plain")
 
