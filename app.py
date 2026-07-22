@@ -785,6 +785,16 @@ def trading_loop():
 
                 log(f"🕯  {asset}: NEW candle ts={ts_val} | price=${cur:,.2f} | age={age_s}s")
                 add_audit(asset,"🕯 NEW CANDLE",f"ts={ts_val} | price=${cur:,.2f} | age={age_s}s | evaluating signal...")
+
+                # VOLUME TIMING FIX: only evaluate candles 800s+ old
+                # At <800s the candle has <10% of final volume — VOL_FILTER always fails
+                # At 800s+ (13+ min) candle has near-final volume for accurate evaluation
+                # Exception: if we already have a position, still manage exits
+                if age_s < 800 and asset not in positions:
+                    add_audit(asset,"⏳ TOO EARLY",f"age={age_s}s < 800s — waiting for candle to mature before evaluating")
+                    log(f"⏳ {asset}: candle too young ({age_s}s) — skipping signal eval until 800s")
+                    continue  # Don't mark as evaluated — re-evaluate next cycle
+
                 last_candle[asset]=ts_val
 
                 # Evaluate signal with full filter breakdown
