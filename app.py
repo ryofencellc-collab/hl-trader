@@ -29,6 +29,15 @@ PASSWORD        = os.environ.get("DASHBOARD_PASSWORD","hl2026")
 NTFY_TOPIC      = "hl-trader-lunchm0ney"
 NTFY_URL        = f"https://ntfy.sh/{NTFY_TOPIC}"
 
+# ── TESTNET PAPER TRADING (Binance candles + testnet execution) ────────────
+TN_WALLET       = "0xa90566c8d886CA63c1194101a7dA2Fa129D26B58"
+TN_API_KEY      = "0x5b75aa092ea3bd1ee77983ab5b8268607120a0145de6df11174b3f72f91b9ea0"
+TN_LEVERAGE     = 10
+TN_TOTAL_USDC   = 988.0
+BINANCE_URL     = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_SYM     = {"BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT",
+                   "BNB":"BNBUSDT","DOGE":"DOGEUSDT","AVAX":"AVAXUSDT"}
+
 ASSETS          = ["BTC","ETH","SOL","BNB","DOGE","AVAX"]
 TOTAL_USDC      = 5.0
 BASE_POS        = TOTAL_USDC / len(ASSETS)
@@ -86,6 +95,7 @@ state = {
     "assets":ASSETS,"balance":TOTAL_USDC,
     "positions":{},"trades":[],"diagnostics":[],"weekly_pnl":{},
     "paused":False,"kill_switch":False,"close_all_requested":False,
+    "issues":[],
     # Full audit log — every candle, every signal, every skip
     "audit":[],
     "health":{"api_connected":False,"last_ping":None,"assets_ok":{},
@@ -106,6 +116,59 @@ state = {
 }
 lock=threading.Lock()
 
+# ── TESTNET STATE (Binance candles + testnet execution) ────────────────────
+tn_state = {
+    "status":"starting","cycle":0,"balance":TN_TOTAL_USDC,
+    "positions":{},"trades":[],"diagnostics":[],"weekly_pnl":{},
+    "paused":False,"kill_switch":False,
+    "audit":[],"issues":[],
+    "health":{"api_connected":False,"last_ping":None,"assets_ok":{}},
+    "tax":{"total_pnl":0.0,"total_tax":0.0,"total_net":0.0,
+           "winning_trades":0,"losing_trades":0,"total_trades":0},
+}
+tn_lock=threading.Lock()
+
+def fetch_binance_candles(asset):
+    """Fetch Binance candles for signal evaluation — always complete candles."""
+    try:
+        sym=BINANCE_SYM.get(asset,asset+"USDT")
+        end_ms=int(time.time()*1000)
+        start_ms=end_ms-CANDLE_LIMIT*15*60*1000
+        r=req.get(BINANCE_URL,params={"symbol":sym,"interval":"15m",
+            "startTime":start_ms,"endTime":end_ms,"limit":CANDLE_LIMIT},timeout=10)
+        candles=[]
+        for c in r.json():
+            candles.append({"t":int(c[0]),"T":int(c[6]),"o":c[1],"h":c[2],
+                           "l":c[3],"c":c[4],"v":c[5]})
+        return candles
+    except Exception as e:
+        log(f"⚠️ Binance fetch error {asset}: {e}")
+        return []
+
+def add_tn_audit(asset,event,detail,filters=None):
+    """Testnet audit trail."""
+    from datetime import timedelta
+    now_utc=datetime.now(timezone.utc)
+    now_est=now_utc-timedelta(hours=4)
+    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    safe=str(detail).replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")
+    entry={"time":time_str,"asset":asset,"event":event,"detail":safe,"filters":filters or {}}
+    with tn_lock:
+        tn_state["audit"].insert(0,entry)
+        tn_state["audit"]=tn_state["audit"][:10000]
+
+def add_tn_issue(asset,issue,detail):
+    """Log trade issues to testnet issues tab."""
+    from datetime import timedelta
+    now_utc=datetime.now(timezone.utc)
+    now_est=now_utc-timedelta(hours=4)
+    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    entry={"time":time_str,"asset":asset,"issue":issue,"detail":str(detail)}
+    with tn_lock:
+        tn_state["issues"].insert(0,entry)
+        tn_state["issues"]=tn_state["issues"][:500]
+    log(f"⚠️ [TESTNET ISSUE] {asset}: {issue} — {detail}")
+
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -124,6 +187,18 @@ def add_diag(level,event,cause,action):
     log(f"{icons.get(level,'📋')} [{level}] {event} | {cause} | {action}")
 
 AUDIT_FILE = "/tmp/hl_audit_log.txt"
+
+def add_issue(asset,issue,detail):
+    """Log trade issues to mainnet issues tab."""
+    from datetime import timedelta
+    now_utc=datetime.now(timezone.utc)
+    now_est=now_utc-timedelta(hours=4)
+    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    entry={"time":time_str,"asset":asset,"issue":issue,"detail":str(detail)}
+    with lock:
+        state["issues"].insert(0,entry)
+        state["issues"]=state["issues"][:500]
+    log(f"⚠️ [ISSUE] {asset}: {issue} — {detail}")
 
 def add_audit(asset,event,detail,filters=None):
     """Full audit trail — every candle evaluation visible on dashboard + saved to disk"""
@@ -318,7 +393,13 @@ wallet=eth_account.Account.from_key(API_PRIVATE_KEY)
 info=Info(API_URL,skip_ws=True)
 exchange=Exchange(wallet,API_URL,account_address=MAIN_WALLET)
 
+# Testnet paper trading — Binance candles + testnet execution
+tn_wallet=eth_account.Account.from_key(TN_API_KEY)
+tn_info=Info(constants.TESTNET_API_URL,skip_ws=True)
+tn_exchange=Exchange(tn_wallet,constants.TESTNET_API_URL,account_address=TN_WALLET)
+
 positions={}; last_candle={}; last_exit={}; bar_count={}; entry_times={}
+tn_positions={}; tn_last_candle={}; tn_last_exit={}; tn_bar_count={}
 
 # ══════════════════════════════════════════════════
 # INDICATORS
@@ -569,6 +650,7 @@ def enter_trade(asset,direction,price,vol,vs,ef,es):
             if statuses and "error" in statuses[0]:
                 add_diag("ERROR",f"Order rejected {asset}",statuses[0]["error"],"Skipping")
                 add_audit(asset,"ORDER REJECTED",f"Exchange error: {statuses[0]['error']}")
+                add_issue(asset,"Order rejected",statuses[0]["error"])
                 return
             fill=price
             if statuses and "filled" in statuses[0]:
@@ -1118,6 +1200,8 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <div class="tab" onclick="show('au',this)">Audit</div>
     <div class="tab" onclick="show('tx',this)">Tax</div>
     <div class="tab" onclick="show('dg',this)">Diagnostics</div>
+    <div class="tab" onclick="show('iss',this)" style="color:#FFB800">⚠️ Issues</div>
+    <div class="tab" onclick="show('tn',this)" style="color:#00B4FF">🧪 Testnet</div>
   </div>
 </div>
 <div class="main">
@@ -1146,6 +1230,16 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
   </div>
   <div class="card">
     {row("Cycle",f"#{s['cycle']}")}{row("Last check",s["last_check"] or "—")}{row("Next check",s["next_check"] or "—")}{row("Mode",mode)}{row("Assets",", ".join(s["assets"]))}
+  </div>
+  <div class="card" style="margin-top:10px;border-color:rgba(0,180,255,0.3)">
+    <div style="font-size:10px;font-weight:700;color:#00B4FF;text-transform:uppercase;margin-bottom:8px">🧪 Testnet Paper Trading — Binance Candles</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
+      <div><div style="font-size:10px;color:#4A5878">Balance</div><div style="font-weight:700">${tn_state["balance"]:,.0f}</div></div>
+      <div><div style="font-size:10px;color:#4A5878">Trades</div><div style="font-weight:700">{tn_state["tax"]["total_trades"]}</div></div>
+      <div><div style="font-size:10px;color:#4A5878">Open</div><div style="font-weight:700">{len(tn_state["positions"])}</div></div>
+      <div><div style="font-size:10px;color:#4A5878">P&L</div><div style="font-weight:700;color:{"#00D68F" if tn_state["tax"]["total_pnl"]>=0 else "#FF4757"}">${tn_state["tax"]["total_pnl"]:+,.2f}</div></div>
+    </div>
+    <div style="font-size:10px;color:#4A5878;margin-top:6px">Cycle #{tn_state["cycle"]} | {len(tn_state.get("issues",[]))} issues | Binance → HyperLiquid Testnet</div>
   </div>
 </div>
 
@@ -1215,6 +1309,52 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
   {asset_html}
   <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin:4px 0 10px">System Events</div>
   {f'<div class="card" style="padding:0 16px">{diag_html}</div>' if diag_html else '<div style="text-align:center;padding:24px;color:#4A5878">No events yet</div>'}
+</div>
+
+<div id="iss" class="sec">
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#FFB800;margin-bottom:10px">⚠️ Trade Issues — Both Systems</div>
+  {f'''<div class="card" style="padding:0 16px">{"".join(f'''<div style="padding:10px 0;border-bottom:1px solid #1E2D42">
+    <div style="display:flex;gap:8px;align-items:center">
+      <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba(255,184,0,0.15);color:#FFB800">{iss["asset"]}</span>
+      <span style="font-size:12px;font-weight:600;color:#FFB800">{iss["issue"]}</span>
+      <span style="font-size:10px;color:#4A5878;margin-left:auto">{iss["time"]}</span>
+    </div>
+    <div style="font-size:11px;color:#4A5878;margin-top:4px">{iss["detail"].replace("<","&lt;").replace(">","&gt;")}</div>
+  </div>''' for iss in (tn_state.get("issues",[]) + state.get("issues",[])))}</div>''' if (tn_state.get("issues") or state.get("issues")) else '<div style="text-align:center;padding:48px 24px;color:#4A5878">No trade issues — all systems nominal ✅</div>'}
+</div>
+
+<div id="tn" class="sec">
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin-bottom:10px">🧪 Testnet — Binance Candles + Testnet Execution</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">BALANCE</div><div style="font-size:20px;font-weight:700">${tn_state["balance"]:,.2f}</div></div>
+    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">OPEN</div><div style="font-size:20px;font-weight:700">{len(tn_state["positions"])}</div></div>
+    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">TRADES</div><div style="font-size:20px;font-weight:700">{tn_state["tax"]["total_trades"]}</div></div>
+    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">NET P&L</div><div style="font-size:20px;font-weight:700;color:{"#00D68F" if tn_state["tax"]["total_pnl"]>=0 else "#FF4757"}">${tn_state["tax"]["total_pnl"]:+,.2f}</div></div>
+  </div>
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin-bottom:10px">Open Positions</div>
+  {f'<div class="card" style="padding:0 16px">{"".join(f"""<div style="padding:10px 0;border-bottom:1px solid #1E2D42"><div style="font-weight:600">{a} {pos["direction"]} @ ${pos["entry"]:,.4f}</div><div style="font-size:11px;color:#4A5878">Now: ${pos.get("current_price",pos["entry"]):,.4f} | Stop: ${pos["stop"]:,.4f}</div></div>""" for a,pos in tn_state["positions"].items())}</div>' if tn_state["positions"] else '<div style="text-align:center;padding:24px;color:#4A5878">No open testnet positions</div>'}
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin:16px 0 10px">Recent Testnet Trades</div>
+  <div class="card" style="padding:0 16px">
+    {"".join(f'''<div style="padding:10px 0;border-bottom:1px solid #1E2D42">
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba(0,180,255,0.15);color:#00B4FF">{t["asset"]}</span>
+        <span style="font-size:12px;font-weight:600">{t["direction"]} {t["action"]}</span>
+        {"<span style='font-size:12px;font-weight:700;margin-left:auto;color:" + ("#00D68F" if (t.get("pnl") or 0)>=0 else "#FF4757") + "'>${:+,.2f}</span>".format(t.get("pnl") or 0) if t.get("pnl") is not None else ""}
+      </div>
+      <div style="font-size:11px;color:#4A5878">${t["entry"]:,.4f} | {t.get("reason","—")} | {t["time"][11:19]}</div>
+    </div>''' for t in tn_state["trades"][:20]) if tn_state["trades"] else '<div style="text-align:center;padding:24px;color:#4A5878">No testnet trades yet</div>'}
+  </div>
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin:16px 0 10px">Testnet Audit (last 50)</div>
+  <div class="card" style="padding:0 16px">
+    {"".join(f'''<div style="padding:8px 0;border-bottom:1px solid #1E2D42">
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:10px;color:#00B4FF;font-weight:700">{a["asset"]}</span>
+        <span style="font-size:11px;font-weight:600">{a["event"]}</span>
+        <span style="font-size:10px;color:#4A5878;margin-left:auto">{a["time"]}</span>
+      </div>
+      <div style="font-size:11px;color:#4A5878;font-family:monospace">{a["detail"][:100]}</div>
+    </div>''' for a in tn_state["audit"][:50]) if tn_state["audit"] else '<div style="text-align:center;padding:24px;color:#4A5878">No testnet audit entries yet</div>'}
+  </div>
 </div>
 
 </div>
@@ -1424,6 +1564,193 @@ except Exception as e:
 
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
+
+# ── TESTNET TRADING LOOP (Binance candles + testnet execution) ─────────────
+def testnet_trading_loop():
+    log("🧪 Testnet trading loop started — Binance candles + testnet execution")
+    tn_pos_usd = TN_TOTAL_USDC / len(ASSETS)
+    tn_leverage = TN_LEVERAGE
+
+    while True:
+        try:
+            if tn_state["kill_switch"] or tn_state["paused"]:
+                time.sleep(CHECK_EVERY); continue
+
+            with tn_lock: tn_state["cycle"]+=1
+
+            for asset in ASSETS:
+                try:
+                    # Fetch Binance candles — always complete
+                    candles=fetch_binance_candles(asset)
+                    if not candles: continue
+
+                    # Get newest candle
+                    newest=candles[-1]
+                    ts_val=str(newest["t"])
+                    now_ms=int(time.time()*1000)
+                    age_s=(now_ms-int(ts_val))/1000
+                    cur=float(newest["c"])
+                    is_closed=now_ms>int(newest.get("T",0))
+
+                    # Position management — always runs
+                    if asset in tn_positions:
+                        pos=tn_positions[asset]
+                        direction=pos["direction"]
+                        # Trail stop update
+                        if direction=="LONG":
+                            if cur>pos.get("trail_high",pos["entry"]):
+                                pos["trail_high"]=cur
+                                pos["trail_stop"]=cur*(1-TRAIL_PCT)
+                        else:
+                            if cur<pos.get("trail_low",pos["entry"]):
+                                pos["trail_low"]=cur
+                                pos["trail_stop"]=cur*(1+TRAIL_PCT)
+
+                        pos["current_price"]=cur
+                        exit_reason=None; exit_price=cur
+
+                        cfg=ASSET_CFG[asset]
+                        closes=[float(c["c"]) for c in candles]
+                        ef_v=ema(closes,EMA_FAST); em_v=ema(closes,EMA_MID)
+                        i=len(closes)-1
+
+                        if cfg["exit"]=="trail":
+                            if direction=="LONG":
+                                if cur<=pos.get("trail_stop",pos["entry"]*(1-TRAIL_PCT)):
+                                    exit_reason,exit_price="trail",pos["trail_stop"]
+                                elif cur<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[i] and em_v[i] and ef_v[i]<em_v[i]: exit_reason="ema"
+                            else:
+                                if cur>=pos.get("trail_stop",pos["entry"]*(1+TRAIL_PCT)):
+                                    exit_reason,exit_price="trail",pos["trail_stop"]
+                                elif cur>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[i] and em_v[i] and ef_v[i]>em_v[i]: exit_reason="ema"
+                        elif cfg["exit"]=="fixed_tp":
+                            tp_p=pos["entry"]*(1+cfg["tp"]) if direction=="LONG" else pos["entry"]*(1-cfg["tp"])
+                            if direction=="LONG":
+                                if cur>=tp_p: exit_reason,exit_price="tp",tp_p
+                                elif cur<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[i] and em_v[i] and ef_v[i]<em_v[i]: exit_reason="ema"
+                            else:
+                                if cur<=tp_p: exit_reason,exit_price="tp",tp_p
+                                elif cur>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[i] and em_v[i] and ef_v[i]>em_v[i]: exit_reason="ema"
+
+                        if exit_reason:
+                            qty=pos["size"]
+                            pnl=((exit_price-pos["entry"])*qty if direction=="LONG"
+                                 else (pos["entry"]-exit_price)*qty)
+                            # Execute on testnet
+                            try:
+                                tn_exchange.market_close(asset)
+                            except Exception as e:
+                                add_tn_issue(asset,"Exit failed",str(e))
+
+                            with tn_lock:
+                                del tn_positions[asset]
+                                tn_state["trades"].insert(0,{
+                                    "time":ts(),"asset":asset,"action":"CLOSED",
+                                    "direction":direction,"entry":pos["entry"],
+                                    "exit":exit_price,"pnl":round(pnl,4),
+                                    "reason":exit_reason,"size":qty
+                                })
+                                tn_state["tax"]["total_pnl"]+=pnl
+                                tn_state["tax"]["total_trades"]+=1
+                                if pnl>0: tn_state["tax"]["winning_trades"]+=1
+                                else: tn_state["tax"]["losing_trades"]+=1
+
+                            add_tn_audit(asset,f"✅ CLOSED {direction}",
+                                        f"exit=${exit_price:,.4f} | pnl=${pnl:+,.2f} | reason={exit_reason}")
+                            ntfy(f"📊 [TESTNET] {asset} {direction} CLOSED",
+                                 f"P&L: ${pnl:+,.2f} | Reason: {exit_reason}\nEntry: ${pos['entry']:,.4f} → Exit: ${exit_price:,.4f}")
+                            log(f"🧪 TESTNET {asset} {direction} CLOSED @ ${exit_price:,.4f} | P&L=${pnl:+,.2f} | {exit_reason}")
+                        continue
+
+                    # Signal evaluation — only if not in position
+                    if tn_last_candle.get(asset)==ts_val:
+                        continue  # already evaluated this candle
+
+                    add_tn_audit(asset,"🕯 NEW CANDLE",
+                                f"ts={ts_val} | price=${cur:,.4f} | age={age_s:.0f}s | binance | evaluating...")
+
+                    direction,signal_price,sig_vol,sig_vs,filters=evaluate_signal(candles,asset)
+                    result=filters.get("_result",{})
+                    blocked=result.get("blocked_by",[])
+                    vol_filter=filters.get("volume",{})
+                    only_vol=(blocked==["volume"])
+
+                    if not direction:
+                        if only_vol:
+                            # RETRY — don't mark as seen
+                            add_tn_audit(asset,"🔄 RETRY",
+                                        f"volume={vol_filter.get('value','?')} — retrying next cycle")
+                        else:
+                            tn_last_candle[asset]=ts_val
+                            add_tn_audit(asset,"⏳ NO SIGNAL",
+                                        f"blocked: {blocked}" if blocked else "EMA not stacked")
+                        continue
+
+                    # Signal fired
+                    tn_last_candle[asset]=ts_val
+                    add_tn_audit(asset,f"🚨 SIGNAL {direction}",
+                                f"price=${signal_price:,.4f} | binance data | all filters ✅")
+
+                    if tn_state["paused"] or tn_state["kill_switch"]: continue
+
+                    # Place order on testnet
+                    try:
+                        pos_usd=get_pos_usd(sig_vol,sig_vs,
+                            ema([ float(c["c"]) for c in candles],EMA_FAST)[-1],
+                            ema([ float(c["c"]) for c in candles],EMA_SLOW)[-1])
+                        notional=pos_usd*tn_leverage
+                        qty=round(notional/cur,6)
+
+                        is_buy=(direction=="LONG")
+                        r=tn_exchange.market_open(asset,is_buy,qty)
+                        statuses=r.get("response",{}).get("data",{}).get("statuses",[])
+
+                        if statuses and "error" in statuses[0]:
+                            err=statuses[0]["error"]
+                            add_tn_issue(asset,"Order rejected",err)
+                            add_tn_audit(asset,"❌ ORDER REJECTED",err)
+                            continue
+
+                        fill=float(statuses[0].get("filled",{}).get("avgPx",cur)) if statuses else cur
+                        stop=fill*(1-STOP_PCT) if direction=="LONG" else fill*(1+STOP_PCT)
+
+                        with tn_lock:
+                            tn_positions[asset]={
+                                "direction":direction,"entry":fill,"size":qty,
+                                "stop":stop,"trail_high":fill,"trail_low":fill,
+                                "trail_stop":fill*(1-TRAIL_PCT) if direction=="LONG" else fill*(1+TRAIL_PCT),
+                                "current_price":fill,"entry_time":ts()
+                            }
+                            tn_state["trades"].insert(0,{
+                                "time":ts(),"asset":asset,"action":"OPENED",
+                                "direction":direction,"entry":fill,"exit":None,
+                                "pnl":None,"reason":"signal","size":qty
+                            })
+
+                        add_tn_audit(asset,f"✅ ENTERED {direction}",
+                                    f"fill=${fill:,.4f} | qty={qty} | stop=${stop:,.4f}")
+                        ntfy(f"🧪 [TESTNET] {asset} {direction} ENTERED",
+                             f"Fill: ${fill:,.4f} | Qty: {qty}\nStop: ${stop:,.4f} | Binance signal")
+                        log(f"🧪 TESTNET {asset} {direction} ENTERED @ ${fill:,.4f}")
+
+                    except Exception as e:
+                        add_tn_issue(asset,"Entry error",str(e))
+                        add_tn_audit(asset,"❌ ENTRY ERROR",str(e))
+
+                except Exception as e:
+                    log(f"🧪 Testnet loop error {asset}: {e}")
+
+        except Exception as e:
+            log(f"🧪 Testnet loop error: {e}")
+
+        time.sleep(CHECK_EVERY)
+
+_tn=threading.Thread(target=testnet_trading_loop,daemon=True)
+_tn.start()
 
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
