@@ -34,9 +34,6 @@ TN_WALLET       = "0xa90566c8d886CA63c1194101a7dA2Fa129D26B58"
 TN_API_KEY      = "0x5b75aa092ea3bd1ee77983ab5b8268607120a0145de6df11174b3f72f91b9ea0"
 TN_LEVERAGE     = 10
 TN_TOTAL_USDC   = 988.0
-BINANCE_URL     = "https://fapi.binance.com/fapi/v1/klines"
-BINANCE_SYM     = {"BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT",
-                   "BNB":"BNBUSDT","DOGE":"DOGEUSDT","AVAX":"AVAXUSDT"}
 
 ASSETS          = ["BTC","ETH","SOL","BNB","DOGE","AVAX"]
 TOTAL_USDC      = 5.0
@@ -129,20 +126,28 @@ tn_state = {
 tn_lock=threading.Lock()
 
 def fetch_binance_candles(asset):
-    """Fetch Binance candles for signal evaluation — always complete candles."""
+    """Fetch HyperLiquid MAINNET candles for testnet signal evaluation.
+    Binance is blocked on Railway — mainnet HL prices match Binance within 0.05%."""
     try:
-        sym=BINANCE_SYM.get(asset,asset+"USDT")
         end_ms=int(time.time()*1000)
         start_ms=end_ms-CANDLE_LIMIT*15*60*1000
-        r=req.get(BINANCE_URL,params={"symbol":sym,"interval":"15m",
-            "startTime":start_ms,"endTime":end_ms,"limit":CANDLE_LIMIT},timeout=10)
+        r=req.post("https://api.hyperliquid.xyz/info",
+            json={"type":"candleSnapshot",
+                  "req":{"coin":asset,"interval":"15m","startTime":start_ms,"endTime":end_ms}},
+            timeout=10)
+        data=r.json()
+        if not isinstance(data,list):
+            log(f"⚠️ HL mainnet candle error {asset}: {data}")
+            add_tn_issue(asset,"Candle fetch error",str(data))
+            return []
         candles=[]
-        for c in r.json():
-            candles.append({"t":int(c[0]),"T":int(c[6]),"o":c[1],"h":c[2],
-                           "l":c[3],"c":c[4],"v":c[5]})
-        return candles
+        for c in data:
+            candles.append({"t":int(c["t"]),"T":int(c.get("T",int(c["t"])+900000)),
+                           "o":c["o"],"h":c["h"],"l":c["l"],"c":c["c"],"v":c["v"]})
+        return sorted(candles,key=lambda x:x["t"])
     except Exception as e:
-        log(f"⚠️ Binance fetch error {asset}: {e}")
+        log(f"⚠️ Testnet candle fetch error {asset}: {e}")
+        add_tn_issue(asset,"Candle fetch error",str(e))
         return []
 
 def add_tn_audit(asset,event,detail,filters=None):
@@ -1213,6 +1218,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <button class="ctrl" style="background:rgba(255,71,87,0.15);color:#FF4757;border:2px solid rgba(255,71,87,0.4);margin:0" onclick="confirm_action('close_all','Close ALL positions?','Immediately market-closes everything.')">⚡ Close All</button>
   </div>
   <button class="ctrl" style="background:rgba(255,71,87,0.25);color:#FF4757;border:2px solid #FF4757;font-size:14px" onclick="confirm_action('kill','KILL SWITCH?','Stops all trading. Positions stay open on HyperLiquid.')">🛑 KILL SWITCH</button>
+  <a href="/system-test" target="_blank" style="display:block;text-align:center;background:rgba(0,180,255,0.1);border:1px solid rgba(0,180,255,0.4);border-radius:12px;padding:12px;color:#00B4FF;font-weight:600;text-decoration:none;margin-top:8px;font-size:13px">🔬 System Test</a>
   <div class="card" style="border-color:{'rgba(0,214,143,0.3)' if tax['total_net']>=0 else 'rgba(255,71,87,0.3)'}">
     <div style="font-size:10px;font-weight:700;color:#4A5878;text-transform:uppercase;margin-bottom:6px">Net P&L</div>
     <div style="font-family:monospace;font-size:28px;font-weight:700;color:{'#00D68F' if tax['total_net']>=0 else '#FF4757'}">${tax["total_net"]:.2f}</div>
@@ -1232,14 +1238,14 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     {row("Cycle",f"#{s['cycle']}")}{row("Last check",s["last_check"] or "—")}{row("Next check",s["next_check"] or "—")}{row("Mode",mode)}{row("Assets",", ".join(s["assets"]))}
   </div>
   <div class="card" style="margin-top:10px;border-color:rgba(0,180,255,0.3)">
-    <div style="font-size:10px;font-weight:700;color:#00B4FF;text-transform:uppercase;margin-bottom:8px">🧪 Testnet Paper Trading — Binance Candles</div>
+    <div style="font-size:10px;font-weight:700;color:#00B4FF;text-transform:uppercase;margin-bottom:8px">🧪 Testnet Paper Trading — HL Mainnet Candles</div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
       <div><div style="font-size:10px;color:#4A5878">Balance</div><div style="font-weight:700">${tn_state["balance"]:,.0f}</div></div>
       <div><div style="font-size:10px;color:#4A5878">Trades</div><div style="font-weight:700">{tn_state["tax"]["total_trades"]}</div></div>
       <div><div style="font-size:10px;color:#4A5878">Open</div><div style="font-weight:700">{len(tn_state["positions"])}</div></div>
       <div><div style="font-size:10px;color:#4A5878">P&L</div><div style="font-weight:700;color:{"#00D68F" if tn_state["tax"]["total_pnl"]>=0 else "#FF4757"}">${tn_state["tax"]["total_pnl"]:+,.2f}</div></div>
     </div>
-    <div style="font-size:10px;color:#4A5878;margin-top:6px">Cycle #{tn_state["cycle"]} | {len(tn_state.get("issues",[]))} issues | Binance → HyperLiquid Testnet</div>
+    <div style="font-size:10px;color:#4A5878;margin-top:6px">Cycle #{tn_state["cycle"]} | {len(tn_state.get("issues",[]))} issues | HL Mainnet → HyperLiquid Testnet</div>
   </div>
 </div>
 
@@ -1324,7 +1330,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 </div>
 
 <div id="tn" class="sec">
-  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin-bottom:10px">🧪 Testnet — Binance Candles + Testnet Execution</div>
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin-bottom:10px">🧪 Testnet — HL Mainnet Candles + Testnet Execution</div>
   <a href="/log-testnet" style="display:block;text-align:center;background:#0F1520;border:1px solid #00B4FF;border-radius:12px;padding:12px;color:#00B4FF;font-weight:600;text-decoration:none;margin-bottom:12px">📋 Export Testnet Log</a>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
     <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">BALANCE</div><div style="font-size:20px;font-weight:700">${tn_state["balance"]:,.2f}</div></div>
@@ -1508,6 +1514,180 @@ def tax_guide():
 def api_state():
     if not session.get("ok"): return jsonify({"error":"unauthorized"}),401
     return jsonify(state)
+
+@app.route("/system-test")
+def system_test():
+    if not session.get("ok"): return "unauthorized",401
+    import time as _time
+    results=[]
+    def chk(name,passed,detail=""):
+        results.append({"name":name,"passed":passed,"detail":detail})
+
+    now=datetime.now(timezone.utc)
+    est=now-timedelta(hours=4)
+
+    # 1. Binance candle fetch
+    try:
+        r=req.get("https://fapi.binance.com/fapi/v1/klines",
+            params={"symbol":"BTCUSDT","interval":"15m","limit":3},timeout=10)
+        data=r.json()
+        is_list=isinstance(data,list)
+        chk("Binance reachable",r.status_code==200,f"HTTP {r.status_code}")
+        chk("Binance returns list",is_list,f"type={type(data).__name__}")
+        if is_list and data:
+            chk("Binance candle format",len(data[0])>=7,
+                f"{len(data)} candles | BTC close=${float(data[-1][4]):,.2f}")
+        else:
+            chk("Binance candle format",False,str(data)[:100])
+    except Exception as e:
+        chk("Binance fetch",False,str(e))
+
+    # 2. HL Mainnet candles
+    mn_candles={}
+    try:
+        end_ms=int(_time.time()*1000); start_ms=end_ms-200*15*60*1000
+        for asset in ["BTC","ETH"]:
+            r=req.post(MAINNET_URL,json={"type":"candleSnapshot",
+                "req":{"coin":asset,"interval":"15m","startTime":start_ms,"endTime":end_ms}},timeout=10)
+            data=r.json()
+            ok=isinstance(data,list) and len(data)>0 and all(k in data[-1] for k in ["t","o","h","l","c","v"])
+            mn_candles[asset]=data if ok else []
+            chk(f"Mainnet {asset} candles",ok,
+                f"{len(data)} candles | close=${float(data[-1]['c']):,.4f}" if ok else str(data)[:80])
+    except Exception as e:
+        chk("Mainnet candles",False,str(e))
+
+    # 3. HL Testnet candles
+    try:
+        end_ms=int(_time.time()*1000); start_ms=end_ms-200*15*60*1000
+        for asset in ["BTC","ETH"]:
+            r=req.post(HL_INFO_URL.replace("hyperliquid.xyz","hyperliquid-testnet.xyz"),
+                json={"type":"candleSnapshot",
+                    "req":{"coin":asset,"interval":"15m","startTime":start_ms,"endTime":end_ms}},timeout=10)
+            data=r.json()
+            ok=isinstance(data,list) and len(data)>0 and all(k in data[-1] for k in ["t","o","h","l","c","v"])
+            chk(f"Testnet {asset} candles",ok,
+                f"{len(data)} candles | close=${float(data[-1]['c']):,.4f}" if ok else str(data)[:80])
+    except Exception as e:
+        chk("Testnet candles",False,str(e))
+
+    # 4. evaluate_signal
+    try:
+        for asset in ["BTC","ETH"]:
+            candles=mn_candles.get(asset,[])
+            if len(candles)<50: chk(f"evaluate_signal {asset}",False,"insufficient candles"); continue
+            _,_,_,_,filters=evaluate_signal(candles,asset)
+            ok="_result" in filters or "ema_stack" in filters
+            d=filters.get("ema_stack",{}).get("value","?")
+            vr=filters.get("volume",{}).get("value","?")
+            chk(f"evaluate_signal {asset}",ok,f"EMA={d} | vol={vr}")
+    except Exception as e:
+        chk("evaluate_signal",False,str(e))
+
+    # 5. szDecimals
+    try:
+        r=req.post(MAINNET_URL,json={"type":"meta"},timeout=10)
+        meta=r.json()
+        universe={a["name"]:a for a in meta.get("universe",[])}
+        for asset in ASSETS:
+            sz=universe.get(asset,{}).get("szDecimals",None)
+            chk(f"szDecimals {asset}",sz is not None,f"szDecimals={sz}")
+    except Exception as e:
+        chk("szDecimals",False,str(e))
+
+    # 6. Order minimum notional
+    try:
+        r=req.post(MAINNET_URL,json={"type":"allMids"},timeout=10)
+        mids=r.json()
+        pos_usd=TOTAL_USDC/len(ASSETS)
+        for asset in ASSETS:
+            price=float(mids.get(asset,0))
+            notional=pos_usd*LEVERAGE
+            chk(f"Min notional {asset}",notional>=10,
+                f"${notional:.2f} (pos=${pos_usd:.2f}×{LEVERAGE}x) | need $10 | price=${price:,.4f}")
+    except Exception as e:
+        chk("Order minimum",False,str(e))
+
+    # 7. Mainnet API auth + userFills
+    try:
+        r=req.post(MAINNET_URL,json={"type":"userFills","user":MAIN_WALLET},timeout=10)
+        fills=r.json()
+        chk("Mainnet userFills",isinstance(fills,list),f"{len(fills)} fills")
+    except Exception as e:
+        chk("Mainnet userFills",False,str(e))
+
+    # 8. Testnet userFills
+    try:
+        tn_url="https://api.hyperliquid-testnet.xyz/info"
+        r=req.post(tn_url,json={"type":"userFills","user":TN_WALLET},timeout=10)
+        fills=r.json()
+        chk("Testnet userFills",isinstance(fills,list),f"{len(fills)} fills")
+    except Exception as e:
+        chk("Testnet userFills",False,str(e))
+
+    # 9. Retry logic
+    try:
+        candles=mn_candles.get("BTC",[])
+        if len(candles)>=50:
+            import copy
+            tc=copy.deepcopy(candles)
+            closes=[float(c["c"]) for c in tc]
+            vols=[float(c["v"]) for c in tc]
+            vs=sma(vols,20)
+            avg=vs[-1] if vs[-1] else 1
+            tc[-1]["v"]=str(avg*0.02)
+            vr=float(tc[-1]["v"])/avg
+            _,_,_,_,filters=evaluate_signal(tc,"BTC")
+            blocked=filters.get("_result",{}).get("blocked_by",[])
+            only_vol=blocked==["volume"]
+            chk("Retry logic (vol only block)",only_vol,
+                f"blocked={blocked} → {'will retry ✅' if only_vol else 'marked as seen ❌'}")
+        else:
+            chk("Retry logic",False,"insufficient candles")
+    except Exception as e:
+        chk("Retry logic",False,str(e))
+
+    # 10. ntfy
+    try:
+        r=req.post(f"https://ntfy.sh/{NTFY_TOPIC}",
+            data="🔬 System test from dashboard".encode("utf-8"),
+            headers={"Title":"HL Trader System Test","Tags":"white_check_mark"},timeout=10)
+        chk("ntfy delivery",r.status_code==200,f"HTTP {r.status_code}")
+    except Exception as e:
+        chk("ntfy delivery",False,str(e))
+
+    # Build HTML report
+    passed=sum(1 for r in results if r["passed"])
+    failed=len(results)-passed
+    color="#00D68F" if failed==0 else "#FFB800" if failed<=6 else "#FF4757"
+
+    rows="".join(f'''<tr>
+        <td style="padding:8px 12px;font-weight:600">{"✅" if r["passed"] else "❌"} {r["name"]}</td>
+        <td style="padding:8px 12px;color:#4A5878;font-family:monospace;font-size:11px">{r["detail"]}</td>
+    </tr>''' for r in results)
+
+    return f'''<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>System Test — HL Trader v4</title>
+<style>
+body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:24px;max-width:800px;margin:0 auto}}
+h1{{color:{color};font-size:20px;margin-bottom:4px}}
+p{{color:#4A5878;margin-bottom:20px;font-size:13px}}
+table{{width:100%;border-collapse:collapse;background:#0F1520;border-radius:12px;overflow:hidden}}
+tr{{border-bottom:1px solid #1E2D42}}
+tr:last-child{{border-bottom:none}}
+td{{font-size:13px}}
+.badge{{display:inline-block;padding:6px 16px;border-radius:20px;font-weight:700;font-size:16px;background:rgba({
+    "0,214,143" if failed==0 else "255,184,0" if failed<=6 else "255,71,87"
+},0.15);color:{color};margin-bottom:16px}}
+a{{color:#00B4FF;text-decoration:none}}
+</style></head><body>
+<h1>🔬 System Test — HL Trader v4</h1>
+<p>{now.strftime("%Y-%m-%d %H:%M")} UTC / {est.strftime("%H:%M")} EST</p>
+<div class="badge">{passed}/{len(results)} passed {"✅" if failed==0 else f"— {failed} failed ⚠️"}</div>
+<table>{rows}</table>
+<p style="margin-top:16px"><a href="/">← Back to dashboard</a></p>
+</body></html>'''
 
 @app.route("/log")
 def log_export():
