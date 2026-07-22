@@ -1519,6 +1519,7 @@ def api_state():
 def system_test():
     if not session.get("ok"): return "unauthorized",401
     import time as _time
+    from datetime import timedelta
     results=[]
     def chk(name,passed,detail=""):
         results.append({"name":name,"passed":passed,"detail":detail})
