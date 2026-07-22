@@ -1520,6 +1520,8 @@ def system_test():
     if not session.get("ok"): return "unauthorized",401
     import time as _time
     from datetime import timedelta
+    MAINNET_URL="https://api.hyperliquid.xyz/info"
+    TESTNET_URL_ST="https://api.hyperliquid-testnet.xyz/info"
     results=[]
     def chk(name,passed,detail=""):
         results.append({"name":name,"passed":passed,"detail":detail})
@@ -1530,7 +1532,9 @@ def system_test():
     # 1. Binance candle fetch
     try:
         r=req.get("https://fapi.binance.com/fapi/v1/klines",
-            params={"symbol":"BTCUSDT","interval":"15m","limit":3},timeout=10)
+            params={"symbol":"BTCUSDT","interval":"15m","limit":3},
+            headers={"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            timeout=10)
         data=r.json()
         is_list=isinstance(data,list)
         chk("Binance reachable",r.status_code==200,f"HTTP {r.status_code}")
@@ -1562,7 +1566,7 @@ def system_test():
     try:
         end_ms=int(_time.time()*1000); start_ms=end_ms-200*15*60*1000
         for asset in ["BTC","ETH"]:
-            r=req.post(HL_INFO_URL.replace("hyperliquid.xyz","hyperliquid-testnet.xyz"),
+            r=req.post(TESTNET_URL_ST,
                 json={"type":"candleSnapshot",
                     "req":{"coin":asset,"interval":"15m","startTime":start_ms,"endTime":end_ms}},timeout=10)
             data=r.json()
