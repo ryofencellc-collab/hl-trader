@@ -123,17 +123,27 @@ def add_diag(level,event,cause,action):
     icons={"INFO":"ℹ️","WARNING":"⚠️","ERROR":"❌","CRITICAL":"🚨"}
     log(f"{icons.get(level,'📋')} [{level}] {event} | {cause} | {action}")
 
+AUDIT_FILE = "/tmp/hl_audit_log.txt"
+
 def add_audit(asset,event,detail,filters=None):
-    """Full audit trail — every candle evaluation visible on dashboard"""
+    """Full audit trail — every candle evaluation visible on dashboard + saved to disk"""
     # Sanitize at source so nothing breaks the HTML dashboard
     safe=str(detail).replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")
+    from datetime import datetime,timezone,timedelta
+    now_utc=datetime.now(timezone.utc)
+    now_est=now_utc-timedelta(hours=4)
+    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
     entry={
-        "time":ts(),"asset":asset,"event":event,
+        "time":time_str,"asset":asset,"event":event,
         "detail":safe,"filters":filters or {}
     }
     with lock:
         state["audit"].insert(0,entry)
-        state["audit"]=state["audit"][:500]
+        state["audit"]=state["audit"][:10000]
+    try:
+        with open(AUDIT_FILE,"a") as f:
+            f.write(f"{time_str}|{asset}|{event}|{safe}\n")
+    except: pass
 
 def add_trade(asset,action,direction,entry,exit_p,size,pnl,reason):
     t={"time":ts(),"asset":asset,"action":action,"direction":direction,
@@ -1006,7 +1016,7 @@ def build_dashboard():
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
             <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba({ec},0.15);color:rgb({ec});white-space:nowrap">{a["asset"]}</span>
             <span style="font-size:12px;font-weight:600">{event}</span>
-            <span style="font-size:10px;color:#4A5878;margin-left:auto;white-space:nowrap">{a["time"][11:19]}</span>
+            <span style="font-size:10px;color:#4A5878;margin-left:auto;white-space:nowrap">{a["time"]}</span>
           </div>
           <div style="font-size:11px;color:#4A5878;font-family:monospace;margin-bottom:3px">{a["detail"].replace(chr(10)," ").replace(chr(13)," ").replace("<","&lt;").replace(">","&gt;").replace("'","&#39;").replace('"',"&quot;")}
           </div>
@@ -1368,6 +1378,15 @@ def log_export():
     lines.append(f"\nAUDIT TRAIL (all {len(s['audit'])} entries):")
     for a in s["audit"]:
         lines.append(f"  {a['time'][11:19]} | {a['asset']:<6} | {a['event']:<30} | {a['detail']}")
+    # Also append raw disk log if available
+    try:
+        import os
+        if os.path.exists(AUDIT_FILE):
+            disk_lines=open(AUDIT_FILE).readlines()
+            lines.append(f"\nFULL DISK LOG ({len(disk_lines)} entries):")
+            for dl in disk_lines:
+                lines.append(f"  {dl.strip()}")
+    except: pass
     lines.append("\nASSET STATUS:")
     for asset in s["assets"]:
         ah=s["health"]["assets_ok"].get(asset,{})
@@ -1377,6 +1396,20 @@ def log_export():
         lines.append(f"  {d['time']} [{d['level']}] {d['event']} | {d['cause']}")
     lines.append("\n"+"="*60)
     return Response("\n".join(lines),mimetype="text/plain")
+
+# Load audit from disk on startup so history is preserved across restarts
+try:
+    import os
+    if os.path.exists(AUDIT_FILE):
+        disk_lines = open(AUDIT_FILE).readlines()
+        for line in reversed(disk_lines[-10000:]):
+            parts = line.strip().split("|",3)
+            if len(parts)==4:
+                state["audit"].append({"time":parts[0],"asset":parts[1],
+                                       "event":parts[2],"detail":parts[3],"filters":{}})
+        log(f"📂 Loaded {len(state['audit'])} audit entries from disk")
+except Exception as e:
+    log(f"⚠️ Could not load audit from disk: {e}")
 
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
