@@ -1,5 +1,5 @@
 """
-HL TRADER — Final Production App v3
+HL TRADER — Final Production App v4
 ══════════════════════════════════════
 8 assets | ntfy alerts | /signal-check | /audit | Tax system
 
@@ -772,11 +772,11 @@ def close_all(reason="manual"):
 # TRADING LOOP
 # ══════════════════════════════════════════════════
 def trading_loop():
-    log("HL TRADER v3 — Full audit trail | Per-asset errors | 6 assets")
-    add_diag("INFO","HL Trader v3 started",
+    log("HL TRADER v4 — Full audit trail | Per-asset errors | 6 assets")
+    add_diag("INFO","HL Trader v4 started",
              f"DRY={DRY_RUN} TEST={TESTNET} LEV={LEVERAGE}x ASSETS={len(ASSETS)}",
              "Per-asset retry | Full audit trail | All orders verified")
-    ntfy("🚀 HL Trader v3 Started",
+    ntfy("🚀 HL Trader v4 Started",
          f"6 assets | Per-asset errors\nMode: {'TESTNET' if TESTNET else 'LIVE'}\n"
          f"Leverage: {LEVERAGE}x\nAssets: {', '.join(ASSETS)}",tags="rocket")
 
@@ -1179,7 +1179,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
 </div></div>
 <div class="hd">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#00D68F">HL TRADER v3</div>
+    <div style="font-family:monospace;font-size:18px;font-weight:700;color:#00D68F">HL TRADER v4</div>
     <div style="display:flex;align-items:center;gap:8px">
       <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;background:rgba({"0,214,143" if any_fresh else "255,184,0"},0.15);color:{"#00D68F" if any_fresh else "#FFB800"}">{"LIVE" if any_fresh else "STALE"}</span>
       <div style="display:flex;align-items:center;gap:6px;background:#0F1520;border:1px solid #1E2D42;border-radius:20px;padding:5px 10px;font-size:11px;font-weight:600">
@@ -1512,7 +1512,7 @@ def api_state():
 @app.route("/log")
 def log_export():
     if not session.get("ok"): return "unauthorized",401
-    s=state; lines=["="*60,"HL TRADER v3 — SYSTEM LOG",f"Generated: {ts()} UTC","="*60]
+    s=state; lines=["="*60,"HL TRADER v4 — SYSTEM LOG",f"Generated: {ts()} UTC","="*60]
     lines.append(f"\nSTATUS: {s['status']} | Cycle #{s['cycle']} | {s['leverage']}x")
     lines.append(f"Mode: {'DRY' if s['dry_run'] else 'LIVE'} | {'Testnet' if s['testnet'] else 'Mainnet'}")
     lines.append(f"Paused: {s['paused']} | Kill: {s['kill_switch']} | API: {s['health']['api_connected']}")
@@ -1553,7 +1553,7 @@ def log_export():
 def log_export_testnet():
     if not session.get("ok"): return "unauthorized",401
     s=tn_state
-    lines=["="*60,"HL TRADER v3 — TESTNET LOG (Binance Candles)",f"Generated: {ts()} UTC","="*60]
+    lines=["="*60,"HL TRADER v4 — TESTNET LOG (Binance Candles)",f"Generated: {ts()} UTC","="*60]
     lines.append(f"\nCycle #{s['cycle']} | Balance: ${s['balance']:,.2f}")
     lines.append(f"Trades: {s['tax']['total_trades']} | W:{s['tax']['winning_trades']} L:{s['tax']['losing_trades']}")
     lines.append(f"Gross P&L: ${s['tax']['total_pnl']:+,.4f}")
