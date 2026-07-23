@@ -45,6 +45,17 @@ TAX_RATE        = 0.35
 EMA_FAST=5; EMA_MID=13; EMA_SLOW=34
 STOP_PCT=0.05; TRAIL_PCT=0.01
 VOL_FILTER=1.5; SEP_FILTER=0.003; BRK_BARS=12
+
+# Per-asset volume thresholds — backtested on HL mainnet data 2026
+# HL mainnet has lower volume than Binance — each asset calibrated separately
+VOL_FILTER_ASSET={
+    "BTC":  1.50,  # BTC has good HL volume — keep original
+    "ETH":  0.60,  # ETH moderate HL volume
+    "SOL":  1.25,  # SOL good HL volume
+    "BNB":  0.30,  # BNB thin HL volume
+    "DOGE": 0.30,  # DOGE thin HL volume
+    "AVAX": 0.10,  # AVAX very thin HL volume
+}
 CANDLE_TF="15m"; CANDLE_LIMIT=200
 
 ASSET_CFG = {
@@ -98,7 +109,7 @@ state = {
     "health":{"api_connected":False,"last_ping":None,"assets_ok":{},
               "params":{
                   "ema":"5/13/34","stop_pct":"5%","trail_pct":"1%",
-                  "vol_filter":"1.5x","sep_filter":"0.003","brk_bars":"12",
+                  "vol_filter":"per-asset (0.10-1.50x)","sep_filter":"0.003","brk_bars":"12",
                   "candle_tf":"15m","check_every":"60s","leverage":f"{LEVERAGE}x",
                   "assets":",".join(ASSETS),
                   "btc_cfg":"trail|fr1bp|BB|varsz",
@@ -495,10 +506,11 @@ def evaluate_signal(candles,asset):
     filters["separation"]={"pass":sep_ok,"value":f"{sep:.4f}","need":f">={SEP_FILTER}"}
     if not sep_ok: return None,None,0,0,filters
 
-    # Volume
+    # Volume — per-asset threshold calibrated to HL mainnet volume profile
     vol=vols[i]; vr=vol/vs[i] if vs[i] else 0
-    vol_ok=vr>=VOL_FILTER
-    filters["volume"]={"pass":vol_ok,"value":f"{vr:.2f}x","need":f">={VOL_FILTER}x"}
+    asset_vf=VOL_FILTER_ASSET.get(asset,VOL_FILTER)
+    vol_ok=vr>=asset_vf
+    filters["volume"]={"pass":vol_ok,"value":f"{vr:.2f}x","need":f">={asset_vf}x"}
 
     # Breakout — fixed to handle BRK_BARS=0 safely
     if i>=BRK_BARS and BRK_BARS>0:
