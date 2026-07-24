@@ -1132,7 +1132,7 @@ def build_dashboard():
 
     # Trade Detail HTML — shows filter criteria for each completed trade
     trade_detail_html=""
-    completed=[t for t in s["trades"][:20] if t.get("action")=="EXIT" and t.get("filters")]
+    completed=[t for t in s["trades"][:20] if t.get("action") in ("EXIT","CLOSED") and t.get("filters")]
     if completed:
         for t in completed:
             pnl_color="#00D68F" if (t.get("pnl") or 0)>=0 else "#FF4757"
@@ -2032,13 +2032,14 @@ def testnet_trading_loop():
                         add_tn_audit(asset,"🔄 RETRY ALL",
                                     f"EMA={ema_dir} | blocked:{blocked} — retrying")
 
+                    if not direction: continue  # still retrying — no signal yet
 
-                    # Signal fired
-                    tn_last_candle[asset]=ts_val
+                    # Signal fired — all filters passed
                     add_tn_audit(asset,f"🚨 SIGNAL {direction}",
                                 f"price=${signal_price:,.4f} | binance data | all filters ✅")
 
                     if tn_state["paused"] or tn_state["kill_switch"]: continue
+
 
                     # Place order on testnet
                     try:
