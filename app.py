@@ -36,9 +36,9 @@ TN_LEVERAGE     = 10
 TN_TOTAL_USDC   = 988.0
 
 ASSETS          = ["BTC","ETH","SOL","BNB","DOGE","AVAX"]
-TOTAL_USDC      = 5.0
+TOTAL_USDC      = 114.80
 BASE_POS        = TOTAL_USDC / len(ASSETS)
-LEVERAGE        = 2
+LEVERAGE        = 10
 CHECK_EVERY     = 60
 TAX_RATE        = 0.35
 
@@ -911,11 +911,7 @@ def trading_loop():
                     log(f"🔄 {asset}: EMA stacked, blocked by {blocked} — retry next cycle")
                     add_issue(asset,f"Signal developing — blocked by {', '.join(blocked)}",
                               f"price=${cur:,.2f} | age={age_s}s | retrying")
-                    # ntfy only on first retry (age<120s) so you know signal is building
-                    if age_s<120:
-                        ntfy(f"🔄 {asset} Signal Developing",
-                             f"EMA stacked {ema_dir}\nBlocked by: {', '.join(blocked)}\nPrice: ${cur:,.2f}\nWill retry every 60s until all filters pass",
-                             priority="default",tags="hourglass_flowing_sand")
+
 
 
                 with lock:
