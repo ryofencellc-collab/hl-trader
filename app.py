@@ -203,6 +203,7 @@ def add_diag(level,event,cause,action):
     log(f"{icons.get(level,'📋')} [{level}] {event} | {cause} | {action}")
 
 AUDIT_FILE = "/tmp/hl_audit_log.txt"
+TRADES_FILE = "/tmp/hl_trades.json"
 
 def add_issue(asset,issue,detail):
     """Log trade issues to mainnet issues tab."""
@@ -246,6 +247,16 @@ def add_trade(asset,action,direction,entry,exit_p,size,pnl,reason):
         if pnl is not None:
             wk=datetime.now(timezone.utc).strftime("%Y-W%W")
             state["weekly_pnl"][wk]=round(state["weekly_pnl"].get(wk,0)+pnl,4)
+    # Persist to disk so trades survive Railway restarts
+    try:
+        import json
+        existing=[]
+        if os.path.exists(TRADES_FILE):
+            existing=json.load(open(TRADES_FILE))
+        existing.insert(0,t)
+        existing=existing[:500]
+        json.dump(existing,open(TRADES_FILE,"w"))
+    except: pass
 
 # ══════════════════════════════════════════════════
 # NTFY
@@ -1555,7 +1566,7 @@ def system_test():
 
     # 1. Binance candle fetch
     try:
-        r=req.get("https://fapi.binance.com/fapi/v1/klines",
+        r=req.get("https://data-api.binance.vision/api/v3/klines",
             params={"symbol":"BTCUSDT","interval":"15m","limit":3},
             headers={"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
             timeout=10)
@@ -1797,6 +1808,59 @@ try:
         log(f"📂 Loaded {len(state['audit'])} audit entries from disk")
 except Exception as e:
     log(f"⚠️ Could not load audit from disk: {e}")
+
+# Load trades from disk
+try:
+    import json as _json
+    if os.path.exists(TRADES_FILE):
+        disk_trades=_json.load(open(TRADES_FILE))
+        with lock:
+            state["trades"]=disk_trades[:500]
+            # Rebuild weekly P&L and tax from disk trades
+            for t in disk_trades:
+                if t.get("pnl") is not None:
+                    wk=t["time"][:7].replace("-","") if t.get("time") else ""
+                    try:
+                        dt=datetime.strptime(t["time"][:10],"%Y-%m-%d")
+                        wk=dt.strftime("%Y-W%W")
+                        state["weekly_pnl"][wk]=round(state["weekly_pnl"].get(wk,0)+t["pnl"],4)
+                        state["tax"]["total_pnl"]+=t["pnl"]
+                        state["tax"]["total_trades"]+=1
+                        if t["pnl"]>0: state["tax"]["winning_trades"]+=1
+                        else: state["tax"]["losing_trades"]+=1
+                    except: pass
+        log(f"📂 Loaded {len(disk_trades)} trades from disk")
+except Exception as e:
+    log(f"⚠️ Could not load trades from disk: {e}")
+
+# Sync open positions from HyperLiquid on startup to prevent double entries
+try:
+    import json as _json2
+    r_pos=req.post(HL_INFO_URL,json={"type":"clearinghouseState","user":MAIN_WALLET},timeout=10)
+    hl_positions=r_pos.json().get("assetPositions",[])
+    for p in hl_positions:
+        pos_data=p.get("position",{})
+        asset=pos_data.get("coin","")
+        szi=float(pos_data.get("szi",0))
+        if asset in ASSETS and szi!=0:
+            direction="LONG" if szi>0 else "SHORT"
+            entry=float(pos_data.get("entryPx",0))
+            size=abs(szi)
+            stop=entry*(1-STOP_PCT) if direction=="LONG" else entry*(1+STOP_PCT)
+            trail=entry*(1-TRAIL_PCT) if direction=="LONG" else entry*(1+TRAIL_PCT)
+            positions[asset]={
+                "direction":direction,"entry":entry,"size":size,"qty_rem":size,
+                "stop":stop,"trail_peak":entry,"trail_stop":trail,
+                "liq":float(pos_data.get("liquidationPx",0) or 0),
+                "partial_done":False,"partial_pnl":0.0,
+                "current_price":entry,"unrealized_pnl":0.0
+            }
+            state["positions"][asset]=positions[asset]
+            log(f"📂 Restored position: {asset} {direction} @ ${entry:,.4f} size={size}")
+    if hl_positions:
+        log(f"📂 Synced {len(positions)} open positions from HyperLiquid")
+except Exception as e:
+    log(f"⚠️ Could not sync positions on startup: {e}")
 
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
