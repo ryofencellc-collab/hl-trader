@@ -197,7 +197,8 @@ def add_diag(level,event,cause,action):
     log(f"{icons.get(level,'📋')} [{level}] {event} | {cause} | {action}")
 
 AUDIT_FILE = "/tmp/hl_audit_log.txt"
-TRADES_FILE = "/tmp/hl_trades.json"
+TRADES_FILE    = "/tmp/hl_trades.json"
+TN_TRADES_FILE = "/tmp/hl_tn_trades.json"
 
 def add_issue(asset,issue,detail):
     """Log trade issues to mainnet issues tab."""
@@ -925,8 +926,11 @@ def trading_loop():
                     last_candle[asset]=ts_val
                 else:
                     # EMA stacked but other filters failing — RETRY next cycle
+                    # Show detailed filter values so we can see why it's retrying
+                    fil_detail=" | ".join(f"{k}={'✅' if v.get('pass') else '❌'} {str(v.get('value',''))[:15]}"
+                                         for k,v in filters.items() if k!="_result")
                     add_audit(asset,"🔄 RETRY ALL",
-                              f"EMA={ema_dir} | blocked:{blocked} — retrying next cycle")
+                              f"EMA={ema_dir} | blocked:{blocked} | {fil_detail}")
                     log(f"🔄 {asset}: EMA stacked, blocked by {blocked} — retry next cycle")
 
 
@@ -956,17 +960,7 @@ def trading_loop():
                         add_audit(asset,"⏳ NO SIGNAL","EMA not stacked",filters)
                         log(f"⏳ {asset}: no signal @ ${cur:,.2f}")
 
-                # Overnight filter
-                if cfg["no_ov"] and 6<=datetime.now(timezone.utc).hour<10:
-                    add_audit(asset,"⏸ OVERNIGHT SKIP",f"UTC hour={datetime.now(timezone.utc).hour} (blocked 6-10)")
-                    log(f"⏸  {asset}: overnight skip"); continue
-
-                # Funding filter
-                if cfg["ff"]:
-                    fr=abs(float(candles[-1].get("fundingRate",0)))
-                    if fr>cfg["ff"]:
-                        add_audit(asset,"⏸ FUNDING SKIP",f"rate={fr:.5f} > max={cfg['ff']:.5f}")
-                        log(f"⏸  {asset}: funding too high"); continue
+                # Overnight + funding already checked inside evaluate_signal
 
                 # EXITS
                 if asset in positions:
@@ -1156,6 +1150,34 @@ def build_dashboard():
             </div>'''
     else:
         trade_detail_html='<div style="text-align:center;padding:48px 24px;color:#4A5878">No completed trades with detail yet</div>'
+
+    # Testnet Trade Detail HTML
+    tn_trade_detail_html=""
+    tn_completed=[t for t in tn_state["trades"][:20] if t.get("action") in ("CLOSED","EXIT")]
+    if tn_completed:
+        for t in tn_completed:
+            pnl_color="#00D68F" if (t.get("pnl") or 0)>=0 else "#FF4757"
+            pnl_str=f'<span style="font-weight:700;color:{pnl_color}">${t["pnl"]:+,.2f}</span>' if t.get("pnl") is not None else ""
+            filter_pills=""
+            for k,v in t.get("filters",{}).items():
+                if k=="_result": continue
+                passed=v.get("pass",False)
+                fc="0,214,143" if passed else "255,71,87"
+                icon="✅" if passed else "❌"
+                val=str(v.get("value",""))[:20]
+                filter_pills+=f'<span style="font-size:10px;padding:2px 6px;border-radius:4px;margin:2px;display:inline-block;background:rgba({fc},0.15);color:rgb({fc})">{icon} {k}: {val}</span>'
+            tn_trade_detail_html+=f'''<div class="card" style="margin-bottom:10px;border-left:3px solid #00B4FF">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+                <div style="font-size:14px;font-weight:700">🧪 {t["asset"]} {t["direction"]}</div>
+                <div style="font-size:11px;color:#4A5878">@ ${t["entry"]:,.4f} → ${t.get("exit",0):,.4f}</div>
+                <div style="margin-left:auto">{pnl_str}</div>
+              </div>
+              <div style="font-size:11px;color:#4A5878;margin-bottom:8px">Exit via {t.get("reason","—")} | {t["time"][11:19]} UTC</div>
+              <div style="line-height:1.8">{filter_pills if filter_pills else "No filter data"}</div>
+            </div>'''
+    else:
+        tn_trade_detail_html='<div style="text-align:center;padding:24px;color:#4A5878">No completed testnet trades yet</div>'
+
 
     # Audit log HTML — full detail
     audit_html=""
@@ -1427,6 +1449,8 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     </div>''' for t in tn_state["trades"][:20]) if tn_state["trades"] else '<div style="text-align:center;padding:24px;color:#4A5878">No testnet trades yet</div>'}
   </div>
   <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin:16px 0 10px">Testnet Audit (last 50)</div>
+  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin:16px 0 10px">🧪 Testnet Trade Detail</div>
+  {tn_trade_detail_html}
   <div class="card" style="padding:0 16px">
     {"".join(f'''<div style="padding:8px 0;border-bottom:1px solid #1E2D42">
       <div style="display:flex;gap:6px;align-items:center">
@@ -1902,6 +1926,43 @@ try:
 except Exception as e:
     log(f"⚠️ Could not sync positions on startup: {e}")
 
+# Load testnet trades from disk
+try:
+    import json as _json3
+    if os.path.exists(TN_TRADES_FILE):
+        tn_disk_trades=_json3.load(open(TN_TRADES_FILE))
+        tn_state["trades"]=tn_disk_trades[:500]
+        log(f"📂 Loaded {len(tn_disk_trades)} testnet trades from disk")
+except Exception as e:
+    log(f"⚠️ Could not load testnet trades from disk: {e}")
+
+# Sync testnet open positions from HyperLiquid testnet on startup
+try:
+    import json as _json4
+    r_tn=req.post("https://api.hyperliquid-testnet.xyz/info",
+        json={"type":"clearinghouseState","user":TN_WALLET},timeout=10)
+    tn_hl_positions=r_tn.json().get("assetPositions",[])
+    for p in tn_hl_positions:
+        pos_data=p.get("position",{})
+        asset=pos_data.get("coin","")
+        szi=float(pos_data.get("szi",0))
+        if asset in ASSETS and szi!=0:
+            direction="LONG" if szi>0 else "SHORT"
+            entry=float(pos_data.get("entryPx",0))
+            size=abs(szi)
+            stop=entry*(1-STOP_PCT) if direction=="LONG" else entry*(1+STOP_PCT)
+            trail=entry*(1-TRAIL_PCT) if direction=="LONG" else entry*(1+TRAIL_PCT)
+            tn_positions[asset]={
+                "direction":direction,"entry":entry,"size":size,
+                "stop":stop,"trail_high":entry,"trail_low":entry,
+                "trail_stop":trail,"current_price":entry,"entry_time":ts()
+            }
+            log(f"📂 Restored TN position: {asset} {direction} @ ${entry:,.4f}")
+    if tn_hl_positions:
+        log(f"📂 Synced {len(tn_positions)} testnet positions from HyperLiquid")
+except Exception as e:
+    log(f"⚠️ Could not sync testnet positions on startup: {e}")
+
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
 
@@ -1994,6 +2055,16 @@ def testnet_trading_loop():
                                     "exit":exit_price,"pnl":round(pnl,4),
                                     "reason":exit_reason,"size":qty
                                 })
+                                # Persist testnet trades to disk
+                                try:
+                                    import json as _jtn2
+                                    _etn2=[]
+                                    if os.path.exists(TN_TRADES_FILE):
+                                        _etn2=_jtn2.load(open(TN_TRADES_FILE))
+                                    _etn2.insert(0,tn_state["trades"][0])
+                                    _etn2=_etn2[:500]
+                                    _jtn2.dump(_etn2,open(TN_TRADES_FILE,"w"))
+                                except: pass
                                 tn_state["tax"]["total_pnl"]+=pnl
                                 tn_state["tax"]["total_trades"]+=1
                                 if pnl>0: tn_state["tax"]["winning_trades"]+=1
@@ -2079,8 +2150,19 @@ def testnet_trading_loop():
                             tn_state["trades"].insert(0,{
                                 "time":ts(),"asset":asset,"action":"OPENED",
                                 "direction":direction,"entry":fill,"exit":None,
-                                "pnl":None,"reason":"signal","size":qty
+                                "pnl":None,"reason":"signal","size":qty,
+                                "filters":filters if "filters" in dir() else {}
                             })
+                            # Persist testnet trades to disk
+                            try:
+                                import json as _jtn
+                                _etn=[]
+                                if os.path.exists(TN_TRADES_FILE):
+                                    _etn=_jtn.load(open(TN_TRADES_FILE))
+                                _etn.insert(0,tn_state["trades"][0])
+                                _etn=_etn[:500]
+                                _jtn.dump(_etn,open(TN_TRADES_FILE,"w"))
+                            except: pass
 
                         add_tn_audit(asset,f"✅ ENTERED {direction}",
                                     f"fill=${fill:,.4f} | qty={qty} | stop=${stop:,.4f}")
