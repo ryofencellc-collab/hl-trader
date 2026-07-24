@@ -1949,7 +1949,14 @@ def testnet_trading_loop():
                             ema([ float(c["c"]) for c in candles],EMA_FAST)[-1],
                             ema([ float(c["c"]) for c in candles],EMA_SLOW)[-1])
                         notional=pos_usd*tn_leverage
-                        qty=round(notional/cur,6)
+                        # Use correct szDecimals per asset
+                        try:
+                            tn_meta=req.post("https://api.hyperliquid-testnet.xyz/info",
+                                json={"type":"meta"},timeout=5).json()
+                            tn_dec=next((a.get("szDecimals",5) for a in tn_meta["universe"]
+                                        if a["name"]==asset),5)
+                        except: tn_dec=5
+                        qty=round(notional/cur,tn_dec)
 
                         is_buy=(direction=="LONG")
                         r=tn_exchange.market_open(asset,is_buy,qty)
