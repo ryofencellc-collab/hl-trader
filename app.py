@@ -132,24 +132,28 @@ tn_state = {
 tn_lock=threading.Lock()
 
 def fetch_binance_candles(asset):
-    """Fetch HyperLiquid MAINNET candles for testnet signal evaluation.
-    Binance is blocked on Railway — mainnet HL prices match Binance within 0.05%."""
+    """Fetch Binance candles for testnet signal evaluation.
+    Uses same source as mainnet — data-api.binance.vision works from Railway.
+    This ensures testnet and mainnet evaluate identical signals."""
     try:
         end_ms=int(time.time()*1000)
         start_ms=end_ms-CANDLE_LIMIT*15*60*1000
-        r=req.post("https://api.hyperliquid.xyz/info",
-            json={"type":"candleSnapshot",
-                  "req":{"coin":asset,"interval":"15m","startTime":start_ms,"endTime":end_ms}},
+        sym=BINANCE_SYM.get(asset,asset+"USDT")
+        r=req.get(BINANCE_CANDLE_URL,
+            params={"symbol":sym,"interval":"15m",
+                    "startTime":start_ms,"endTime":end_ms,"limit":CANDLE_LIMIT},
             timeout=10)
+        if r.status_code!=200:
+            add_tn_issue(asset,"Binance candle error",f"HTTP {r.status_code}")
+            return []
         data=r.json()
         if not isinstance(data,list):
-            log(f"⚠️ HL mainnet candle error {asset}: {data}")
             add_tn_issue(asset,"Candle fetch error",str(data))
             return []
         candles=[]
-        for c in data:
-            candles.append({"t":int(c["t"]),"T":int(c.get("T",int(c["t"])+900000)),
-                           "o":c["o"],"h":c["h"],"l":c["l"],"c":c["c"],"v":c["v"]})
+        for b in data:
+            candles.append({"t":int(b[0]),"T":int(b[6]),
+                           "o":b[1],"h":b[2],"l":b[3],"c":b[4],"v":b[5]})
         return sorted(candles,key=lambda x:x["t"])
     except Exception as e:
         log(f"⚠️ Testnet candle fetch error {asset}: {e}")
@@ -1168,6 +1172,37 @@ def trading_loop():
                         atr_val=atr_vals[-1] if atr_vals and atr_vals[-1] else 0
                     except: atr_val=0
 
+                    # EMA cross check FIRST — matches backtest priority
+                    # If EMA crossed, cancel stop and exit — no trail update needed
+                    complete_closes=[float(c["c"]) for c in candles[:-1]]
+                    ema_x=((pos["direction"]=="LONG" and
+                            ema(complete_closes,EMA_FAST)[-1]<ema(complete_closes,EMA_MID)[-1]) or
+                           (pos["direction"]=="SHORT" and
+                            ema(complete_closes,EMA_FAST)[-1]>ema(complete_closes,EMA_MID)[-1]))
+
+                    if ema_x:
+                        add_audit(asset,"📊 EMA CROSS EXIT",f"EMA5 crossed EMA13 @ ${cur:,.4f}")
+                        old_oid=stop_oids.get(asset)
+                        if old_oid and old_oid!="FILLED":
+                            cancelled=cancel_hl_stop(asset,old_oid)
+                            log(f"🔄 {asset}: cancelled stop before EMA exit OID:{old_oid} → {cancelled}")
+                            time.sleep(0.3)
+                            if asset in stop_oids: del stop_oids[asset]
+                        exit_trade(asset,cur,"ema_cross")
+                        continue
+
+                    # Hard stop check using complete candle
+                    stop_hit=((pos["direction"]=="LONG" and prev_lo<=pos["stop"]) or
+                               (pos["direction"]=="SHORT" and prev_hi>=pos["stop"]))
+                    if stop_hit:
+                        add_audit(asset,"🛑 STOP HIT",f"stop=${pos['stop']:,.4f} | low={prev_lo:,.4f}")
+                        old_oid=stop_oids.get(asset)
+                        if old_oid and old_oid!="FILLED":
+                            cancel_hl_stop(asset,old_oid)
+                        exit_trade(asset,pos["stop"],"stop")
+                        if asset in stop_oids: del stop_oids[asset]
+                        continue
+
                     # S4+S2: Update trail with ATR filter, cancel-replace stop on HL
                     trail_result=update_trail_stop(asset,pos,prev_hi,prev_lo,atr_val,stop_oids)
                     if trail_result=="FILLED":
@@ -1202,7 +1237,6 @@ def trading_loop():
                                 pos["trail_peak"]=trig_p; pos["trail_stop"]=round_price(trig_p*(1+TRAIL_PCT))
                             add_audit(asset,"💰 PARTIAL EXIT",f"@ ${trig_p:,.4f} | stop→breakeven @ ${pos['entry']:,.4f}")
                             log(f"💰 {asset} PARTIAL @ ${trig_p:,.4f} | stop→breakeven")
-                            # Update stop to breakeven
                             old_oid=stop_oids.get(asset)
                             if old_oid and old_oid!="FILLED":
                                 cancel_hl_stop(asset,old_oid)
@@ -1218,43 +1252,12 @@ def trading_loop():
                         if ((pos["direction"]=="LONG" and prev_hi>=tp_p) or
                             (pos["direction"]=="SHORT" and prev_lo<=tp_p)):
                             add_audit(asset,"🎯 TP HIT",f"target=${tp_p:,.4f} hit")
-                            # Cancel stop before closing
                             old_oid=stop_oids.get(asset)
                             if old_oid and old_oid!="FILLED":
                                 cancel_hl_stop(asset,old_oid)
                                 if asset in stop_oids: del stop_oids[asset]
                                 time.sleep(0.3)
                             exit_trade(asset,tp_p,"tp"); continue
-
-                    # Hard stop check using complete candle
-                    stop_hit=((pos["direction"]=="LONG" and prev_lo<=pos["stop"]) or
-                               (pos["direction"]=="SHORT" and prev_hi>=pos["stop"]))
-
-                    # EMA cross check using complete candles
-                    complete_closes=[float(c["c"]) for c in candles[:-1]]
-                    ema_x=((pos["direction"]=="LONG" and
-                            ema(complete_closes,EMA_FAST)[-1]<ema(complete_closes,EMA_MID)[-1]) or
-                           (pos["direction"]=="SHORT" and
-                            ema(complete_closes,EMA_FAST)[-1]>ema(complete_closes,EMA_MID)[-1]))
-
-                    if stop_hit:
-                        add_audit(asset,"🛑 STOP HIT",f"stop=${pos['stop']:,.4f} | low={prev_lo:,.4f}")
-                        # Stop already on HL — just clean up local state
-                        old_oid=stop_oids.get(asset)
-                        if old_oid and old_oid!="FILLED":
-                            cancel_hl_stop(asset,old_oid)
-                        exit_trade(asset,pos["stop"],"stop")
-                        if asset in stop_oids: del stop_oids[asset]
-                    elif ema_x:
-                        add_audit(asset,"📊 EMA CROSS EXIT",f"EMA5 crossed EMA13 @ ${cur:,.4f}")
-                        # Cancel stop first, then market close
-                        old_oid=stop_oids.get(asset)
-                        if old_oid and old_oid!="FILLED":
-                            cancelled=cancel_hl_stop(asset,old_oid)
-                            log(f"🔄 {asset}: cancelled stop before EMA exit OID:{old_oid} → {cancelled}")
-                            time.sleep(0.3)
-                            if asset in stop_oids: del stop_oids[asset]
-                        exit_trade(asset,cur,"ema_cross")
                     else:
                         pnl=((cur-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
                              else (pos["entry"]-cur)*pos["size"])
