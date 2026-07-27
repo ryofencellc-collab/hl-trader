@@ -44,7 +44,7 @@ CHECK_EVERY     = 60
 TAX_RATE        = 0.35
 
 EMA_FAST=5; EMA_MID=13; EMA_SLOW=34
-STOP_PCT=0.05; TRAIL_PCT=0.01
+STOP_PCT=0.05; TRAIL_PCT=0.01; ATR_BUFFER=0.5
 VOL_FILTER=0.5; SEP_FILTER=0.003; BRK_BARS=12  # 0.5x proven best on 2yr Binance backtest
 
 # Binance candle feed — data-api.binance.vision works from Railway
@@ -332,6 +332,71 @@ def ntfy_daily_summary(period="morning"):
          f"Trades: {tax['total_trades']} ({tax['winning_trades']}W/{tax['losing_trades']}L)\n"
          f"Win rate: {wr:.1f}%\nTax set aside: ${tax['total_tax']:.2f}\n"
          f"Open positions:{open_str}\nCycle #{state['cycle']}",tags="bar_chart")
+
+# ══════════════════════════════════════════════════
+# 12-HOUR SIM COMPARISON (9am / 6pm UTC)
+# ══════════════════════════════════════════════════
+_last_sim_hour = -1
+
+def run_12hr_sim():
+    try:
+        import requests as _req
+        now_utc = datetime.now(timezone.utc)
+        log("📊 Running 12hr sim comparison...")
+        end_ms = int(time.time()*1000)
+        start_ms = end_ms - 12*3600*1000
+        BSYM = {"BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT",
+                "BNB":"BNBUSDT","DOGE":"DOGEUSDT","AVAX":"AVAXUSDT"}
+        sim_signals=[]; app_entered=[]
+        cutoff = time.time()-12*3600
+        for t in state["trades"]:
+            try:
+                ep=datetime.strptime(t["time"],"%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc).timestamp()
+                if ep>=cutoff and t.get("action")=="ENTER":
+                    app_entered.append(t["asset"])
+            except: pass
+        for asset in ASSETS:
+            try:
+                r=_req.get(BINANCE_CANDLE_URL,
+                    params={"symbol":BSYM.get(asset,asset+"USDT"),"interval":"15m",
+                            "startTime":start_ms,"endTime":end_ms,"limit":200},timeout=10)
+                if r.status_code!=200: continue
+                raw=r.json()
+                if not isinstance(raw,list) or len(raw)<50: continue
+                candles=[{"t":int(b[0]),"o":b[1],"h":b[2],"l":b[3],"c":b[4],"v":b[5]} for b in raw]
+                for i in range(50,len(candles)-1):
+                    direction,_,_,_,filters=evaluate_signal(candles[:i+1],asset)
+                    if direction:
+                        st=datetime.fromtimestamp(int(candles[i]["t"])/1000,tz=timezone.utc)
+                        if st.timestamp()>=cutoff:
+                            sim_signals.append((asset,direction,st.strftime("%H:%M")))
+                        break
+            except: continue
+        sim_assets=[s[0] for s in sim_signals]
+        matched=[a for a in sim_assets if a in app_entered]
+        sim_only=[a for a in sim_assets if a not in app_entered]
+        app_only=[a for a in app_entered if a not in sim_assets]
+        out=[f"12hr Sim | {now_utc.strftime('%H:%M')} UTC"]
+        if sim_signals:
+            for asset,direction,st in sim_signals:
+                status="✅ matched" if asset in matched else "⚠️ app missed"
+                out.append(f"{status}: {asset} {direction} @ {st}")
+        else:
+            out.append("No signals in last 12hrs")
+        if app_only: out.append(f"App extra: {', '.join(app_only)}")
+        if not sim_only and not app_only: out.append("✅ In sync")
+        ntfy("📊 Daily Sim Check","\n".join(out),tags="chart_with_upwards_trend")
+        log(f"📊 Sim done: {len(sim_signals)} signals | {len(matched)} matched")
+    except Exception as e:
+        log(f"⚠️ 12hr sim failed: {e}")
+
+def check_12hr_sim():
+    global _last_sim_hour
+    h=datetime.now(timezone.utc).hour
+    if h in (9,18) and h!=_last_sim_hour:
+        _last_sim_hour=h
+        threading.Thread(target=run_12hr_sim,daemon=True).start()
+
 
 def check_milestones():
     bal=state["balance"]
@@ -636,7 +701,9 @@ def verify_entry(asset):
         log(f"❌ verify_entry {asset} — no fill found in last 30s")
         return False,0
     except Exception as e:
-        add_diag("ERROR",f"Verify entry {asset}",str(e),"Assuming failed"); return False,0
+        add_diag("ERROR",f"Verify entry {asset}",str(e),"Assuming failed")
+        add_issue(asset,"Verify entry failed",str(e))
+        return False,0
 
 def verify_exit(asset):
     """
@@ -690,8 +757,10 @@ def place_hl_stop(asset, direction, size, stop_price):
             log(f"⚠️  Stop unexpected response {asset}: {statuses}")
         else:
             add_diag("ERROR", f"Stop order failed {asset}", str(result), "Position unprotected")
+            add_issue(asset,"Stop order failed",f"Result: {str(result)[:100]} — position unprotected")
     except Exception as e:
         add_diag("ERROR", f"Stop order exception {asset}", str(e), "Position unprotected")
+        add_issue(asset,"Stop order exception",f"{str(e)[:100]} — position unprotected")
     return None
 
 def cancel_hl_stop(asset, oid):
@@ -759,8 +828,8 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
         dec=5
     qty=round((pos_usd*LEVERAGE)/price,dec)
     log(f"📋 {asset} size: {qty} (dec={dec}, pos_usd=${pos_usd:.2f}, notional=${qty*price:.2f})")
-    stop=round(price*(1-STOP_PCT) if direction=="LONG" else price*(1+STOP_PCT),2)
-    trail=round(price*(1-TRAIL_PCT) if direction=="LONG" else price*(1+TRAIL_PCT),2)
+    stop=round_price(price*(1-STOP_PCT) if direction=="LONG" else price*(1+STOP_PCT))
+    trail=round_price(price*(1-TRAIL_PCT) if direction=="LONG" else price*(1+TRAIL_PCT))
     liq=liq_price(price,direction)
 
     if DRY_RUN:
@@ -783,6 +852,7 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
             log(f"📋 Statuses for {asset}: {statuses}")
             if statuses and "error" in statuses[0]:
                 add_diag("ERROR",f"Order rejected {asset}",statuses[0]["error"],"Skipping")
+                add_issue(asset,"Order rejected",f"Exchange rejected: {statuses[0]['error']}")
                 add_audit(asset,"ORDER REJECTED",f"Exchange error: {statuses[0]['error']}")
                 add_issue(asset,"Order rejected",statuses[0]["error"])
                 return
@@ -797,10 +867,11 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
                 if not confirmed:
                     add_diag("ERROR",f"Entry NOT confirmed {a}","Order placed but not visible","NOT logging")
                     add_audit(a,"ENTRY FAILED",f"Order placed @ ${f:,.2f} but not visible on exchange")
+                    add_issue(a,"Entry not confirmed",f"Order placed @ ${f:,.2f} but not visible — position NOT recorded")
                     return
                 f2=actual if actual>0 else f
-                stp2=round(f2*(1-STOP_PCT) if d=="LONG" else f2*(1+STOP_PCT),2)
-                trl2=round(f2*(1-TRAIL_PCT) if d=="LONG" else f2*(1+TRAIL_PCT),2)
+                stp2=round_price(f2*(1-STOP_PCT) if d=="LONG" else f2*(1+STOP_PCT))
+                trl2=round_price(f2*(1-TRAIL_PCT) if d=="LONG" else f2*(1+TRAIL_PCT))
                 lq2=liq_price(f2,d)
                 try:
                     meta2=info.meta()
@@ -840,9 +911,11 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
         else:
             add_diag("ERROR",f"Entry failed {asset}",str(r),"Skipping")
             add_audit(asset,"ENTRY FAILED",f"Exchange rejected order: {r}")
+            add_issue(asset,"Entry failed",f"Exchange rejected: {str(r)[:100]}")
     except Exception as e:
         add_diag("ERROR",f"Entry exception {asset}",str(e),"Skipping")
         add_audit(asset,"ENTRY ERROR",str(e))
+        add_issue(asset,"Entry exception",str(e)[:150])
 
 def exit_trade(asset,price,reason):
     if asset not in positions: return
@@ -900,6 +973,7 @@ def exit_trade(asset,price,reason):
     except Exception as e:
         add_diag("ERROR",f"Exit exception {asset}",str(e),"Position may still be open")
         add_audit(asset,"EXIT ERROR",str(e))
+        add_issue(asset,"Exit exception",f"{str(e)[:150]} — position may still be open")
 
 def close_all(reason="manual"):
     log(f"🚨 CLOSING ALL — {reason}")
@@ -1218,6 +1292,7 @@ def trading_loop():
                 retry_count[asset]=retry_count.get(asset,0)+1
                 add_diag("ERROR",f"Error {asset}",str(e),f"Retry {retry_count[asset]}/5")
                 add_audit(asset,"❌ ERROR",f"{str(e)} | retry {retry_count[asset]}/5")
+                add_issue(asset,f"Trading error (retry {retry_count[asset]}/5)",str(e)[:150])
                 if retry_count[asset]>5:
                     add_diag("WARNING",f"{asset} skipped",
                              f"{retry_count[asset]} consecutive errors",
@@ -1231,6 +1306,7 @@ def trading_loop():
         check_milestones()
         check_daily_summaries()
         check_tax_reminders()
+        check_12hr_sim()
 
         with lock:
             state["status"]="stopped" if state["kill_switch"] else ("paused" if state["paused"] else "waiting")
@@ -1290,31 +1366,52 @@ def build_dashboard():
 
     # Trade Detail HTML — shows filter criteria for each completed trade
     trade_detail_html=""
-    completed=[t for t in s["trades"][:20] if t.get("action") in ("EXIT","CLOSED") and t.get("filters")]
-    if completed:
-        for t in completed:
-            pnl_color="#00D68F" if (t.get("pnl") or 0)>=0 else "#FF4757"
-            pnl_str=f'<span style="font-weight:700;color:{pnl_color}">${t["pnl"]:+,.2f}</span>' if t.get("pnl") is not None else ""
+    all_trades=s["trades"][:100]
+    paired=[]
+    used_exits=set()
+    for ei,entry_t in enumerate(all_trades):
+        if entry_t.get("action")!="ENTER": continue
+        asset_=entry_t["asset"]; dir_=entry_t["direction"]
+        for xi,exit_t in enumerate(all_trades):
+            if xi in used_exits: continue
+            if exit_t.get("action") not in ("EXIT","CLOSED"): continue
+            if exit_t["asset"]!=asset_ or exit_t["direction"]!=dir_: continue
+            if xi<ei:
+                paired.append((entry_t,exit_t)); used_exits.add(xi); break
+        else:
+            paired.append((entry_t,None))
+    if paired:
+        for entry_t,exit_t in paired[:15]:
+            pnl=exit_t.get("pnl") if exit_t else None
+            pnl_color="#00D68F" if (pnl or 0)>=0 else "#FF4757"
+            pnl_str=f'<span style="font-weight:700;color:{pnl_color}">${pnl:+,.2f}</span>' if pnl is not None else '<span style="color:#4A5878">OPEN</span>'
             filter_pills=""
-            for k,v in t.get("filters",{}).items():
+            for k,v in entry_t.get("filters",{}).items():
                 if k=="_result": continue
                 passed=v.get("pass",False)
                 fc="0,214,143" if passed else "255,71,87"
-                icon="✅" if passed else "❌"
-                val=str(v.get("value",""))[:20]
-                filter_pills+=f'<span style="font-size:10px;padding:2px 6px;border-radius:4px;margin:2px;display:inline-block;background:rgba({fc},0.15);color:rgb({fc})">{icon} {k}: {val}</span>'
-            trade_detail_html+=f'''<div class="card" style="margin-bottom:10px">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-                <div style="font-size:14px;font-weight:700">{t["asset"]} {t["direction"]}</div>
-                <div style="font-size:11px;color:#4A5878">@ ${t["entry"]:,.4f} → ${t.get("exit",0):,.4f}</div>
+                val=str(v.get("value",""))[:25]
+                filter_pills+=f'<span style="font-size:10px;padding:2px 6px;border-radius:4px;margin:2px;display:inline-block;background:rgba({fc},0.15);color:rgb({fc})">{"✅" if passed else "❌"} {k}: {val}</span>'
+            exit_reason=exit_t.get("reason","—") if exit_t else "holding"
+            exit_price=f'${exit_t.get("exit",0):,.4f}' if exit_t else "—"
+            reason_map={"trail":"🔔 Trail stop","ema_cross":"📊 EMA cross","stop":"🛑 Hard stop","tp":"🎯 Take profit","holding":"⏳ Still open"}
+            exit_label=reason_map.get(exit_reason,exit_reason)
+            border_color="#00D68F" if (pnl or 0)>=0 else "#FF4757" if pnl is not None else "#4A5878"
+            exit_time=exit_t["time"][11:16] if exit_t else "—"
+            trade_detail_html+=f"""<div class="card" style="margin-bottom:10px;border-left:3px solid {border_color}">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                <div style="font-size:14px;font-weight:700">{entry_t["asset"]} {entry_t["direction"]}</div>
+                <div style="font-size:11px;color:#4A5878">${entry_t["entry"]:,.4f} → {exit_price}</div>
                 <div style="margin-left:auto">{pnl_str}</div>
               </div>
-              <div style="font-size:11px;color:#4A5878;margin-bottom:8px">Exit via {t.get("reason","—")} | {t["time"][11:19]} UTC</div>
-              <div style="line-height:1.8">{filter_pills}</div>
-            </div>'''
+              <div style="font-size:11px;color:#4A5878;margin-bottom:6px">
+                ▶ In: {entry_t["time"][11:16]} UTC &nbsp;|&nbsp; {"■ Out" if exit_t else "⏳ Open"}: {exit_time} UTC &nbsp;|&nbsp; {exit_label}
+              </div>
+              <div style="font-size:10px;color:#4A5878;margin-bottom:3px">WHY ENTERED:</div>
+              <div style="line-height:1.8">{filter_pills if filter_pills else '<span style="font-size:10px;color:#4A5878">No filter data</span>'}</div>
+            </div>"""
     else:
-        trade_detail_html='<div style="text-align:center;padding:48px 24px;color:#4A5878">No completed trades with detail yet</div>'
-
+        trade_detail_html='<div style="text-align:center;padding:48px 24px;color:#4A5878">No trades yet</div>'
     # Testnet Trade Detail HTML
     tn_trade_detail_html=""
     tn_completed=[t for t in tn_state["trades"][:20] if t.get("action") in ("CLOSED","EXIT")]
