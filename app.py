@@ -9,7 +9,8 @@ Every candle, every signal, every skip tracked and visible.
 DRY_RUN = False | TESTNET = True | LEVERAGE = 10x
 """
 
-import threading, time, csv, os, requests as req
+import threading
+import math, time, csv, os, requests as req
 from datetime import datetime, timezone
 from flask import Flask, request, session, redirect, jsonify, Response
 import eth_account
@@ -255,6 +256,18 @@ def add_trade(asset,action,direction,entry,exit_p,size,pnl,reason,filters=None):
     except: pass
 
 # ══════════════════════════════════════════════════
+# PRICE ROUNDING (HL requires 5 significant figures)
+# ══════════════════════════════════════════════════
+def round_price(p, sig=5):
+    """Round price to HyperLiquid 5 significant figures requirement"""
+    if p==0: return 0.0
+    try:
+        mag=math.floor(math.log10(abs(p)))
+        dec=max(0,sig-1-mag)
+        return round(p,dec)
+    except: return round(p,4)
+
+# ══════════════════════════════════════════════════
 # NTFY
 # ══════════════════════════════════════════════════
 def ntfy(title,message,priority="default",tags=""):
@@ -422,7 +435,9 @@ tn_info=Info(constants.TESTNET_API_URL,skip_ws=True)
 tn_exchange=Exchange(tn_wallet,constants.TESTNET_API_URL,account_address=TN_WALLET)
 
 positions={}; last_candle={}; last_exit={}; bar_count={}; entry_times={}
+stop_oids={}   # mainnet: asset -> HL stop order OID (S2 cancel-replace)
 tn_positions={}; tn_last_candle={}; tn_last_exit={}; tn_bar_count={}
+tn_stop_oids={}  # testnet: asset -> HL stop order OID (S2 cancel-replace)
 
 # ══════════════════════════════════════════════════
 # INDICATORS
@@ -480,6 +495,9 @@ def atr_lookup(candles):
 def evaluate_signal(candles,asset):
     """
     Full signal evaluation with detailed filter breakdown.
+    S2+S4: Evaluates on candles[-2] — the LAST COMPLETE candle.
+    candles[-1] is the current forming candle — we never evaluate on incomplete data.
+    This matches the backtest exactly: signal on complete candle OHLC.
     Returns signal direction + complete filter status for audit.
     """
     cfg=ASSET_CFG[asset]
@@ -488,12 +506,19 @@ def evaluate_signal(candles,asset):
     if len(candles)<50:
         return None,None,0,0,{"error":"insufficient candles"}
 
-    closes=[float(c["c"]) for c in candles]
-    highs=[float(c["h"]) for c in candles]
-    lows=[float(c["l"]) for c in candles]
-    vols=[float(c["v"]) for c in candles]
+    # S2+S4 KEY CHANGE: use candles[:-1] — exclude current forming candle
+    # candles[-1] = current incomplete candle (forming right now)
+    # candles[-2] = last COMPLETE candle with final OHLC
+    complete_candles = candles[:-1]
+    if len(complete_candles)<50:
+        return None,None,0,0,{"error":"insufficient complete candles"}
+
+    closes=[float(c["c"]) for c in complete_candles]
+    highs=[float(c["h"]) for c in complete_candles]
+    lows=[float(c["l"]) for c in complete_candles]
+    vols=[float(c["v"]) for c in complete_candles]
     ef=ema(closes,EMA_FAST); em2=ema(closes,EMA_MID); es=ema(closes,EMA_SLOW)
-    vs=sma(vols,20); u=bbu(closes); l=bbl(closes); i=len(candles)-1
+    vs=sma(vols,20); u=bbu(closes); l=bbl(closes); i=len(complete_candles)-1
 
     # EMA stack
     if ef[i] and em2[i] and es[i]:
@@ -541,9 +566,9 @@ def evaluate_signal(candles,asset):
 
     # Strong close
     if cfg["sc"]:
-        br=float(candles[i]["h"])-float(candles[i]["l"])
+        br=float(complete_candles[i]["h"])-float(complete_candles[i]["l"])
         if br>0:
-            cp=(closes[i]-float(candles[i]["l"]))/br
+            cp=(closes[i]-float(complete_candles[i]["l"]))/br
             sc_ok=(cp>=0.70 if d=="LONG" else cp<=0.30)
             sc_val=f"close pct={cp:.2f} ({'≥0.70' if d=='LONG' else '≤0.30'} needed)"
         else: sc_ok=False; sc_val="zero range candle"
@@ -554,7 +579,7 @@ def evaluate_signal(candles,asset):
     # Regime
     if cfg["regime"]:
         try:
-            lkp,atr_v=atr_lookup(candles)
+            lkp,atr_v=atr_lookup(complete_candles)
             if lkp[i] and atr_v[i]:
                 reg_ok=atr_v[i]>lkp[i]*1.2
                 reg_val=f"ATR={atr_v[i]:.4f} vs MA={lkp[i]:.4f} (need >1.2x)"
@@ -637,6 +662,91 @@ def liq_price(entry,direction):
 # ══════════════════════════════════════════════════
 # TRADING
 # ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# S2+S4 STOP ORDER MANAGEMENT
+# ══════════════════════════════════════════════════
+def place_hl_stop(asset, direction, size, stop_price):
+    """Place reduce-only stop market order on HyperLiquid exchange"""
+    is_buy = direction == "SHORT"  # SHORT needs BUY to close
+    sp = round_price(stop_price)
+    lp = round_price(sp * 0.9 if is_buy else sp * 1.1)
+    try:
+        dec = next((a.get("szDecimals",5) for a in info.meta()["universe"] if a["name"]==asset),5)
+        sz = round(size, dec)
+    except:
+        sz = size
+    order_type = {"trigger": {"triggerPx": sp, "isMarket": True, "tpsl": "sl"}}
+    try:
+        result = exchange.order(asset, is_buy, sz, lp, order_type, reduce_only=True)
+        if result.get("status") == "ok":
+            statuses = result["response"]["data"]["statuses"]
+            if statuses and "resting" in statuses[0]:
+                oid = statuses[0]["resting"]["oid"]
+                log(f"✅ Stop placed {asset} @ ${sp} OID:{oid}")
+                return oid
+            if statuses and "filled" in statuses[0]:
+                log(f"⚠️  Stop filled immediately for {asset} — position already closed")
+                return "FILLED"
+            log(f"⚠️  Stop unexpected response {asset}: {statuses}")
+        else:
+            add_diag("ERROR", f"Stop order failed {asset}", str(result), "Position unprotected")
+    except Exception as e:
+        add_diag("ERROR", f"Stop order exception {asset}", str(e), "Position unprotected")
+    return None
+
+def cancel_hl_stop(asset, oid):
+    """Cancel a stop order on HyperLiquid"""
+    try:
+        result = exchange.cancel(asset, oid)
+        return result.get("status") == "ok"
+    except Exception as e:
+        log(f"⚠️  Cancel stop failed {asset} OID:{oid}: {e}")
+        return False
+
+def update_trail_stop(asset, pos, hi, lo, atr_val, oids_dict):
+    """
+    S2+S4 trail update:
+    S4: Only update trail if candle move > 0.5x ATR
+    S2: Cancel old stop, place new stop at updated trail price
+    Returns True if trail was updated
+    """
+    if atr_val is None: atr_val = 0
+    updated = False
+    
+    if pos["direction"] == "LONG":
+        move = hi - pos["trail_peak"]
+        # S4: ATR filter — skip update if move is noise
+        # If ATR=0, always update (can't filter nothing)
+        if hi > pos["trail_peak"] and (atr_val == 0 or move > atr_val * ATR_BUFFER):
+            pos["trail_peak"] = hi
+            pos["trail_stop"] = round_price(hi * (1 - TRAIL_PCT))
+            updated = True
+    else:
+        move = pos["trail_peak"] - lo
+        if lo < pos["trail_peak"] and (atr_val == 0 or move > atr_val * ATR_BUFFER):
+            pos["trail_peak"] = lo
+            pos["trail_stop"] = round_price(lo * (1 + TRAIL_PCT))
+            updated = True
+
+    if updated:
+        add_audit(asset, "📈 TRAIL UPDATED S4",
+                  f"trail=${pos['trail_stop']:.4f} | peak=${pos['trail_peak']:.4f} | "
+                  f"move=${move:.4f} | ATR=${atr_val:.4f}")
+        # S2: Cancel old stop, place new one
+        old_oid = oids_dict.get(asset)
+        if old_oid and old_oid != "FILLED":
+            cancelled = cancel_hl_stop(asset, old_oid)
+            log(f"🔄 {asset}: cancel old stop OID:{old_oid} → {cancelled}")
+            time.sleep(0.3)
+        new_oid = place_hl_stop(asset, pos["direction"], pos.get("qty_rem", pos["size"]), pos["trail_stop"])
+        if new_oid and new_oid != "FILLED":
+            oids_dict[asset] = new_oid
+        elif new_oid == "FILLED":
+            # Stop triggered immediately — position closed by exchange
+            return "FILLED"
+
+    return updated
+
 def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
     log(f"🔥 ENTER_TRADE CALLED: {asset} {direction} @ ${price:,.4f} — attempting order")
     cfg=ASSET_CFG[asset]
@@ -707,6 +817,16 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
                 add_audit(a,"✅ ENTERED",f"{d} @ ${f2:,.2f} | stop=${stp2:,.2f} | trail=${trl2:,.2f} | liq=${lq2:,.2f} | CONFIRMED")
                 ntfy_trade_entered(a,d,f2,q2,stp2,trl2,pu)
                 log(f"✅ ENTERED {d} {a} @ ${f2:,.2f} | CONFIRMED | liq=${lq2:,.2f}")
+                # S2: Place stop loss order on HL exchange immediately
+                oid=place_hl_stop(a,d,q2,stp2)
+                if oid and oid!="FILLED":
+                    stop_oids[a]=oid
+                    add_audit(a,"🛡 STOP PLACED",f"stop @ ${stp2:,.4f} OID:{oid}")
+                elif oid=="FILLED":
+                    add_audit(a,"⚠️ STOP FILLED IMMEDIATELY",f"position may be closed")
+                else:
+                    add_audit(a,"⚠️ STOP PLACEMENT FAILED",f"position unprotected — will retry next candle")
+                    add_issue(a,"Stop placement failed",f"entry @ ${f2:,.4f} — no stop order placed")
                 with lock: state["positions"]={k:v for k,v in positions.items()}
 
             t=threading.Thread(
@@ -962,68 +1082,112 @@ def trading_loop():
 
                 # Overnight + funding already checked inside evaluate_signal
 
-                # EXITS
+                # EXITS — S2+S4: use last COMPLETE candle hi/lo
                 if asset in positions:
                     pos=positions[asset]
-                    if pos["direction"]=="LONG" and hi>pos["trail_peak"]:
-                        pos["trail_peak"]=hi; pos["trail_stop"]=round(hi*(1-TRAIL_PCT),2)
-                        add_audit(asset,"📈 TRAIL UPDATED",f"new trail=${pos['trail_stop']:,.2f}")
-                    elif pos["direction"]=="SHORT" and lo<pos["trail_peak"]:
-                        pos["trail_peak"]=lo; pos["trail_stop"]=round(lo*(1+TRAIL_PCT),2)
-                        add_audit(asset,"📉 TRAIL UPDATED",f"new trail=${pos['trail_stop']:,.2f}")
+                    # Use candles[-2] for exit checks — last COMPLETE candle
+                    prev=candles[-2]
+                    prev_hi=float(prev["h"]); prev_lo=float(prev["l"])
+                    # ATR from complete candles
+                    try:
+                        _,atr_vals=atr_lookup(candles[:-1])
+                        atr_val=atr_vals[-1] if atr_vals and atr_vals[-1] else 0
+                    except: atr_val=0
 
+                    # S4+S2: Update trail with ATR filter, cancel-replace stop on HL
+                    trail_result=update_trail_stop(asset,pos,prev_hi,prev_lo,atr_val,stop_oids)
+                    if trail_result=="FILLED":
+                        # Stop was triggered by HL exchange
+                        pnl=((pos["trail_stop"]-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                             else (pos["entry"]-pos["trail_stop"])*pos["size"])
+                        add_audit(asset,"✅ TRAIL EXIT (HL)",f"stop triggered by exchange @ ${pos['trail_stop']:.4f} | P&L=${pnl:+.4f}")
+                        record_tax(asset,pos["direction"],pos["entry"],pos["trail_stop"],pos["size"],pnl,entry_times.get(asset,ts()))
+                        ntfy_trade_closed(asset,pos["direction"],pos["entry"],pos["trail_stop"],pnl,"trail")
+                        add_trade(asset,"EXIT",pos["direction"],pos["entry"],pos["trail_stop"],pos["size"],pnl,"trail")
+                        last_exit[asset]=bar_count.get(asset,0)
+                        del positions[asset]
+                        if asset in stop_oids: del stop_oids[asset]
+                        if asset in entry_times: del entry_times[asset]
+                        with lock: state["positions"]={k:v for k,v in positions.items()}
+                        continue
+
+                    # Partial exit for SOL
                     if cfg["exit"]=="partial" and not pos["partial_done"]:
                         trig_p=(pos["entry"]*(1+cfg["pt"]) if pos["direction"]=="LONG"
                                 else pos["entry"]*(1-cfg["pt"]))
-                        if ((pos["direction"]=="LONG" and hi>=trig_p) or
-                            (pos["direction"]=="SHORT" and lo<=trig_p)):
+                        if ((pos["direction"]=="LONG" and prev_hi>=trig_p) or
+                            (pos["direction"]=="SHORT" and prev_lo<=trig_p)):
                             pqty=pos["qty_rem"]*cfg["ps"]
                             praw=((trig_p-pos["entry"])*pqty if pos["direction"]=="LONG"
                                   else (pos["entry"]-trig_p)*pqty)
                             pos["partial_pnl"]+=praw; pos["qty_rem"]-=pqty
                             pos["partial_done"]=True; pos["stop"]=pos["entry"]
                             if pos["direction"]=="LONG":
-                                pos["trail_peak"]=trig_p; pos["trail_stop"]=round(trig_p*(1-TRAIL_PCT),2)
+                                pos["trail_peak"]=trig_p; pos["trail_stop"]=round_price(trig_p*(1-TRAIL_PCT))
                             else:
-                                pos["trail_peak"]=trig_p; pos["trail_stop"]=round(trig_p*(1+TRAIL_PCT),2)
-                            add_audit(asset,"💰 PARTIAL EXIT",f"@ ${trig_p:,.2f} | stop→breakeven @ ${pos['entry']:,.2f}")
-                            log(f"💰 {asset} PARTIAL @ ${trig_p:,.2f} | stop→breakeven")
+                                pos["trail_peak"]=trig_p; pos["trail_stop"]=round_price(trig_p*(1+TRAIL_PCT))
+                            add_audit(asset,"💰 PARTIAL EXIT",f"@ ${trig_p:,.4f} | stop→breakeven @ ${pos['entry']:,.4f}")
+                            log(f"💰 {asset} PARTIAL @ ${trig_p:,.4f} | stop→breakeven")
+                            # Update stop to breakeven
+                            old_oid=stop_oids.get(asset)
+                            if old_oid and old_oid!="FILLED":
+                                cancel_hl_stop(asset,old_oid)
+                                time.sleep(0.3)
+                            new_oid=place_hl_stop(asset,pos["direction"],pos["qty_rem"],pos["stop"])
+                            if new_oid and new_oid!="FILLED":
+                                stop_oids[asset]=new_oid
 
+                    # Fixed TP for BNB
                     if cfg["exit"]=="fixed_tp" and cfg["tp"]:
                         tp_p=(pos["entry"]*(1+cfg["tp"]) if pos["direction"]=="LONG"
                               else pos["entry"]*(1-cfg["tp"]))
-                        if ((pos["direction"]=="LONG" and hi>=tp_p) or
-                            (pos["direction"]=="SHORT" and lo<=tp_p)):
-                            add_audit(asset,"🎯 TP HIT",f"target=${tp_p:,.2f} hit")
+                        if ((pos["direction"]=="LONG" and prev_hi>=tp_p) or
+                            (pos["direction"]=="SHORT" and prev_lo<=tp_p)):
+                            add_audit(asset,"🎯 TP HIT",f"target=${tp_p:,.4f} hit")
+                            # Cancel stop before closing
+                            old_oid=stop_oids.get(asset)
+                            if old_oid and old_oid!="FILLED":
+                                cancel_hl_stop(asset,old_oid)
+                                if asset in stop_oids: del stop_oids[asset]
+                                time.sleep(0.3)
                             exit_trade(asset,tp_p,"tp"); continue
 
-                    stop_hit=((pos["direction"]=="LONG" and lo<=pos["stop"]) or
-                               (pos["direction"]=="SHORT" and hi>=pos["stop"]))
-                    trail_hit=((pos["direction"]=="LONG" and lo<=pos["trail_stop"]) or
-                                (pos["direction"]=="SHORT" and hi>=pos["trail_stop"]))
-                    ema_x=((pos["direction"]=="LONG" and ema(
-                        [float(c["c"]) for c in candles],EMA_FAST)[-1]<
-                        ema([float(c["c"]) for c in candles],EMA_MID)[-1]) or
-                        (pos["direction"]=="SHORT" and ema(
-                        [float(c["c"]) for c in candles],EMA_FAST)[-1]>
-                        ema([float(c["c"]) for c in candles],EMA_MID)[-1]))
+                    # Hard stop check using complete candle
+                    stop_hit=((pos["direction"]=="LONG" and prev_lo<=pos["stop"]) or
+                               (pos["direction"]=="SHORT" and prev_hi>=pos["stop"]))
+
+                    # EMA cross check using complete candles
+                    complete_closes=[float(c["c"]) for c in candles[:-1]]
+                    ema_x=((pos["direction"]=="LONG" and
+                            ema(complete_closes,EMA_FAST)[-1]<ema(complete_closes,EMA_MID)[-1]) or
+                           (pos["direction"]=="SHORT" and
+                            ema(complete_closes,EMA_FAST)[-1]>ema(complete_closes,EMA_MID)[-1]))
 
                     if stop_hit:
-                        add_audit(asset,"🛑 STOP HIT",f"stop=${pos['stop']:,.2f} | low={lo:,.2f}")
+                        add_audit(asset,"🛑 STOP HIT",f"stop=${pos['stop']:,.4f} | low={prev_lo:,.4f}")
+                        # Stop already on HL — just clean up local state
+                        old_oid=stop_oids.get(asset)
+                        if old_oid and old_oid!="FILLED":
+                            cancel_hl_stop(asset,old_oid)
                         exit_trade(asset,pos["stop"],"stop")
-                    elif trail_hit:
-                        add_audit(asset,"🔔 TRAIL HIT",f"trail=${pos['trail_stop']:,.2f} | low={lo:,.2f}")
-                        exit_trade(asset,pos["trail_stop"],"trail")
+                        if asset in stop_oids: del stop_oids[asset]
                     elif ema_x:
-                        add_audit(asset,"📊 EMA CROSS EXIT",f"EMA5 crossed EMA13 @ ${cur:,.2f}")
+                        add_audit(asset,"📊 EMA CROSS EXIT",f"EMA5 crossed EMA13 @ ${cur:,.4f}")
+                        # Cancel stop first, then market close
+                        old_oid=stop_oids.get(asset)
+                        if old_oid and old_oid!="FILLED":
+                            cancelled=cancel_hl_stop(asset,old_oid)
+                            log(f"🔄 {asset}: cancelled stop before EMA exit OID:{old_oid} → {cancelled}")
+                            time.sleep(0.3)
+                            if asset in stop_oids: del stop_oids[asset]
                         exit_trade(asset,cur,"ema_cross")
                     else:
                         pnl=((cur-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
                              else (pos["entry"]-cur)*pos["size"])
                         add_audit(asset,"⏳ HOLDING",
-                                  f"{pos['direction']} @ ${pos['entry']:,.2f} | cur=${cur:,.2f} | "
-                                  f"trail=${pos['trail_stop']:,.2f} | liq=${pos['liq']:,.2f} | P&L=${pnl:+.4f}")
-                        log(f"⏳ {asset} {pos['direction']} @ ${cur:,.2f} | trail=${pos['trail_stop']:,.2f} | P&L=${pnl:+.4f}")
+                                  f"{pos['direction']} @ ${pos['entry']:,.4f} | cur=${cur:,.4f} | "
+                                  f"trail=${pos['trail_stop']:,.4f} | stop_oid={stop_oids.get(asset,'?')} | P&L=${pnl:+.4f}")
+                        log(f"⏳ {asset} {pos['direction']} @ ${cur:,.4f} | trail=${pos['trail_stop']:,.4f} | P&L=${pnl:+.4f}")
 
                 # ENTRIES
                 elif not paused and not killed:
@@ -1923,6 +2087,19 @@ try:
             log(f"📂 Restored position: {asset} {direction} @ ${entry:,.4f} size={size}")
     if hl_positions:
         log(f"📂 Synced {len(positions)} open positions from HyperLiquid")
+    # Recover stop order OIDs from HL open orders
+    try:
+        open_orders=req.post(HL_INFO_URL,json={"type":"openOrders","user":MAIN_WALLET},timeout=10).json()
+        if isinstance(open_orders,list):
+            for o in open_orders:
+                asset=o.get("coin","")
+                if asset in positions and asset not in stop_oids:
+                    # Find reduce-only orders (stop losses)
+                    if o.get("reduceOnly") or o.get("orderType","").lower() in ("stop market","stop limit","trigger"):
+                        stop_oids[asset]=o.get("oid")
+                        log(f"📂 Recovered stop OID for {asset}: {stop_oids[asset]}")
+    except Exception as e:
+        log(f"⚠️ Could not recover stop OIDs: {e}")
 except Exception as e:
     log(f"⚠️ Could not sync positions on startup: {e}")
 
@@ -1960,6 +2137,19 @@ try:
             log(f"📂 Restored TN position: {asset} {direction} @ ${entry:,.4f}")
     if tn_hl_positions:
         log(f"📂 Synced {len(tn_positions)} testnet positions from HyperLiquid")
+    # Recover testnet stop OIDs
+    try:
+        tn_open_orders=req.post("https://api.hyperliquid-testnet.xyz/info",
+            json={"type":"openOrders","user":TN_WALLET},timeout=10).json()
+        if isinstance(tn_open_orders,list):
+            for o in tn_open_orders:
+                asset=o.get("coin","")
+                if asset in tn_positions and asset not in tn_stop_oids:
+                    if o.get("reduceOnly"):
+                        tn_stop_oids[asset]=o.get("oid")
+                        log(f"📂 Recovered TN stop OID for {asset}: {tn_stop_oids[asset]}")
+    except Exception as e:
+        log(f"⚠️ Could not recover TN stop OIDs: {e}")
 except Exception as e:
     log(f"⚠️ Could not sync testnet positions on startup: {e}")
 
@@ -1993,54 +2183,90 @@ def testnet_trading_loop():
                     cur=float(newest["c"])
                     is_closed=now_ms>int(newest.get("T",0))
 
-                    # Position management — always runs
+                    # Position management — S2+S4 same as mainnet
                     if asset in tn_positions:
                         pos=tn_positions[asset]
                         direction=pos["direction"]
-                        # Trail stop update
-                        if direction=="LONG":
-                            if cur>pos.get("trail_high",pos["entry"]):
-                                pos["trail_high"]=cur
-                                pos["trail_stop"]=cur*(1-TRAIL_PCT)
-                        else:
-                            if cur<pos.get("trail_low",pos["entry"]):
-                                pos["trail_low"]=cur
-                                pos["trail_stop"]=cur*(1+TRAIL_PCT)
+
+                        # S2+S4: Use last COMPLETE candle for exit checks
+                        prev=candles[-2]
+                        prev_hi=float(prev["h"]); prev_lo=float(prev["l"])
+
+                        # ATR from complete candles
+                        try:
+                            _,atr_vals=atr_lookup(candles[:-1])
+                            atr_val=atr_vals[-1] if atr_vals and atr_vals[-1] else 0
+                        except: atr_val=0
+
+                        # S4+S2: Update trail with ATR filter, cancel-replace stop
+                        trail_result=update_trail_stop(asset,pos,prev_hi,prev_lo,atr_val,tn_stop_oids)
+                        if trail_result=="FILLED":
+                            # Stop triggered by HL testnet exchange
+                            pnl=((pos["trail_stop"]-pos["entry"])*pos["size"] if direction=="LONG"
+                                 else (pos["entry"]-pos["trail_stop"])*pos["size"])
+                            add_tn_audit(asset,f"✅ TRAIL EXIT (HL) {direction}",
+                                        f"@ ${pos['trail_stop']:.4f} | P&L=${pnl:+.4f}")
+                            with tn_lock:
+                                del tn_positions[asset]
+                                if asset in tn_stop_oids: del tn_stop_oids[asset]
+                                tn_state["trades"].insert(0,{
+                                    "time":ts(),"asset":asset,"action":"CLOSED",
+                                    "direction":direction,"entry":pos["entry"],
+                                    "exit":pos["trail_stop"],"pnl":round(pnl,4),
+                                    "reason":"trail","size":pos["size"]
+                                })
+                                try:
+                                    import json as _jtn2
+                                    _etn2=[]
+                                    if os.path.exists(TN_TRADES_FILE):
+                                        _etn2=_jtn2.load(open(TN_TRADES_FILE))
+                                    _etn2.insert(0,tn_state["trades"][0])
+                                    _etn2=_etn2[:500]
+                                    _jtn2.dump(_etn2,open(TN_TRADES_FILE,"w"))
+                                except: pass
+                            continue
 
                         pos["current_price"]=cur
                         exit_reason=None; exit_price=cur
 
                         cfg=ASSET_CFG[asset]
-                        closes=[float(c["c"]) for c in candles]
-                        ef_v=ema(closes,EMA_FAST); em_v=ema(closes,EMA_MID)
-                        i=len(closes)-1
+                        # EMA cross using complete candles
+                        complete_closes=[float(c["c"]) for c in candles[:-1]]
+                        ef_v=ema(complete_closes,EMA_FAST); em_v=ema(complete_closes,EMA_MID)
+                        ii=len(complete_closes)-1
 
-                        if cfg["exit"]=="trail":
-                            if direction=="LONG":
-                                if cur<=pos.get("trail_stop",pos["entry"]*(1-TRAIL_PCT)):
-                                    exit_reason,exit_price="trail",pos["trail_stop"]
-                                elif cur<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[i] and em_v[i] and ef_v[i]<em_v[i]: exit_reason="ema"
-                            else:
-                                if cur>=pos.get("trail_stop",pos["entry"]*(1+TRAIL_PCT)):
-                                    exit_reason,exit_price="trail",pos["trail_stop"]
-                                elif cur>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[i] and em_v[i] and ef_v[i]>em_v[i]: exit_reason="ema"
-                        elif cfg["exit"]=="fixed_tp":
+                        # Fixed TP for BNB
+                        if cfg["exit"]=="fixed_tp" and cfg["tp"]:
                             tp_p=pos["entry"]*(1+cfg["tp"]) if direction=="LONG" else pos["entry"]*(1-cfg["tp"])
                             if direction=="LONG":
-                                if cur>=tp_p: exit_reason,exit_price="tp",tp_p
-                                elif cur<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[i] and em_v[i] and ef_v[i]<em_v[i]: exit_reason="ema"
+                                if prev_hi>=tp_p: exit_reason,exit_price="tp",tp_p
+                                elif prev_lo<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[ii] and em_v[ii] and ef_v[ii]<em_v[ii]: exit_reason="ema"
                             else:
-                                if cur<=tp_p: exit_reason,exit_price="tp",tp_p
-                                elif cur>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[i] and em_v[i] and ef_v[i]>em_v[i]: exit_reason="ema"
+                                if prev_lo<=tp_p: exit_reason,exit_price="tp",tp_p
+                                elif prev_hi>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[ii] and em_v[ii] and ef_v[ii]>em_v[ii]: exit_reason="ema"
+                        else:
+                            # Trail/partial exits — hard stop and EMA cross checks
+                            if direction=="LONG":
+                                if prev_lo<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[ii] and em_v[ii] and ef_v[ii]<em_v[ii]: exit_reason="ema"
+                            else:
+                                if prev_hi>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
+                                elif ef_v[ii] and em_v[ii] and ef_v[ii]>em_v[ii]: exit_reason="ema"
 
                         if exit_reason:
                             qty=pos["size"]
                             pnl=((exit_price-pos["entry"])*qty if direction=="LONG"
                                  else (pos["entry"]-exit_price)*qty)
+                            # S2: Cancel stop order before closing
+                            old_oid=tn_stop_oids.get(asset)
+                            if old_oid and old_oid!="FILLED":
+                                try:
+                                    tn_exchange.cancel(asset,old_oid)
+                                    time.sleep(0.3)
+                                except: pass
+                                if asset in tn_stop_oids: del tn_stop_oids[asset]
                             # Execute on testnet
                             try:
                                 tn_exchange.market_close(asset)
@@ -2138,14 +2364,16 @@ def testnet_trading_loop():
                             continue
 
                         fill=float(statuses[0].get("filled",{}).get("avgPx",cur)) if statuses else cur
-                        stop=fill*(1-STOP_PCT) if direction=="LONG" else fill*(1+STOP_PCT)
+                        stop=round_price(fill*(1-STOP_PCT) if direction=="LONG" else fill*(1+STOP_PCT))
+                        trail=round_price(fill*(1-TRAIL_PCT) if direction=="LONG" else fill*(1+TRAIL_PCT))
 
                         with tn_lock:
                             tn_positions[asset]={
-                                "direction":direction,"entry":fill,"size":qty,
-                                "stop":stop,"trail_high":fill,"trail_low":fill,
-                                "trail_stop":fill*(1-TRAIL_PCT) if direction=="LONG" else fill*(1+TRAIL_PCT),
-                                "current_price":fill,"entry_time":ts()
+                                "direction":direction,"entry":fill,"size":qty,"qty_rem":qty,
+                                "stop":stop,"trail_peak":fill,
+                                "trail_stop":trail,
+                                "current_price":fill,"entry_time":ts(),
+                                "partial_done":False,"partial_pnl":0.0
                             }
                             tn_state["trades"].insert(0,{
                                 "time":ts(),"asset":asset,"action":"OPENED",
@@ -2164,8 +2392,25 @@ def testnet_trading_loop():
                                 _jtn.dump(_etn,open(TN_TRADES_FILE,"w"))
                             except: pass
 
+                        # S2: Place stop order on HL testnet exchange
+                        tn_oid=None
+                        try:
+                            is_buy=direction=="SHORT"
+                            sp=round_price(stop)
+                            lp=round_price(sp*0.9 if is_buy else sp*1.1)
+                            tn_order_type={"trigger":{"triggerPx":sp,"isMarket":True,"tpsl":"sl"}}
+                            tn_stop_result=tn_exchange.order(asset,is_buy,qty,lp,tn_order_type,reduce_only=True)
+                            if tn_stop_result.get("status")=="ok":
+                                tn_s=tn_stop_result["response"]["data"]["statuses"][0]
+                                if "resting" in tn_s:
+                                    tn_oid=tn_s["resting"]["oid"]
+                                    tn_stop_oids[asset]=tn_oid
+                                    add_tn_audit(asset,"🛡 TN STOP PLACED",f"stop @ ${sp} OID:{tn_oid}")
+                        except Exception as e:
+                            add_tn_issue(asset,"TN stop placement failed",str(e))
+
                         add_tn_audit(asset,f"✅ ENTERED {direction}",
-                                    f"fill=${fill:,.4f} | qty={qty} | stop=${stop:,.4f}")
+                                    f"fill=${fill:,.4f} | qty={qty} | stop=${stop:,.4f} | stop_oid={tn_oid}")
                         ntfy(f"🧪 [TESTNET] {asset} {direction} ENTERED",
                              f"Fill: ${fill:,.4f} | Qty: {qty}\nStop: ${stop:,.4f} | Binance signal")
                         log(f"🧪 TESTNET {asset} {direction} ENTERED @ ${fill:,.4f}")
