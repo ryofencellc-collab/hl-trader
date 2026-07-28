@@ -98,6 +98,7 @@ state = {
     "assets":ASSETS,"balance":TOTAL_USDC,
     "positions":{},"trades":[],"diagnostics":[],"weekly_pnl":{},
     "paused":False,"kill_switch":False,"close_all_requested":False,
+    "weekly_pnl":0.0,"weekly_trades":0,"week_start":"",
     "issues":[],
     # Full audit log — every candle, every signal, every skip
     "audit":[],
@@ -164,8 +165,7 @@ def add_tn_audit(asset,event,detail,filters=None):
     """Testnet audit trail."""
     from datetime import timedelta
     now_utc=datetime.now(timezone.utc)
-    now_est=now_utc-timedelta(hours=4)
-    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
     safe=str(detail).replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")
     entry={"time":time_str,"asset":asset,"event":event,"detail":safe,"filters":filters or {}}
     with tn_lock:
@@ -176,8 +176,7 @@ def add_tn_issue(asset,issue,detail):
     """Log trade issues to testnet issues tab."""
     from datetime import timedelta
     now_utc=datetime.now(timezone.utc)
-    now_est=now_utc-timedelta(hours=4)
-    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC"
     entry={"time":time_str,"asset":asset,"issue":issue,"detail":str(detail)}
     with tn_lock:
         tn_state["issues"].insert(0,entry)
@@ -209,8 +208,7 @@ def add_issue(asset,issue,detail):
     """Log trade issues to mainnet issues tab."""
     from datetime import timedelta
     now_utc=datetime.now(timezone.utc)
-    now_est=now_utc-timedelta(hours=4)
-    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC"
     entry={"time":time_str,"asset":asset,"issue":issue,"detail":str(detail)}
     with lock:
         state["issues"].insert(0,entry)
@@ -223,8 +221,7 @@ def add_audit(asset,event,detail,filters=None):
     safe=str(detail).replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")
     from datetime import datetime,timezone,timedelta
     now_utc=datetime.now(timezone.utc)
-    now_est=now_utc-timedelta(hours=4)
-    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC / {now_est.strftime('%H:%M:%S')} EST"
+    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
     entry={
         "time":time_str,"asset":asset,"event":event,
         "detail":safe,"filters":filters or {}
@@ -397,7 +394,7 @@ def run_12hr_sim():
 def check_12hr_sim():
     global _last_sim_hour
     h=datetime.now(timezone.utc).hour
-    if h in (9,18) and h!=_last_sim_hour:
+    if h in (10,0) and h!=_last_sim_hour:
         _last_sim_hour=h
         threading.Thread(target=run_12hr_sim,daemon=True).start()
 
@@ -407,6 +404,17 @@ def check_milestones():
     for m in MILESTONES:
         if bal>=m and m not in milestones_hit:
             milestones_hit.add(m); ntfy_milestone(bal)
+
+def check_weekly_reset():
+    """Reset weekly P&L every Monday 00:00 UTC"""
+    now=datetime.now(timezone.utc)
+    week_key=f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+    with lock:
+        if state.get("week_start")!=week_key:
+            state["week_start"]=week_key
+            state["weekly_pnl"]=0.0
+            state["weekly_trades"]=0
+            log(f"📅 New week started: {week_key} — weekly P&L reset")
 
 def check_daily_summaries():
     now=datetime.now(timezone.utc); h,minute=now.hour,now.minute
@@ -459,6 +467,12 @@ def get_next_due():
         due=datetime.strptime(q["due"],"%Y-%m-%d").replace(tzinfo=timezone.utc)
         if due>=now: return q,(due-now).days
     return None,0
+
+def update_weekly_pnl(pnl):
+    """Update weekly P&L running total"""
+    with lock:
+        state["weekly_pnl"]=round(state.get("weekly_pnl",0)+pnl,4)
+        state["weekly_trades"]=state.get("weekly_trades",0)+1
 
 def record_tax(asset,direction,entry,exit_p,size,pnl,entry_time):
     tax=calc_tax(pnl)
@@ -866,7 +880,7 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
 
             # NON-BLOCKING: run verification in background thread
             # Main loop continues checking other assets immediately
-            def verify_and_confirm(a,d,f,pu,q,stp,trl,lq,et):
+            def verify_and_confirm(a,d,f,pu,q,stp,trl,lq,et,filters_arg=None):
                 confirmed,actual=verify_entry(a)
                 if not confirmed:
                     add_diag("ERROR",f"Entry NOT confirmed {a}","Order placed but not visible","NOT logging")
@@ -888,7 +902,7 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
                               "pos_usd":pu,"stop":stp2,"trail_peak":f2,
                               "trail_stop":trl2,"liq":lq2,"partial_done":False,
                               "partial_pnl":0.0,"qty_rem":q2,"current_price":f2,"unrealized_pnl":0.0}
-                add_trade(a,"ENTER",d,f2,None,q2,None,"signal")
+                add_trade(a,"ENTER",d,f2,None,q2,None,"signal",filters_arg)
                 add_audit(a,"✅ ENTERED",f"{d} @ ${f2:,.2f} | stop=${stp2:,.2f} | trail=${trl2:,.2f} | liq=${lq2:,.2f} | CONFIRMED")
                 ntfy_trade_entered(a,d,f2,q2,stp2,trl2,pu)
                 log(f"✅ ENTERED {d} {a} @ ${f2:,.2f} | CONFIRMED | liq=${lq2:,.2f}")
@@ -907,6 +921,7 @@ def enter_trade(asset,direction,price,vol,vs,ef,es,filters=None):
             t=threading.Thread(
                 target=verify_and_confirm,
                 args=(asset,direction,fill,pos_usd,qty,stop,trail,liq,ts()),
+                kwargs={"filters_arg":filters},
                 daemon=True
             )
             t.start()
@@ -937,6 +952,7 @@ def exit_trade(asset,price,reason):
         log(f"[DRY] EXIT {pos['direction']} {asset} @ ${price:,.2f} | {reason} | P&L=${pnl:+.4f}")
         add_audit(asset,f"{icon} EXITED (DRY)",f"{pos['direction']} @ ${price:,.2f} | reason={reason} | P&L=${pnl:+.4f}")
         record_tax(asset,pos["direction"],pos["entry"],price,pos["size"],pnl,etime)
+        update_weekly_pnl(pnl)
         ntfy_trade_closed(asset,pos["direction"],pos["entry"],price,pnl,reason)
         add_trade(asset,"EXIT",pos["direction"],pos["entry"],price,pos["size"],pnl,reason)
         last_exit[asset]=bar_count.get(asset,0)
@@ -968,6 +984,7 @@ def exit_trade(asset,price,reason):
             log(f"{icon} EXITED {pos['direction']} {asset} @ ${fill:,.2f} | {reason} | P&L=${pnl:+.4f} | CONFIRMED")
             add_audit(asset,f"{icon} EXITED",f"{pos['direction']} @ ${fill:,.2f} | reason={reason} | P&L=${pnl:+.4f} | CONFIRMED on exchange")
             record_tax(asset,pos["direction"],pos["entry"],fill,pos["size"],pnl,etime)
+            update_weekly_pnl(pnl)
             ntfy_trade_closed(asset,pos["direction"],pos["entry"],fill,pnl,reason)
             add_trade(asset,"EXIT",pos["direction"],pos["entry"],fill,pos["size"],pnl,reason)
             last_exit[asset]=bar_count.get(asset,0)
@@ -1041,6 +1058,49 @@ def trading_loop():
                          else (pos["entry"]-cur)*pos["size"])
                     state["positions"][asset]["current_price"]=cur
                     state["positions"][asset]["unrealized_pnl"]=round(pnl,4)
+
+            # TWO-WAY HL SYNC — verify app state matches HL every cycle
+            try:
+                hl_state=info.user_state(MAIN_WALLET)
+                hl_open={p["position"]["coin"]:p["position"]
+                         for p in hl_state.get("assetPositions",[])
+                         if float(p["position"].get("szi",0))!=0
+                         and p["position"]["coin"] in ASSETS}
+                # Positions HL closed that app still thinks are open
+                for asset in list(positions.keys()):
+                    if asset not in hl_open:
+                        pos=positions[asset]
+                        cur_p=float(mids.get(asset,pos["entry"]))
+                        pnl=round((cur_p-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                                  else (pos["entry"]-cur_p)*pos["size"],4)
+                        log(f"TWO-WAY HL SYNC: {asset} closed on HL — syncing app state")
+                        add_audit(asset,"🔄 HL SYNC CLOSE","Position closed on HL — syncing app state")
+                        add_issue(asset,"HL sync close","HL closed position app thought was open")
+                        ntfy_trade_closed(asset,pos["direction"],pos["entry"],cur_p,pnl,"trail_hl")
+                        add_trade(asset,"EXIT",pos["direction"],pos["entry"],cur_p,pos["size"],pnl,"trail_hl")
+                        record_tax(asset,pos["direction"],pos["entry"],cur_p,pos["size"],pnl,entry_times.get(asset,ts()))
+                        update_weekly_pnl(pnl)
+                        del positions[asset]
+                        if asset in stop_oids: del stop_oids[asset]
+                        if asset in entry_times: del entry_times[asset]
+                        with lock: state["positions"]={k:v for k,v in positions.items()}
+                # DUPLICATE STOP CANCELLED — cancel older duplicate stops
+                open_orders=info.open_orders(MAIN_WALLET) or []
+                asset_orders={}
+                for o in open_orders:
+                    a=o.get("coin","")
+                    if a in ASSETS:
+                        if a not in asset_orders: asset_orders[a]=[]
+                        asset_orders[a].append(o)
+                for asset,orders in asset_orders.items():
+                    if len(orders)>1:
+                        orders_sorted=sorted(orders,key=lambda x:x.get("timestamp",0),reverse=True)
+                        for dup in orders_sorted[1:]:
+                            log(f"🔄 {asset}: DUPLICATE STOP CANCELLED OID:{dup['oid']}")
+                            cancel_hl_stop(asset,dup["oid"])
+                            add_audit(asset,"🔄 DUPLICATE STOP CANCELLED",f"OID:{dup['oid']}")
+            except Exception as e:
+                log(f"⚠️ HL sync check failed: {e}")
         except Exception as e:
             if api_down_since is None:
                 api_down_since=time.time(); ntfy_api_down()
@@ -1188,6 +1248,12 @@ def trading_loop():
                             log(f"🔄 {asset}: cancelled stop before EMA exit OID:{old_oid} → {cancelled}")
                             time.sleep(0.3)
                             if asset in stop_oids: del stop_oids[asset]
+                        # ntfy on EMA cross exit
+                        pos_ema=positions.get(asset,{})
+                        if pos_ema:
+                            pnl_ema=((cur-pos_ema["entry"])*pos_ema["size"] if pos_ema["direction"]=="LONG"
+                                     else (pos_ema["entry"]-cur)*pos_ema["size"])
+                            ntfy_trade_closed(asset,pos_ema["direction"],pos_ema["entry"],cur,pnl_ema,"ema_cross")
                         exit_trade(asset,cur,"ema_cross")
                         continue
 
@@ -1310,6 +1376,7 @@ def trading_loop():
         check_daily_summaries()
         check_tax_reminders()
         check_12hr_sim()
+        check_weekly_reset()
 
         with lock:
             state["status"]="stopped" if state["kill_switch"] else ("paused" if state["paused"] else "waiting")
@@ -1578,6 +1645,11 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <div style="font-size:10px;font-weight:700;color:#4A5878;text-transform:uppercase;margin-bottom:6px">Net P&L</div>
     <div style="font-family:monospace;font-size:28px;font-weight:700;color:{'#00D68F' if tax['total_net']>=0 else '#FF4757'}">${tax["total_net"]:.2f}</div>
     <div style="font-size:12px;color:#4A5878;margin-top:4px">Gross: ${tax["total_pnl"]:.2f} · Tax: ${tax["total_tax"]:.2f}</div>
+  </div>
+  <div class="card" style="margin-bottom:10px;border-left:3px solid {'#00D68F' if s.get('weekly_pnl',0)>=0 else '#FF4757'}">
+    <div style="font-size:10px;color:#4A5878;margin-bottom:4px">WEEK {s.get('week_start','—')} · {s.get('weekly_trades',0)} trades</div>
+    <div style="font-family:monospace;font-size:22px;font-weight:700;color:{'#00D68F' if s.get('weekly_pnl',0)>=0 else '#FF4757'}">${s.get('weekly_pnl',0):+,.2f}</div>
+    <div style="font-size:11px;color:#4A5878;margin-top:2px">Weekly P&L · resets Monday 00:00 UTC</div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
     <div class="card"><div style="font-size:10px;color:#4A5878;font-weight:600;text-transform:uppercase;margin-bottom:6px">Balance</div><div style="font-family:monospace;font-size:18px;font-weight:700">${s["balance"]:.2f}</div></div>
@@ -1890,8 +1962,7 @@ def system_test():
         results.append({"name":name,"passed":passed,"detail":detail})
 
     now=datetime.now(timezone.utc)
-    est=now-timedelta(hours=4)
-
+    
     # 1. Binance candle fetch
     try:
         r=req.get("https://data-api.binance.vision/api/v3/klines",
@@ -2051,7 +2122,7 @@ td{{font-size:13px}}
 a{{color:#00B4FF;text-decoration:none}}
 </style></head><body>
 <h1>🔬 System Test — HL Trader v4</h1>
-<p>{now.strftime("%Y-%m-%d %H:%M")} UTC / {est.strftime("%H:%M")} EST</p>
+<p>{now.strftime("%Y-%m-%d %H:%M")} UTC / UTC</p>
 <div class="badge">{passed}/{len(results)} passed {"✅" if failed==0 else f"— {failed} failed ⚠️"}</div>
 <table>{rows}</table>
 <p style="margin-top:16px"><a href="/">← Back to dashboard</a></p>
