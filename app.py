@@ -1062,48 +1062,50 @@ def trading_loop():
                     state["positions"][asset]["unrealized_pnl"]=round(pnl,4)
 
             # TWO-WAY HL SYNC — only runs after startup_complete=True
-            # This prevents false exits when positions dict is empty on restart
-            if startup_complete:
+            # Uses same clearinghouseState API as startup sync
+            if startup_complete and positions:
                 try:
-                    hl_state=info.user_state(MAIN_WALLET)
+                    r_sync=req.post(HL_INFO_URL,
+                        json={"type":"clearinghouseState","user":MAIN_WALLET},timeout=10)
+                    hl_pos=r_sync.json().get("assetPositions",[])
                     hl_open={p["position"]["coin"]:p["position"]
-                             for p in hl_state.get("assetPositions",[])
+                             for p in hl_pos
                              if float(p["position"].get("szi",0))!=0
                              and p["position"]["coin"] in ASSETS}
-                    # Only check assets that ARE in positions dict
-                    # Never fire if positions is empty
-                    if positions:
-                        for asset in list(positions.keys()):
-                            if asset not in hl_open:
-                                pos=positions[asset]
-                                cur_p=float(mids.get(asset,pos["entry"]))
-                                pnl=round((cur_p-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
-                                          else (pos["entry"]-cur_p)*pos["size"],4)
-                                log(f"TWO-WAY HL SYNC: {asset} closed on HL — syncing")
-                                add_audit(asset,"🔄 HL SYNC CLOSE","Position closed on HL — syncing")
-                                ntfy_trade_closed(asset,pos["direction"],pos["entry"],cur_p,pnl,"trail_hl")
-                                add_trade(asset,"EXIT",pos["direction"],pos["entry"],cur_p,pos["size"],pnl,"trail_hl")
-                                record_tax(asset,pos["direction"],pos["entry"],cur_p,pos["size"],pnl,entry_times.get(asset,ts()))
-                                update_weekly_pnl(pnl)
-                                del positions[asset]
-                                if asset in stop_oids: del stop_oids[asset]
-                                if asset in entry_times: del entry_times[asset]
-                                with lock: state["positions"]={k:v for k,v in positions.items()}
+                    # Only fire if asset WAS in positions AND is now gone from HL
+                    for asset in list(positions.keys()):
+                        if asset not in hl_open:
+                            pos=positions[asset]
+                            cur_p=float(mids.get(asset,pos["entry"]))
+                            pnl=round((cur_p-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                                      else (pos["entry"]-cur_p)*pos["size"],4)
+                            log(f"TWO-WAY HL SYNC: {asset} closed on HL — syncing")
+                            add_audit(asset,"🔄 HL SYNC CLOSE","Position closed on HL — syncing")
+                            ntfy_trade_closed(asset,pos["direction"],pos["entry"],cur_p,pnl,"trail_hl")
+                            add_trade(asset,"EXIT",pos["direction"],pos["entry"],cur_p,pos["size"],pnl,"trail_hl")
+                            record_tax(asset,pos["direction"],pos["entry"],cur_p,pos["size"],pnl,entry_times.get(asset,ts()))
+                            update_weekly_pnl(pnl)
+                            del positions[asset]
+                            if asset in stop_oids: del stop_oids[asset]
+                            if asset in entry_times: del entry_times[asset]
+                            with lock: state["positions"]={k:v for k,v in positions.items()}
                     # Cancel duplicate stops
-                    open_orders=info.open_orders(MAIN_WALLET) or []
-                    asset_orders={}
-                    for o in open_orders:
-                        a=o.get("coin","")
-                        if a in ASSETS:
-                            if a not in asset_orders: asset_orders[a]=[]
-                            asset_orders[a].append(o)
-                    for asset,orders in asset_orders.items():
-                        if len(orders)>1:
-                            orders_sorted=sorted(orders,key=lambda x:x.get("timestamp",0),reverse=True)
-                            for dup in orders_sorted[1:]:
-                                log(f"🔄 {asset}: DUPLICATE STOP CANCELLED OID:{dup['oid']}")
-                                cancel_hl_stop(asset,dup["oid"])
-                                add_audit(asset,"🔄 DUPLICATE STOP CANCELLED",f"OID:{dup['oid']}")
+                    open_orders=req.post(HL_INFO_URL,
+                        json={"type":"openOrders","user":MAIN_WALLET},timeout=10).json()
+                    if isinstance(open_orders,list):
+                        asset_orders={}
+                        for o in open_orders:
+                            a=o.get("coin","")
+                            if a in ASSETS:
+                                if a not in asset_orders: asset_orders[a]=[]
+                                asset_orders[a].append(o)
+                        for asset,orders in asset_orders.items():
+                            if len(orders)>1:
+                                orders_sorted=sorted(orders,key=lambda x:x.get("timestamp",0),reverse=True)
+                                for dup in orders_sorted[1:]:
+                                    log(f"🔄 {asset}: DUPLICATE STOP CANCELLED OID:{dup['oid']}")
+                                    cancel_hl_stop(asset,dup["oid"])
+                                    add_audit(asset,"🔄 DUPLICATE STOP CANCELLED",f"OID:{dup['oid']}")
                 except Exception as e:
                     log(f"⚠️ HL sync check failed: {e}")
         except Exception as e:
