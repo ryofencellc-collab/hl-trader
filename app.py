@@ -6,7 +6,7 @@ HL TRADER — Final Production App v4
 Full diagnostic visibility — no Railway logs needed.
 Every candle, every signal, every skip tracked and visible.
 
-DRY_RUN = False | TESTNET = True | LEVERAGE = 10x
+DRY_RUN = False | MAINNET ONLY | LEVERAGE = 10x
 """
 
 import threading
@@ -22,19 +22,14 @@ from hyperliquid.utils import constants
 # CONFIG
 # ══════════════════════════════════════════════════
 DRY_RUN         = False
-TESTNET         = False
 MAIN_WALLET     = "0xa90566c8d886CA63c1194101a7dA2Fa129D26B58"
 API_PRIVATE_KEY = "0x9cd8627ff5c807e8dd1ba0ce0e5936c0f8eb133123fccd49807509abf3f3ff07"
-API_URL         = constants.TESTNET_API_URL if TESTNET else constants.MAINNET_API_URL
+API_URL         = constants.MAINNET_API_URL
 PASSWORD        = os.environ.get("DASHBOARD_PASSWORD","hl2026")
 NTFY_TOPIC      = "hl-trader-lunchm0ney"
 NTFY_URL        = f"https://ntfy.sh/{NTFY_TOPIC}"
 
-# ── TESTNET PAPER TRADING (Binance candles + testnet execution) ────────────
-TN_WALLET       = "0xa90566c8d886CA63c1194101a7dA2Fa129D26B58"
-TN_API_KEY      = "0x5b75aa092ea3bd1ee77983ab5b8268607120a0145de6df11174b3f72f91b9ea0"
-TN_LEVERAGE     = 10
-TN_TOTAL_USDC   = 988.0
+
 
 ASSETS          = ["BTC","ETH","SOL","BNB","DOGE","AVAX"]
 TOTAL_USDC      = 114.80
@@ -94,7 +89,7 @@ def get_pos_usd(vol,vs,ef,es):
 # ══════════════════════════════════════════════════
 state = {
     "status":"starting","last_check":None,"next_check":None,
-    "cycle":0,"dry_run":DRY_RUN,"testnet":TESTNET,"leverage":LEVERAGE,
+    "cycle":0,"dry_run":DRY_RUN,"leverage":LEVERAGE,
     "assets":ASSETS,"balance":TOTAL_USDC,
     "positions":{},"trades":[],"diagnostics":[],"weekly_pnl":{},
     "paused":False,"kill_switch":False,"close_all_requested":False,
@@ -120,68 +115,6 @@ state = {
 }
 lock=threading.Lock()
 
-# ── TESTNET STATE (Binance candles + testnet execution) ────────────────────
-tn_state = {
-    "status":"starting","cycle":0,"balance":TN_TOTAL_USDC,
-    "positions":{},"trades":[],"diagnostics":[],"weekly_pnl":{},
-    "paused":False,"kill_switch":False,
-    "audit":[],"issues":[],
-    "health":{"api_connected":False,"last_ping":None,"assets_ok":{}},
-    "tax":{"total_pnl":0.0,"total_tax":0.0,"total_net":0.0,
-           "winning_trades":0,"losing_trades":0,"total_trades":0},
-}
-tn_lock=threading.Lock()
-
-def fetch_binance_candles(asset):
-    """Fetch Binance candles for testnet signal evaluation.
-    Uses same source as mainnet — data-api.binance.vision works from Railway.
-    This ensures testnet and mainnet evaluate identical signals."""
-    try:
-        end_ms=int(time.time()*1000)
-        start_ms=end_ms-CANDLE_LIMIT*15*60*1000
-        sym=BINANCE_SYM.get(asset,asset+"USDT")
-        r=req.get(BINANCE_CANDLE_URL,
-            params={"symbol":sym,"interval":"15m",
-                    "startTime":start_ms,"endTime":end_ms,"limit":CANDLE_LIMIT},
-            timeout=10)
-        if r.status_code!=200:
-            add_tn_issue(asset,"Binance candle error",f"HTTP {r.status_code}")
-            return []
-        data=r.json()
-        if not isinstance(data,list):
-            add_tn_issue(asset,"Candle fetch error",str(data))
-            return []
-        candles=[]
-        for b in data:
-            candles.append({"t":int(b[0]),"T":int(b[6]),
-                           "o":b[1],"h":b[2],"l":b[3],"c":b[4],"v":b[5]})
-        return sorted(candles,key=lambda x:x["t"])
-    except Exception as e:
-        log(f"⚠️ Testnet candle fetch error {asset}: {e}")
-        add_tn_issue(asset,"Candle fetch error",str(e))
-        return []
-
-def add_tn_audit(asset,event,detail,filters=None):
-    """Testnet audit trail."""
-    from datetime import timedelta
-    now_utc=datetime.now(timezone.utc)
-    time_str=f"{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-    safe=str(detail).replace("<","&lt;").replace(">","&gt;").replace(chr(10)," ").replace(chr(13)," ")
-    entry={"time":time_str,"asset":asset,"event":event,"detail":safe,"filters":filters or {}}
-    with tn_lock:
-        tn_state["audit"].insert(0,entry)
-        tn_state["audit"]=tn_state["audit"][:10000]
-
-def add_tn_issue(asset,issue,detail):
-    """Log trade issues to testnet issues tab."""
-    from datetime import timedelta
-    now_utc=datetime.now(timezone.utc)
-    time_str=f"{now_utc.strftime('%H:%M:%S')} UTC"
-    entry={"time":time_str,"asset":asset,"issue":issue,"detail":str(detail)}
-    with tn_lock:
-        tn_state["issues"].insert(0,entry)
-        tn_state["issues"]=tn_state["issues"][:500]
-    log(f"⚠️ [TESTNET ISSUE] {asset}: {issue} — {detail}")
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -202,7 +135,6 @@ def add_diag(level,event,cause,action):
 
 AUDIT_FILE = "/tmp/hl_audit_log.txt"
 TRADES_FILE    = "/tmp/hl_trades.json"
-TN_TRADES_FILE = "/tmp/hl_tn_trades.json"
 
 def add_issue(asset,issue,detail):
     """Log trade issues to mainnet issues tab."""
@@ -415,6 +347,11 @@ def check_weekly_reset():
             state["weekly_pnl"]=0.0
             state["weekly_trades"]=0
             log(f"📅 New week started: {week_key} — weekly P&L reset")
+            try:
+                import json as _j
+                _j.dump({"weekly_pnl":0.0,"weekly_trades":0,"week_start":week_key},
+                        open(WEEKLY_FILE,"w"))
+            except: pass
 
 def check_daily_summaries():
     now=datetime.now(timezone.utc); h,minute=now.hour,now.minute
@@ -469,10 +406,33 @@ def get_next_due():
     return None,0
 
 def update_weekly_pnl(pnl):
-    """Update weekly P&L running total"""
+    """Update weekly P&L running total — persisted to file"""
     with lock:
         state["weekly_pnl"]=round(state.get("weekly_pnl",0)+pnl,4)
         state["weekly_trades"]=state.get("weekly_trades",0)+1
+    try:
+        import json as _j
+        _j.dump({"weekly_pnl":state["weekly_pnl"],
+                 "weekly_trades":state["weekly_trades"],
+                 "week_start":state["week_start"]},
+                open(WEEKLY_FILE,"w"))
+    except: pass
+
+def load_weekly_pnl():
+    """Load weekly P&L from file on startup"""
+    try:
+        import json as _j
+        if os.path.exists(WEEKLY_FILE):
+            d=_j.load(open(WEEKLY_FILE))
+            # Only restore if same week
+            now=datetime.now(timezone.utc)
+            wk=f"{now.isocalendar()[0]}-W{now.isocalendar()[1]:02d}"
+            if d.get("week_start")==wk:
+                state["weekly_pnl"]=d.get("weekly_pnl",0)
+                state["weekly_trades"]=d.get("weekly_trades",0)
+                state["week_start"]=wk
+                log(f"📅 Weekly P&L restored: ${state['weekly_pnl']:+,.2f} ({state['weekly_trades']} trades)")
+    except: pass
 
 def record_tax(asset,direction,entry,exit_p,size,pnl,entry_time):
     tax=calc_tax(pnl)
@@ -484,7 +444,7 @@ def record_tax(asset,direction,entry,exit_p,size,pnl,entry_time):
     year=datetime.now(timezone.utc).year; fname=f"hl_tax_{year}.csv"
     fe=os.path.exists(fname); q=get_quarter(datetime.now(timezone.utc))
     row={"trade_id":f"{asset}-{entry_time[:10]}-{entry_time[11:19].replace(':','')}",
-         "account":MAIN_WALLET[:10]+"...","network":"Testnet" if TESTNET else "Mainnet",
+         "account":MAIN_WALLET[:10]+"...","network":"Mainnet",
          "contract_type":"Section 1256 - Perpetual Futures","exchange":"HyperLiquid",
          "asset":f"{asset}-PERP","direction":direction,
          "entry_date":entry_time,"exit_date":ts(),
@@ -511,16 +471,6 @@ def record_tax(asset,direction,entry,exit_p,size,pnl,entry_time):
 wallet=eth_account.Account.from_key(API_PRIVATE_KEY)
 info=Info(API_URL,skip_ws=True)
 exchange=Exchange(wallet,API_URL,account_address=MAIN_WALLET)
-
-# Testnet paper trading — Binance candles + testnet execution
-tn_wallet=eth_account.Account.from_key(TN_API_KEY)
-tn_info=Info(constants.TESTNET_API_URL,skip_ws=True)
-tn_exchange=Exchange(tn_wallet,constants.TESTNET_API_URL,account_address=TN_WALLET)
-
-positions={}; last_candle={}; last_exit={}; bar_count={}; entry_times={}
-stop_oids={}   # mainnet: asset -> HL stop order OID (S2 cancel-replace)
-tn_positions={}; tn_last_candle={}; tn_last_exit={}; tn_bar_count={}
-tn_stop_oids={}  # testnet: asset -> HL stop order OID (S2 cancel-replace)
 
 # ══════════════════════════════════════════════════
 # INDICATORS
@@ -695,12 +645,12 @@ def evaluate_signal(candles,asset):
 
     return (d if all_pass else None),closes[i],vol,vs[i] if vs[i] else 0,filters
 
-HL_INFO_URL = "https://api.hyperliquid-testnet.xyz/info" if TESTNET else "https://api.hyperliquid.xyz/info"
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 
 def verify_entry(asset):
     """
     Verify entry using userFills — clearinghouseState broken on this wallet.
-    userFills works correctly on both testnet and mainnet.
+    userFills works correctly on mainnet.
     """
     time.sleep(15)
     try:
@@ -1013,10 +963,10 @@ def close_all(reason="manual"):
 def trading_loop():
     log("HL TRADER v4 — Full audit trail | Per-asset errors | 6 assets")
     add_diag("INFO","HL Trader v4 started",
-             f"DRY={DRY_RUN} TEST={TESTNET} LEV={LEVERAGE}x ASSETS={len(ASSETS)}",
+             f"DRY={DRY_RUN} LEV={LEVERAGE}x ASSETS={len(ASSETS)}",
              "Per-asset retry | Full audit trail | All orders verified")
     ntfy("🚀 HL Trader v4 Started",
-         f"6 assets | Per-asset errors\nMode: {'TESTNET' if TESTNET else 'LIVE'}\n"
+         "6 assets | Per-asset errors\nMode: LIVE\n"
          f"Leverage: {LEVERAGE}x\nAssets: {', '.join(ASSETS)}",tags="rocket")
 
     retry_count={}; cycle=0; api_down_since=None
@@ -1051,6 +1001,41 @@ def trading_loop():
                 down_min=(time.time()-api_down_since)/60
                 ntfy_api_recovered(down_min); api_down_since=None
             startup_complete=True  # positions loaded, safe to run sync
+            # Subscribe to userFills via WebSocket for instant position detection
+            try:
+                def on_fill(msg):
+                    """Handle fill events from HL WebSocket"""
+                    try:
+                        fills=msg.get("data",[]) if isinstance(msg,dict) else []
+                        if not isinstance(fills,list): fills=[fills]
+                        for fill in fills:
+                            coin=fill.get("coin","")
+                            side=fill.get("side","")
+                            px=float(fill.get("px",0))
+                            sz=float(fill.get("sz",0))
+                            if coin in ASSETS and coin in positions:
+                                pos=positions[coin]
+                                # Check if this fill closes our position
+                                is_close=(pos["direction"]=="LONG" and side=="B" and sz>0) or                                          (pos["direction"]=="SHORT" and side=="A" and sz>0)
+                                if is_close:
+                                    pnl=round((px-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                                              else (pos["entry"]-px)*pos["size"],4)
+                                    log(f"🔔 WS FILL: {coin} closed @ ${px:,.4f} P&L=${pnl:+,.4f}")
+                                    add_audit(coin,"🔔 WS FILL DETECTED",f"Closed @ ${px:,.4f} | P&L=${pnl:+,.4f}")
+                                    ntfy_trade_closed(coin,pos["direction"],pos["entry"],px,pnl,"trail_hl")
+                                    add_trade(coin,"EXIT",pos["direction"],pos["entry"],px,pos["size"],pnl,"trail_hl")
+                                    record_tax(coin,pos["direction"],pos["entry"],px,pos["size"],pnl,entry_times.get(coin,ts()))
+                                    update_weekly_pnl(pnl)
+                                    del positions[coin]
+                                    if coin in stop_oids: del stop_oids[coin]
+                                    if coin in entry_times: del entry_times[coin]
+                                    with lock: state["positions"]={k:v for k,v in positions.items()}
+                    except Exception as _we:
+                        log(f"⚠️ WebSocket fill handler error: {_we}")
+                info.subscribe({"type":"userFills","user":MAIN_WALLET},on_fill)
+                log("🔌 WebSocket userFills subscribed — instant position detection active")
+            except Exception as _wse:
+                log(f"⚠️ WebSocket subscription failed: {_wse} — falling back to polling")
             with lock:
                 state["health"]["api_connected"]=True
                 state["health"]["last_ping"]=ts()
@@ -1242,12 +1227,6 @@ def trading_loop():
                             log(f"🔄 {asset}: cancelled stop before EMA exit OID:{old_oid} → {cancelled}")
                             time.sleep(0.3)
                             if asset in stop_oids: del stop_oids[asset]
-                        # ntfy on EMA cross exit
-                        pos_ema=positions.get(asset,{})
-                        if pos_ema:
-                            pnl_ema=((cur-pos_ema["entry"])*pos_ema["size"] if pos_ema["direction"]=="LONG"
-                                     else (pos_ema["entry"]-cur)*pos_ema["size"])
-                            ntfy_trade_closed(asset,pos_ema["direction"],pos_ema["entry"],cur,pnl_ema,"ema_cross")
                         exit_trade(asset,cur,"ema_cross")
                         continue
 
@@ -1392,8 +1371,8 @@ def build_dashboard():
     killed=s["kill_switch"]; paused=s["paused"]
     status="STOPPED" if killed else ("PAUSED" if paused else s["status"].upper())
     dot="#FF4757" if killed else ("#FFB800" if paused else "#00D68F")
-    mode="DRY RUN" if s["dry_run"] else ("TESTNET" if s["testnet"] else "🚨 LIVE")
-    mc="61,158,255" if s["dry_run"] else ("255,184,0" if s["testnet"] else "0,214,143")
+    mode="DRY RUN" if s["dry_run"] else "🚨 LIVE"
+    mc="61,158,255" if s["dry_run"] else "0,214,143"
     wr=f"{tax['winning_trades']/tax['total_trades']*100:.0f}%" if tax["total_trades"]>0 else "—"
 
     def row(k,v):
@@ -1476,33 +1455,6 @@ def build_dashboard():
             </div>"""
     else:
         trade_detail_html='<div style="text-align:center;padding:48px 24px;color:#4A5878">No trades yet</div>'
-    # Testnet Trade Detail HTML
-    tn_trade_detail_html=""
-    tn_completed=[t for t in tn_state["trades"][:20] if t.get("action") in ("CLOSED","EXIT")]
-    if tn_completed:
-        for t in tn_completed:
-            pnl_color="#00D68F" if (t.get("pnl") or 0)>=0 else "#FF4757"
-            pnl_str=f'<span style="font-weight:700;color:{pnl_color}">${t["pnl"]:+,.2f}</span>' if t.get("pnl") is not None else ""
-            filter_pills=""
-            for k,v in t.get("filters",{}).items():
-                if k=="_result": continue
-                passed=v.get("pass",False)
-                fc="0,214,143" if passed else "255,71,87"
-                icon="✅" if passed else "❌"
-                val=str(v.get("value",""))[:20]
-                filter_pills+=f'<span style="font-size:10px;padding:2px 6px;border-radius:4px;margin:2px;display:inline-block;background:rgba({fc},0.15);color:rgb({fc})">{icon} {k}: {val}</span>'
-            tn_trade_detail_html+=f'''<div class="card" style="margin-bottom:10px;border-left:3px solid #00B4FF">
-              <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-                <div style="font-size:14px;font-weight:700">🧪 {t["asset"]} {t["direction"]}</div>
-                <div style="font-size:11px;color:#4A5878">@ ${t["entry"]:,.4f} → ${t.get("exit",0):,.4f}</div>
-                <div style="margin-left:auto">{pnl_str}</div>
-              </div>
-              <div style="font-size:11px;color:#4A5878;margin-bottom:8px">Exit via {t.get("reason","—")} | {t["time"][11:19]} UTC</div>
-              <div style="line-height:1.8">{filter_pills if filter_pills else "No filter data"}</div>
-            </div>'''
-    else:
-        tn_trade_detail_html='<div style="text-align:center;padding:24px;color:#4A5878">No completed testnet trades yet</div>'
-
 
     # Audit log HTML — full detail
     audit_html=""
@@ -1622,7 +1574,6 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
     <div class="tab" onclick="show('tx',this)">Tax</div>
     <div class="tab" onclick="show('dg',this)">Diagnostics</div>
     <div class="tab" onclick="show('iss',this)" style="color:#FFB800">⚠️ Issues</div>
-    <div class="tab" onclick="show('tn',this)" style="color:#00B4FF">🧪 Testnet</div>
   </div>
 </div>
 <div class="main">
@@ -1657,16 +1608,6 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
   </div>
   <div class="card">
     {row("Cycle",f"#{s['cycle']}")}{row("Last check",s["last_check"] or "—")}{row("Next check",s["next_check"] or "—")}{row("Mode",mode)}{row("Assets",", ".join(s["assets"]))}
-  </div>
-  <div class="card" style="margin-top:10px;border-color:rgba(0,180,255,0.3)">
-    <div style="font-size:10px;font-weight:700;color:#00B4FF;text-transform:uppercase;margin-bottom:8px">🧪 Testnet Paper Trading — HL Mainnet Candles</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
-      <div><div style="font-size:10px;color:#4A5878">Balance</div><div style="font-weight:700">${tn_state["balance"]:,.0f}</div></div>
-      <div><div style="font-size:10px;color:#4A5878">Trades</div><div style="font-weight:700">{tn_state["tax"]["total_trades"]}</div></div>
-      <div><div style="font-size:10px;color:#4A5878">Open</div><div style="font-weight:700">{len(tn_state["positions"])}</div></div>
-      <div><div style="font-size:10px;color:#4A5878">P&L</div><div style="font-weight:700;color:{"#00D68F" if tn_state["tax"]["total_pnl"]>=0 else "#FF4757"}">${tn_state["tax"]["total_pnl"]:+,.2f}</div></div>
-    </div>
-    <div style="font-size:10px;color:#4A5878;margin-top:6px">Cycle #{tn_state["cycle"]} | {len(tn_state.get("issues",[]))} issues | HL Mainnet → HyperLiquid Testnet</div>
   </div>
 </div>
 
@@ -1753,44 +1694,7 @@ body{{background:#080B10;color:#E8EDF5;font-family:-apple-system,BlinkMacSystemF
       <span style="font-size:10px;color:#4A5878;margin-left:auto">{iss["time"]}</span>
     </div>
     <div style="font-size:11px;color:#4A5878;margin-top:4px">{iss["detail"].replace("<","&lt;").replace(">","&gt;")}</div>
-  </div>''' for iss in (tn_state.get("issues",[]) + state.get("issues",[])))}</div>''' if (tn_state.get("issues") or state.get("issues")) else '<div style="text-align:center;padding:48px 24px;color:#4A5878">No trade issues — all systems nominal ✅</div>'}
-</div>
-
-<div id="tn" class="sec">
-  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin-bottom:10px">🧪 Testnet — HL Mainnet Candles + Testnet Execution</div>
-  <a href="/log-testnet" style="display:block;text-align:center;background:#0F1520;border:1px solid #00B4FF;border-radius:12px;padding:12px;color:#00B4FF;font-weight:600;text-decoration:none;margin-bottom:12px">📋 Export Testnet Log</a>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
-    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">BALANCE</div><div style="font-size:20px;font-weight:700">${tn_state["balance"]:,.2f}</div></div>
-    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">OPEN</div><div style="font-size:20px;font-weight:700">{len(tn_state["positions"])}</div></div>
-    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">TRADES</div><div style="font-size:20px;font-weight:700">{tn_state["tax"]["total_trades"]}</div></div>
-    <div class="card"><div style="font-size:10px;color:#4A5878;margin-bottom:4px">NET P&L</div><div style="font-size:20px;font-weight:700;color:{"#00D68F" if tn_state["tax"]["total_pnl"]>=0 else "#FF4757"}">${tn_state["tax"]["total_pnl"]:+,.2f}</div></div>
-  </div>
-  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin-bottom:10px">Open Positions</div>
-  {f'<div class="card" style="padding:0 16px">{"".join(f"""<div style="padding:10px 0;border-bottom:1px solid #1E2D42"><div style="font-weight:600">{a} {pos["direction"]} @ ${pos["entry"]:,.4f}</div><div style="font-size:11px;color:#4A5878">Now: ${pos.get("current_price",pos["entry"]):,.4f} | Stop: ${pos["stop"]:,.4f}</div></div>""" for a,pos in tn_state["positions"].items())}</div>' if tn_state["positions"] else '<div style="text-align:center;padding:24px;color:#4A5878">No open testnet positions</div>'}
-  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin:16px 0 10px">Recent Testnet Trades</div>
-  <div class="card" style="padding:0 16px">
-    {"".join(f'''<div style="padding:10px 0;border-bottom:1px solid #1E2D42">
-      <div style="display:flex;gap:8px;align-items:center">
-        <span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:rgba(0,180,255,0.15);color:#00B4FF">{t["asset"]}</span>
-        <span style="font-size:12px;font-weight:600">{t["direction"]} {t["action"]}</span>
-        {"<span style='font-size:12px;font-weight:700;margin-left:auto;color:" + ("#00D68F" if (t.get("pnl") or 0)>=0 else "#FF4757") + "'>${:+,.2f}</span>".format(t.get("pnl") or 0) if t.get("pnl") is not None else ""}
-      </div>
-      <div style="font-size:11px;color:#4A5878">${t["entry"]:,.4f} | {t.get("reason","—")} | {t["time"][11:19]}</div>
-    </div>''' for t in tn_state["trades"][:20]) if tn_state["trades"] else '<div style="text-align:center;padding:24px;color:#4A5878">No testnet trades yet</div>'}
-  </div>
-  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin:16px 0 10px">Testnet Audit (last 50)</div>
-  <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#00B4FF;margin:16px 0 10px">🧪 Testnet Trade Detail</div>
-  {tn_trade_detail_html}
-  <div class="card" style="padding:0 16px">
-    {"".join(f'''<div style="padding:8px 0;border-bottom:1px solid #1E2D42">
-      <div style="display:flex;gap:6px;align-items:center">
-        <span style="font-size:10px;color:#00B4FF;font-weight:700">{a["asset"]}</span>
-        <span style="font-size:11px;font-weight:600">{a["event"]}</span>
-        <span style="font-size:10px;color:#4A5878;margin-left:auto">{a["time"]}</span>
-      </div>
-      <div style="font-size:11px;color:#4A5878;font-family:monospace">{a["detail"][:100]}</div>
-    </div>''' for a in tn_state["audit"][:50]) if tn_state["audit"] else '<div style="text-align:center;padding:24px;color:#4A5878">No testnet audit entries yet</div>'}
-  </div>
+  </div>''' for iss in state.get("issues",[]))}</div>''' if (state.get("issues")) else '<div style="text-align:center;padding:48px 24px;color:#4A5878">No trade issues — all systems nominal ✅</div>'}
 </div>
 
 </div>
@@ -1950,7 +1854,6 @@ def system_test():
     import time as _time
     from datetime import timedelta
     MAINNET_URL="https://api.hyperliquid.xyz/info"
-    TESTNET_URL_ST="https://api.hyperliquid-testnet.xyz/info"
     results=[]
     def chk(name,passed,detail=""):
         results.append({"name":name,"passed":passed,"detail":detail})
@@ -1990,19 +1893,7 @@ def system_test():
     except Exception as e:
         chk("Mainnet candles",False,str(e))
 
-    # 3. HL Testnet candles
-    try:
-        end_ms=int(_time.time()*1000); start_ms=end_ms-200*15*60*1000
-        for asset in ["BTC","ETH"]:
-            r=req.post(TESTNET_URL_ST,
-                json={"type":"candleSnapshot",
-                    "req":{"coin":asset,"interval":"15m","startTime":start_ms,"endTime":end_ms}},timeout=10)
-            data=r.json()
-            ok=isinstance(data,list) and len(data)>0 and all(k in data[-1] for k in ["t","o","h","l","c","v"])
-            chk(f"Testnet {asset} candles",ok,
-                f"{len(data)} candles | close=${float(data[-1]['c']):,.4f}" if ok else str(data)[:80])
-    except Exception as e:
-        chk("Testnet candles",False,str(e))
+    # 3. HL Binance candles
 
     # 4. evaluate_signal
     try:
@@ -2049,16 +1940,7 @@ def system_test():
     except Exception as e:
         chk("Mainnet userFills",False,str(e))
 
-    # 8. Testnet userFills
-    try:
-        tn_url="https://api.hyperliquid-testnet.xyz/info"
-        r=req.post(tn_url,json={"type":"userFills","user":TN_WALLET},timeout=10)
-        fills=r.json()
-        chk("Testnet userFills",isinstance(fills,list),f"{len(fills)} fills")
-    except Exception as e:
-        chk("Testnet userFills",False,str(e))
-
-    # 9. Retry logic
+    # 8. Retry logic
     try:
         candles=mn_candles.get("BTC",[])
         if len(candles)>=50:
@@ -2127,7 +2009,7 @@ def log_export():
     if not session.get("ok"): return "unauthorized",401
     s=state; lines=["="*60,"HL TRADER v4 — SYSTEM LOG",f"Generated: {ts()} UTC","="*60]
     lines.append(f"\nSTATUS: {s['status']} | Cycle #{s['cycle']} | {s['leverage']}x")
-    lines.append(f"Mode: {'DRY' if s['dry_run'] else 'LIVE'} | {'Testnet' if s['testnet'] else 'Mainnet'}")
+    lines.append(f"Mode: {'DRY' if s['dry_run'] else 'LIVE'} | Mainnet")
     lines.append(f"Paused: {s['paused']} | Kill: {s['kill_switch']} | API: {s['health']['api_connected']}")
     lines.append(f"\nP&L: Gross ${s['tax']['total_pnl']:+.4f} | Tax ${s['tax']['total_tax']:.4f} | Net ${s['tax']['total_net']:+.4f}")
     lines.append(f"Trades: {s['tax']['total_trades']} | W:{s['tax']['winning_trades']} L:{s['tax']['losing_trades']}")
@@ -2162,71 +2044,20 @@ def log_export():
     lines.append("\n"+"="*60)
     return Response("\n".join(lines),mimetype="text/plain")
 
-@app.route("/log-testnet")
-def log_export_testnet():
-    if not session.get("ok"): return "unauthorized",401
-    s=tn_state
-    lines=["="*60,"HL TRADER v4 — TESTNET LOG (Binance Candles)",f"Generated: {ts()} UTC","="*60]
-    lines.append(f"\nCycle #{s['cycle']} | Balance: ${s['balance']:,.2f}")
-    lines.append(f"Trades: {s['tax']['total_trades']} | W:{s['tax']['winning_trades']} L:{s['tax']['losing_trades']}")
-    lines.append(f"Gross P&L: ${s['tax']['total_pnl']:+,.4f}")
-    lines.append("\nOPEN POSITIONS:")
-    for asset,pos in s["positions"].items():
-        lines.append(f"  {asset}: {pos['direction']} @ ${pos['entry']:,.4f} | now=${pos.get('current_price',pos['entry']):,.4f}")
-    if not s["positions"]: lines.append("  None")
-    lines.append("\nTRADE HISTORY:")
-    for t in s["trades"]:
-        ep=f"${t['exit']:,.4f}" if t.get("exit") else "—"
-        pl=f"${t['pnl']:+,.4f}" if t.get("pnl") is not None else "open"
-        lines.append(f"  {t['time']} | {t['asset']} {t['direction']} {t['action']} | ${t['entry']:,.4f}→{ep} | {t.get('reason','—')} | {pl}")
-    lines.append(f"\nISSUES ({len(s.get('issues',[]))}):")
-    for iss in s.get("issues",[]):
-        lines.append(f"  {iss['time']} | {iss['asset']} | {iss['issue']} | {iss['detail']}")
-    lines.append(f"\nAUDIT TRAIL (all {len(s['audit'])} entries):")
-    for a in s["audit"]:
-        lines.append(f"  {a['time']} | {a['asset']:<6} | {a['event']:<30} | {a['detail']}")
-    lines.append("\n"+"="*60)
-    return Response("\n".join(lines),mimetype="text/plain")
+load_weekly_pnl()
 
-# Load audit from disk on startup so history is preserved across restarts
+# Sync real balance from HL on startup
 try:
-    import os
-    if os.path.exists(AUDIT_FILE):
-        disk_lines = open(AUDIT_FILE).readlines()
-        for line in reversed(disk_lines[-10000:]):
-            parts = line.strip().split("|",3)
-            if len(parts)==4:
-                state["audit"].append({"time":parts[0],"asset":parts[1],
-                                       "event":parts[2],"detail":parts[3],"filters":{}})
-        log(f"📂 Loaded {len(state['audit'])} audit entries from disk")
-except Exception as e:
-    log(f"⚠️ Could not load audit from disk: {e}")
+    _bal_r=req.post(HL_INFO_URL,json={"type":"clearinghouseState","user":MAIN_WALLET},timeout=10)
+    _bal_data=_bal_r.json()
+    _bal=float(_bal_data.get("marginSummary",{}).get("accountValue",0))
+    if _bal>0:
+        state["balance"]=round(_bal,2)
+        log(f"💰 Balance synced from HL: ${state['balance']:,.2f}")
+except Exception as _e:
+    log(f"⚠️ Balance sync failed: {_e}")
 
-# Load trades from disk
-try:
-    import json as _json
-    if os.path.exists(TRADES_FILE):
-        disk_trades=_json.load(open(TRADES_FILE))
-        with lock:
-            state["trades"]=disk_trades[:500]
-            # Rebuild weekly P&L and tax from disk trades
-            for t in disk_trades:
-                if t.get("pnl") is not None:
-                    wk=t["time"][:7].replace("-","") if t.get("time") else ""
-                    try:
-                        dt=datetime.strptime(t["time"][:10],"%Y-%m-%d")
-                        wk=dt.strftime("%Y-W%W")
-                        state["weekly_pnl"][wk]=round(state["weekly_pnl"].get(wk,0)+t["pnl"],4)
-                        state["tax"]["total_pnl"]+=t["pnl"]
-                        state["tax"]["total_trades"]+=1
-                        if t["pnl"]>0: state["tax"]["winning_trades"]+=1
-                        else: state["tax"]["losing_trades"]+=1
-                    except: pass
-        log(f"📂 Loaded {len(disk_trades)} trades from disk")
-except Exception as e:
-    log(f"⚠️ Could not load trades from disk: {e}")
-
-# Sync open positions from HyperLiquid on startup to prevent double entries
+# Sync open positions from HyperLiquid on startup
 try:
     import json as _json2
     r_pos=req.post(HL_INFO_URL,json={"type":"clearinghouseState","user":MAIN_WALLET},timeout=10)
@@ -2252,15 +2083,14 @@ try:
             log(f"📂 Restored position: {asset} {direction} @ ${entry:,.4f} size={size}")
     if hl_positions:
         log(f"📂 Synced {len(positions)} open positions from HyperLiquid")
-    # Recover stop order OIDs from HL open orders
+    # Recover stop order OIDs
     try:
         open_orders=req.post(HL_INFO_URL,json={"type":"openOrders","user":MAIN_WALLET},timeout=10).json()
         if isinstance(open_orders,list):
             for o in open_orders:
                 asset=o.get("coin","")
                 if asset in positions and asset not in stop_oids:
-                    # Find reduce-only orders (stop losses)
-                    if o.get("reduceOnly") or o.get("orderType","").lower() in ("stop market","stop limit","trigger"):
+                    if o.get("reduceOnly"):
                         stop_oids[asset]=o.get("oid")
                         log(f"📂 Recovered stop OID for {asset}: {stop_oids[asset]}")
     except Exception as e:
@@ -2268,332 +2098,18 @@ try:
 except Exception as e:
     log(f"⚠️ Could not sync positions on startup: {e}")
 
-# Load testnet trades from disk
+# Load trades from disk
 try:
-    import json as _json3
-    if os.path.exists(TN_TRADES_FILE):
-        tn_disk_trades=_json3.load(open(TN_TRADES_FILE))
-        tn_state["trades"]=tn_disk_trades[:500]
-        log(f"📂 Loaded {len(tn_disk_trades)} testnet trades from disk")
+    import json as _json_t
+    if os.path.exists(TRADES_FILE):
+        disk_trades=_json_t.load(open(TRADES_FILE))
+        state["trades"]=disk_trades[:500]
+        log(f"📂 Loaded {len(disk_trades)} trades from disk")
 except Exception as e:
-    log(f"⚠️ Could not load testnet trades from disk: {e}")
-
-# Sync testnet open positions from HyperLiquid testnet on startup
-try:
-    import json as _json4
-    r_tn=req.post("https://api.hyperliquid-testnet.xyz/info",
-        json={"type":"clearinghouseState","user":TN_WALLET},timeout=10)
-    tn_hl_positions=r_tn.json().get("assetPositions",[])
-    for p in tn_hl_positions:
-        pos_data=p.get("position",{})
-        asset=pos_data.get("coin","")
-        szi=float(pos_data.get("szi",0))
-        if asset in ASSETS and szi!=0:
-            direction="LONG" if szi>0 else "SHORT"
-            entry=float(pos_data.get("entryPx",0))
-            size=abs(szi)
-            stop=entry*(1-STOP_PCT) if direction=="LONG" else entry*(1+STOP_PCT)
-            trail=entry*(1-TRAIL_PCT) if direction=="LONG" else entry*(1+TRAIL_PCT)
-            tn_positions[asset]={
-                "direction":direction,"entry":entry,"size":size,
-                "stop":stop,"trail_high":entry,"trail_low":entry,
-                "trail_stop":trail,"current_price":entry,"entry_time":ts()
-            }
-            log(f"📂 Restored TN position: {asset} {direction} @ ${entry:,.4f}")
-    if tn_hl_positions:
-        log(f"📂 Synced {len(tn_positions)} testnet positions from HyperLiquid")
-    # Recover testnet stop OIDs
-    try:
-        tn_open_orders=req.post("https://api.hyperliquid-testnet.xyz/info",
-            json={"type":"openOrders","user":TN_WALLET},timeout=10).json()
-        if isinstance(tn_open_orders,list):
-            for o in tn_open_orders:
-                asset=o.get("coin","")
-                if asset in tn_positions and asset not in tn_stop_oids:
-                    if o.get("reduceOnly"):
-                        tn_stop_oids[asset]=o.get("oid")
-                        log(f"📂 Recovered TN stop OID for {asset}: {tn_stop_oids[asset]}")
-    except Exception as e:
-        log(f"⚠️ Could not recover TN stop OIDs: {e}")
-except Exception as e:
-    log(f"⚠️ Could not sync testnet positions on startup: {e}")
+    log(f"⚠️ Could not load trades from disk: {e}")
 
 _t=threading.Thread(target=trading_loop,daemon=True)
 _t.start()
-
-# ── TESTNET TRADING LOOP (Binance candles + testnet execution) ─────────────
-def testnet_trading_loop():
-    log("🧪 Testnet trading loop started — Binance candles + testnet execution")
-    tn_pos_usd = TN_TOTAL_USDC / len(ASSETS)
-    tn_leverage = TN_LEVERAGE
-
-    while True:
-        try:
-            if tn_state["kill_switch"] or tn_state["paused"]:
-                time.sleep(CHECK_EVERY); continue
-
-            with tn_lock: tn_state["cycle"]+=1
-
-            for asset in ASSETS:
-                try:
-                    # Fetch Binance candles — always complete
-                    candles=fetch_binance_candles(asset)
-                    if not candles: continue
-
-                    # Get newest candle
-                    newest=candles[-1]
-                    ts_val=str(newest["t"])
-                    now_ms=int(time.time()*1000)
-                    age_s=(now_ms-int(ts_val))/1000
-                    cur=float(newest["c"])
-                    is_closed=now_ms>int(newest.get("T",0))
-
-                    # Position management — S2+S4 same as mainnet
-                    if asset in tn_positions:
-                        pos=tn_positions[asset]
-                        direction=pos["direction"]
-
-                        # S2+S4: Use last COMPLETE candle for exit checks
-                        prev=candles[-2]
-                        prev_hi=float(prev["h"]); prev_lo=float(prev["l"])
-
-                        # ATR from complete candles
-                        try:
-                            _,atr_vals=atr_lookup(candles[:-1])
-                            atr_val=atr_vals[-1] if atr_vals and atr_vals[-1] else 0
-                        except: atr_val=0
-
-                        # S4+S2: Update trail with ATR filter, cancel-replace stop
-                        trail_result=update_trail_stop(asset,pos,prev_hi,prev_lo,atr_val,tn_stop_oids)
-                        if trail_result=="FILLED":
-                            # Stop triggered by HL testnet exchange
-                            pnl=((pos["trail_stop"]-pos["entry"])*pos["size"] if direction=="LONG"
-                                 else (pos["entry"]-pos["trail_stop"])*pos["size"])
-                            add_tn_audit(asset,f"✅ TRAIL EXIT (HL) {direction}",
-                                        f"@ ${pos['trail_stop']:.4f} | P&L=${pnl:+.4f}")
-                            with tn_lock:
-                                del tn_positions[asset]
-                                if asset in tn_stop_oids: del tn_stop_oids[asset]
-                                tn_state["trades"].insert(0,{
-                                    "time":ts(),"asset":asset,"action":"CLOSED",
-                                    "direction":direction,"entry":pos["entry"],
-                                    "exit":pos["trail_stop"],"pnl":round(pnl,4),
-                                    "reason":"trail","size":pos["size"]
-                                })
-                                try:
-                                    import json as _jtn2
-                                    _etn2=[]
-                                    if os.path.exists(TN_TRADES_FILE):
-                                        _etn2=_jtn2.load(open(TN_TRADES_FILE))
-                                    _etn2.insert(0,tn_state["trades"][0])
-                                    _etn2=_etn2[:500]
-                                    _jtn2.dump(_etn2,open(TN_TRADES_FILE,"w"))
-                                except: pass
-                            continue
-
-                        pos["current_price"]=cur
-                        exit_reason=None; exit_price=cur
-
-                        cfg=ASSET_CFG[asset]
-                        # EMA cross using complete candles
-                        complete_closes=[float(c["c"]) for c in candles[:-1]]
-                        ef_v=ema(complete_closes,EMA_FAST); em_v=ema(complete_closes,EMA_MID)
-                        ii=len(complete_closes)-1
-
-                        # Fixed TP for BNB
-                        if cfg["exit"]=="fixed_tp" and cfg["tp"]:
-                            tp_p=pos["entry"]*(1+cfg["tp"]) if direction=="LONG" else pos["entry"]*(1-cfg["tp"])
-                            if direction=="LONG":
-                                if prev_hi>=tp_p: exit_reason,exit_price="tp",tp_p
-                                elif prev_lo<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[ii] and em_v[ii] and ef_v[ii]<em_v[ii]: exit_reason="ema"
-                            else:
-                                if prev_lo<=tp_p: exit_reason,exit_price="tp",tp_p
-                                elif prev_hi>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[ii] and em_v[ii] and ef_v[ii]>em_v[ii]: exit_reason="ema"
-                        else:
-                            # Trail/partial exits — hard stop and EMA cross checks
-                            if direction=="LONG":
-                                if prev_lo<=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[ii] and em_v[ii] and ef_v[ii]<em_v[ii]: exit_reason="ema"
-                            else:
-                                if prev_hi>=pos["stop"]: exit_reason,exit_price="stop",pos["stop"]
-                                elif ef_v[ii] and em_v[ii] and ef_v[ii]>em_v[ii]: exit_reason="ema"
-
-                        if exit_reason:
-                            qty=pos["size"]
-                            pnl=((exit_price-pos["entry"])*qty if direction=="LONG"
-                                 else (pos["entry"]-exit_price)*qty)
-                            # S2: Cancel stop order before closing
-                            old_oid=tn_stop_oids.get(asset)
-                            if old_oid and old_oid!="FILLED":
-                                try:
-                                    tn_exchange.cancel(asset,old_oid)
-                                    time.sleep(0.3)
-                                except: pass
-                                if asset in tn_stop_oids: del tn_stop_oids[asset]
-                            # Execute on testnet
-                            try:
-                                tn_exchange.market_close(asset)
-                            except Exception as e:
-                                add_tn_issue(asset,"Exit failed",str(e))
-
-                            with tn_lock:
-                                del tn_positions[asset]
-                                tn_state["trades"].insert(0,{
-                                    "time":ts(),"asset":asset,"action":"CLOSED",
-                                    "direction":direction,"entry":pos["entry"],
-                                    "exit":exit_price,"pnl":round(pnl,4),
-                                    "reason":exit_reason,"size":qty
-                                })
-                                # Persist testnet trades to disk
-                                try:
-                                    import json as _jtn2
-                                    _etn2=[]
-                                    if os.path.exists(TN_TRADES_FILE):
-                                        _etn2=_jtn2.load(open(TN_TRADES_FILE))
-                                    _etn2.insert(0,tn_state["trades"][0])
-                                    _etn2=_etn2[:500]
-                                    _jtn2.dump(_etn2,open(TN_TRADES_FILE,"w"))
-                                except: pass
-                                tn_state["tax"]["total_pnl"]+=pnl
-                                tn_state["tax"]["total_trades"]+=1
-                                if pnl>0: tn_state["tax"]["winning_trades"]+=1
-                                else: tn_state["tax"]["losing_trades"]+=1
-
-                            add_tn_audit(asset,f"✅ CLOSED {direction}",
-                                        f"exit=${exit_price:,.4f} | pnl=${pnl:+,.2f} | reason={exit_reason}")
-                            ntfy(f"📊 [TESTNET] {asset} {direction} CLOSED",
-                                 f"P&L: ${pnl:+,.2f} | Reason: {exit_reason}\nEntry: ${pos['entry']:,.4f} → Exit: ${exit_price:,.4f}")
-                            log(f"🧪 TESTNET {asset} {direction} CLOSED @ ${exit_price:,.4f} | P&L=${pnl:+,.2f} | {exit_reason}")
-                        continue
-
-                    # Signal evaluation — only if not in position
-                    if tn_last_candle.get(asset)==ts_val:
-                        continue  # already evaluated this candle
-
-                    add_tn_audit(asset,"🕯 NEW CANDLE",
-                                f"ts={ts_val} | price=${cur:,.4f} | age={age_s:.0f}s | binance | evaluating...")
-
-                    direction,signal_price,sig_vol,sig_vs,filters=evaluate_signal(candles,asset)
-                    result=filters.get("_result",{})
-                    blocked=result.get("blocked_by",[])
-                    ema_filter=filters.get("ema_stack",{})
-                    ema_passed=ema_filter.get("pass",False)
-                    ema_dir=ema_filter.get("value","flat")
-
-                    if not ema_passed:
-                        # EMA flat — mark as seen
-                        tn_last_candle[asset]=ts_val
-                        add_tn_audit(asset,"⏭ EMA FLAT",f"EMA={ema_dir} | seen")
-                    elif direction:
-                        # All pass — mark as seen, enter below
-                        tn_last_candle[asset]=ts_val
-                    else:
-                        # EMA stacked but other filters failing — RETRY
-                        add_tn_audit(asset,"🔄 RETRY ALL",
-                                    f"EMA={ema_dir} | blocked:{blocked} — retrying")
-
-                    if not direction: continue  # still retrying — no signal yet
-
-                    # Signal fired — all filters passed
-                    add_tn_audit(asset,f"🚨 SIGNAL {direction}",
-                                f"price=${signal_price:,.4f} | binance data | all filters ✅")
-
-                    if tn_state["paused"] or tn_state["kill_switch"]: continue
-
-
-                    # Place order on testnet
-                    try:
-                        pos_usd=get_pos_usd(sig_vol,sig_vs,
-                            ema([ float(c["c"]) for c in candles],EMA_FAST)[-1],
-                            ema([ float(c["c"]) for c in candles],EMA_SLOW)[-1])
-                        notional=pos_usd*tn_leverage
-                        # Use correct szDecimals per asset
-                        try:
-                            tn_meta=req.post("https://api.hyperliquid-testnet.xyz/info",
-                                json={"type":"meta"},timeout=5).json()
-                            tn_dec=next((a.get("szDecimals",5) for a in tn_meta["universe"]
-                                        if a["name"]==asset),5)
-                        except: tn_dec=5
-                        qty=round(notional/cur,tn_dec)
-
-                        is_buy=(direction=="LONG")
-                        r=tn_exchange.market_open(asset,is_buy,qty)
-                        statuses=r.get("response",{}).get("data",{}).get("statuses",[])
-
-                        if statuses and "error" in statuses[0]:
-                            err=statuses[0]["error"]
-                            add_tn_issue(asset,"Order rejected",err)
-                            add_tn_audit(asset,"❌ ORDER REJECTED",err)
-                            continue
-
-                        fill=float(statuses[0].get("filled",{}).get("avgPx",cur)) if statuses else cur
-                        stop=round_price(fill*(1-STOP_PCT) if direction=="LONG" else fill*(1+STOP_PCT))
-                        trail=round_price(fill*(1-TRAIL_PCT) if direction=="LONG" else fill*(1+TRAIL_PCT))
-
-                        with tn_lock:
-                            tn_positions[asset]={
-                                "direction":direction,"entry":fill,"size":qty,"qty_rem":qty,
-                                "stop":stop,"trail_peak":fill,
-                                "trail_stop":trail,
-                                "current_price":fill,"entry_time":ts(),
-                                "partial_done":False,"partial_pnl":0.0
-                            }
-                            tn_state["trades"].insert(0,{
-                                "time":ts(),"asset":asset,"action":"OPENED",
-                                "direction":direction,"entry":fill,"exit":None,
-                                "pnl":None,"reason":"signal","size":qty,
-                                "filters":filters if "filters" in dir() else {}
-                            })
-                            # Persist testnet trades to disk
-                            try:
-                                import json as _jtn
-                                _etn=[]
-                                if os.path.exists(TN_TRADES_FILE):
-                                    _etn=_jtn.load(open(TN_TRADES_FILE))
-                                _etn.insert(0,tn_state["trades"][0])
-                                _etn=_etn[:500]
-                                _jtn.dump(_etn,open(TN_TRADES_FILE,"w"))
-                            except: pass
-
-                        # S2: Place stop order on HL testnet exchange
-                        tn_oid=None
-                        try:
-                            is_buy=direction=="SHORT"
-                            sp=round_price(stop)
-                            lp=round_price(sp*0.9 if is_buy else sp*1.1)
-                            tn_order_type={"trigger":{"triggerPx":sp,"isMarket":True,"tpsl":"sl"}}
-                            tn_stop_result=tn_exchange.order(asset,is_buy,qty,lp,tn_order_type,reduce_only=True)
-                            if tn_stop_result.get("status")=="ok":
-                                tn_s=tn_stop_result["response"]["data"]["statuses"][0]
-                                if "resting" in tn_s:
-                                    tn_oid=tn_s["resting"]["oid"]
-                                    tn_stop_oids[asset]=tn_oid
-                                    add_tn_audit(asset,"🛡 TN STOP PLACED",f"stop @ ${sp} OID:{tn_oid}")
-                        except Exception as e:
-                            add_tn_issue(asset,"TN stop placement failed",str(e))
-
-                        add_tn_audit(asset,f"✅ ENTERED {direction}",
-                                    f"fill=${fill:,.4f} | qty={qty} | stop=${stop:,.4f} | stop_oid={tn_oid}")
-                        ntfy(f"🧪 [TESTNET] {asset} {direction} ENTERED",
-                             f"Fill: ${fill:,.4f} | Qty: {qty}\nStop: ${stop:,.4f} | Binance signal")
-                        log(f"🧪 TESTNET {asset} {direction} ENTERED @ ${fill:,.4f}")
-
-                    except Exception as e:
-                        add_tn_issue(asset,"Entry error",str(e))
-                        add_tn_audit(asset,"❌ ENTRY ERROR",str(e))
-
-                except Exception as e:
-                    log(f"🧪 Testnet loop error {asset}: {e}")
-
-        except Exception as e:
-            log(f"🧪 Testnet loop error: {e}")
-
-        time.sleep(CHECK_EVERY)
-
-_tn=threading.Thread(target=testnet_trading_loop,daemon=True)
-_tn.start()
 
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
