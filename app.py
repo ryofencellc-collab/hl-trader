@@ -957,6 +957,10 @@ def close_all(reason="manual"):
         except Exception as e:
             add_diag("ERROR",f"Close all failed {asset}",str(e),"Try manually")
 
+# ── GLOBAL TRADING STATE ─────────────────────────────────────────────────
+positions={}; stop_oids={}; entry_times={}; last_candle={}
+last_exit={}; bar_count={}
+
 # ══════════════════════════════════════════════════
 # TRADING LOOP
 # ══════════════════════════════════════════════════
