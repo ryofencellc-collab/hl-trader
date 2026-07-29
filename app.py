@@ -1062,19 +1062,20 @@ def trading_loop():
                     state["positions"][asset]["unrealized_pnl"]=round(pnl,4)
 
             # TWO-WAY HL SYNC — only runs after startup_complete=True
-            # Uses same clearinghouseState API as startup sync
+            # Uses open orders API — direct state check broken on this wallet
             if startup_complete and positions:
                 try:
-                    r_sync=req.post(HL_INFO_URL,
-                        json={"type":"clearinghouseState","user":MAIN_WALLET},timeout=10)
-                    hl_pos=r_sync.json().get("assetPositions",[])
-                    hl_open={p["position"]["coin"]:p["position"]
-                             for p in hl_pos
-                             if float(p["position"].get("szi",0))!=0
-                             and p["position"]["coin"] in ASSETS}
-                    # Only fire if asset WAS in positions AND is now gone from HL
+                    # Use open orders API to check position protection status
+                    open_orders_r=req.post(HL_INFO_URL,
+                        json={"type":"openOrders","user":MAIN_WALLET},timeout=10)
+                    open_orders_data=open_orders_r.json() if open_orders_r.status_code==200 else []
+                    # Build set of assets that have active stop orders on HL
+                    hl_protected={o.get("coin","") for o in (open_orders_data if isinstance(open_orders_data,list) else [])
+                                  if o.get("coin","") in ASSETS}
+                    # Only fire exit if asset has NO stop order AND has been open >5 minutes
                     for asset in list(positions.keys()):
-                        if asset not in hl_open:
+                        pos_age=(time.time()-entry_times.get(asset,time.time()))/60
+                        if asset not in hl_protected and pos_age>5:
                             pos=positions[asset]
                             cur_p=float(mids.get(asset,pos["entry"]))
                             pnl=round((cur_p-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
@@ -1175,28 +1176,14 @@ def trading_loop():
                 result=filters.get("_result",{})
                 blocked=result.get("blocked_by",[])
 
-                # RETRY ALL FIX: only EMA direction marks candle as seen
-                # Proven: 2yr backtest 8142 trades 78.2% WR $+235k 105G/0R
-                # Simulation v3: 10/10 tests pass all 6 assets
+                # ONE EVAL PER CANDLE — matches backtest exactly
+                # Mark candle as seen immediately — no mid-candle retries
+                # Backtest evaluates once at candle close then moves on
+                last_candle[asset]=ts_val
                 ema_filter=filters.get("ema_stack",{})
-                ema_passed=ema_filter.get("pass",False)
                 ema_dir=ema_filter.get("value","flat")
-
-                if not ema_passed:
-                    # EMA flat — only fundamental filter, mark as seen
-                    last_candle[asset]=ts_val
+                if not filters.get("ema_stack",{}).get("pass",False):
                     add_audit(asset,"⏭ EMA FLAT",f"EMA={ema_dir} | seen — wont change mid-candle")
-                elif direction:
-                    # All filters passed — mark as seen, enter trade below
-                    last_candle[asset]=ts_val
-                else:
-                    # EMA stacked but other filters failing — RETRY next cycle
-                    # Show detailed filter values so we can see why it's retrying
-                    fil_detail=" | ".join(f"{k}={'✅' if v.get('pass') else '❌'} {str(v.get('value',''))[:15]}"
-                                         for k,v in filters.items() if k!="_result")
-                    add_audit(asset,"🔄 RETRY ALL",
-                              f"EMA={ema_dir} | blocked:{blocked} | {fil_detail}")
-                    log(f"🔄 {asset}: EMA stacked, blocked by {blocked} — retry next cycle")
 
 
                 with lock:
