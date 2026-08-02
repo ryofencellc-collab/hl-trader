@@ -206,8 +206,12 @@ def get_cb_client():
     from coinbase.rest import RESTClient
     return RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
 
-def fetch_candles(asset):
-    """Fetch last 200 15min candles from Coinbase for asset"""
+# ── CANDLE CACHE — updated by WebSocket, fallback to REST ─────────
+candle_cache = {asset: [] for asset in ASSET_NAMES}
+candle_cache_lock = threading.Lock()
+
+def fetch_candles_rest(asset):
+    """Fetch candles via REST — used on startup and as fallback"""
     try:
         client = get_cb_client()
         product_id = ASSETS[asset]["spot"]
@@ -232,12 +236,76 @@ def fetch_candles(asset):
                 "c":   float(c.close),
                 "v":   float(c.volume),
             })
-        # Sort ascending by timestamp
         candles = sorted(candles, key=lambda x: x["ts"])
+        with candle_cache_lock:
+            candle_cache[asset] = candles
         return candles
     except Exception as e:
         add_issue(asset, "candle_fetch_error", str(e))
         return None
+
+def fetch_candles(asset):
+    """Get candles — from cache if available, else REST"""
+    with candle_cache_lock:
+        cached = candle_cache.get(asset, [])
+    if cached:
+        return cached
+    return fetch_candles_rest(asset)
+
+def start_websocket():
+    """Subscribe to Coinbase WebSocket candle channel for all assets"""
+    try:
+        from coinbase.websocket import WSClient
+        product_ids = [ASSETS[a]["spot"] for a in ASSET_NAMES]
+
+        def on_message(msg):
+            try:
+                import json as _j
+                data = _j.loads(msg) if isinstance(msg, str) else msg
+                channel = data.get("channel","")
+                events = data.get("events",[])
+                if channel != "candles": return
+                for event in events:
+                    for c in event.get("candles",[]):
+                        product_id = c.get("product_id","")
+                        # Find asset from product_id
+                        asset = next((a for a,cfg in ASSETS.items()
+                                     if cfg["spot"]==product_id), None)
+                        if not asset: continue
+                        candle = {
+                            "ts":  int(float(c["start"])) * 1000,
+                            "dt":  datetime.fromtimestamp(int(float(c["start"])),
+                                   tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                            "o":   float(c["open"]),
+                            "h":   float(c["high"]),
+                            "l":   float(c["low"]),
+                            "c":   float(c["close"]),
+                            "v":   float(c["volume"]),
+                        }
+                        with candle_cache_lock:
+                            cache = candle_cache.get(asset, [])
+                            # Update or append candle
+                            existing = next((i for i,x in enumerate(cache)
+                                           if x["ts"]==candle["ts"]), None)
+                            if existing is not None:
+                                cache[existing] = candle
+                            else:
+                                cache.append(candle)
+                                cache.sort(key=lambda x: x["ts"])
+                                if len(cache) > CANDLE_LIMIT:
+                                    cache = cache[-CANDLE_LIMIT:]
+                            candle_cache[asset] = cache
+            except Exception as e:
+                log(f"⚠️ WebSocket message error: {e}")
+
+        ws = WSClient(api_key=CB_API_KEY, api_secret=CB_API_SEC,
+                      on_message=on_message)
+        ws.open()
+        ws.subscribe(product_ids=product_ids, channels=["candles"])
+        log(f"🔌 WebSocket candles subscribed for {len(product_ids)} assets")
+        ws.run_forever_with_exception_check()
+    except Exception as e:
+        log(f"⚠️ WebSocket failed: {e} — falling back to REST polling")
 
 def get_balance():
     """Get real balance from Coinbase"""
@@ -1189,6 +1257,16 @@ def kill():
 # ══════════════════════════════════════════════════════════════════
 load_trades()
 load_weekly_pnl()
+
+# Start WebSocket candle feed
+_ws = threading.Thread(target=start_websocket, daemon=True)
+_ws.start()
+
+# Pre-load candles via REST before trading loop starts
+log("📡 Pre-loading candles via REST...")
+for asset in ASSET_NAMES:
+    fetch_candles_rest(asset)
+    log(f"  {asset}: {len(candle_cache.get(asset,[]))} candles loaded")
 
 _t = threading.Thread(target=trading_loop, daemon=True)
 _t.start()
