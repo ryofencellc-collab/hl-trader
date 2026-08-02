@@ -881,7 +881,7 @@ def process_asset(asset):
                   f"ts={sig_ts} | already evaluated | price=${cur:,.4f}",
                   candle=last_complete)
         with lock:
-            state["health"]["assets_ok"][asset]["status"] = "WAITING"
+            state["health"]["assets_ok"][asset]["status"] = "CHECKED"
         return
 
     last_candle[asset] = sig_ts
@@ -889,7 +889,7 @@ def process_asset(asset):
     direction, sig_candle, indicators = evaluate_signal(candles, asset)
 
     with lock:
-        state["health"]["assets_ok"][asset]["status"] = "LIVE"
+        state["health"]["assets_ok"][asset]["status"] = "CHECKED"
 
     if direction:
         # Signal confirmed — queue pending entry for NEXT candle open
@@ -926,37 +926,16 @@ def process_asset(asset):
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-def auth_required(f):
-    from functools import wraps
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("authed"):
-            return redirect("/login")
-        return f(*args, **kwargs)
-    return decorated
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        if request.form.get("password") == PASSWORD:
-            session["authed"] = True
-            return redirect("/")
-        return '<form method="post"><input name="password" type="password" placeholder="password"><button>Login</button><p style="color:red">Wrong password</p></form>'
-    return '<form method="post"><input name="password" type="password" placeholder="password"><button>Login</button></form>'
 
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
+
 
 @app.route("/api/state")
-@auth_required
 def api_state():
     from flask import jsonify
     return jsonify(state)
 
 @app.route("/api/diagnostics")
-@auth_required
 def api_diagnostics():
     from flask import jsonify
     try:
@@ -964,6 +943,108 @@ def api_diagnostics():
             return jsonify(json.load(open(DIAG_FILE)))
     except: pass
     return jsonify([])
+
+def build_trade_journal():
+    """Build trade journal — each completed trade as a detailed card"""
+    completed = [t for t in state["trades"] if t.get("action") == "EXIT"]
+    if not completed:
+        return '<div style="color:#4A5878;padding:16px;text-align:center">No completed trades yet</div>'
+
+    html = ""
+    for t in completed[:50]:
+        pnl = t.get("pnl", 0)
+        pnl_color = "#00D68F" if pnl >= 0 else "#FF4757"
+        emoji = "✅" if pnl >= 0 else "❌"
+        net = pnl * 0.65 if pnl > 0 else pnl
+
+        # Find matching diagnostic entries for this trade
+        asset = t.get("asset","")
+        entry_time = t.get("time","")[:13]
+
+        # Find signal, entry, trail updates, exit from diagnostic
+        diags = []
+        try:
+            if os.path.exists(DIAG_FILE):
+                all_diags = json.load(open(DIAG_FILE))
+                diags = [d for d in all_diags
+                        if d.get("asset") == asset
+                        and d.get("time","")[:10] == t.get("time","")[:10]]
+        except: pass
+
+        sig_html = ""
+        entry_html = ""
+        trail_html = ""
+        exit_html = ""
+
+        for d in reversed(diags):
+            ev = d.get("event","")
+            if "SIGNAL" in ev and not sig_html:
+                ind = d.get("indicators",{})
+                c = d.get("candle",{})
+                sig_html = f"""
+                <div style="margin-bottom:8px">
+                  <div style="color:#FFB800;font-size:11px;font-weight:700;margin-bottom:4px">🚨 SIGNAL CANDLE</div>
+                  <div style="font-size:11px;color:#8892A4">Time: {c.get('dt','')} UTC</div>
+                  <div style="font-size:11px;color:#8892A4">OHLC: O:{c.get('o','')} H:{c.get('h','')} L:{c.get('l','')} C:{c.get('c','')}</div>
+                  <div style="font-size:11px;color:#8892A4">EMA5:{ind.get('ema5','')} EMA13:{ind.get('ema13','')} EMA34:{ind.get('ema34','')}</div>
+                  <div style="font-size:11px;color:#8892A4">Sep:{ind.get('separation','')} | Vol:{ind.get('vol_ratio','')}x | Brk:{ind.get('brk_level','')}</div>
+                </div>"""
+            elif "ENTER" in ev and not entry_html:
+                c = d.get("candle",{})
+                entry_html = f"""
+                <div style="margin-bottom:8px">
+                  <div style="color:#00B4FF;font-size:11px;font-weight:700;margin-bottom:4px">📊 ENTRY CANDLE</div>
+                  <div style="font-size:11px;color:#8892A4">Time: {c.get('dt','')} UTC | Open: ${t.get('entry',0):,.4f}</div>
+                  <div style="font-size:11px;color:#8892A4">{d.get('detail','')[:100]}</div>
+                </div>"""
+            elif "TRAIL" in ev:
+                c = d.get("candle",{})
+                trail_html += f'<div style="font-size:10px;color:#6B7A99">{d.get("time","")[:16]} | {d.get("detail","")[:80]}</div>'
+            elif "EXIT" in ev and not exit_html:
+                c = d.get("candle",{})
+                exit_html = f"""
+                <div style="margin-bottom:8px">
+                  <div style="color:{pnl_color};font-size:11px;font-weight:700;margin-bottom:4px">{emoji} EXIT CANDLE</div>
+                  <div style="font-size:11px;color:#8892A4">Time: {c.get('dt','')} UTC | Price: ${t.get('exit',0):,.4f}</div>
+                  <div style="font-size:11px;color:#8892A4">O:{c.get('o','')} H:{c.get('h','')} L:{c.get('l','')} C:{c.get('c','')}</div>
+                </div>"""
+
+        if trail_html:
+            trail_html = f"""
+            <div style="margin-bottom:8px">
+              <div style="color:#61DAFB;font-size:11px;font-weight:700;margin-bottom:4px">🔄 TRAIL UPDATES</div>
+              {trail_html}
+            </div>"""
+
+        # Copy block
+        copy_text = (f"{asset} {t.get('direction','')} | {t.get('time','')[:16]}\n"
+                    f"Entry: ${t.get('entry',0):,.4f} | Exit: ${t.get('exit',0):,.4f}\n"
+                    f"P&L: ${pnl:+,.4f} | Net(35%): ${net:+,.4f}\n"
+                    f"Reason: {t.get('reason','')}")
+
+        html += f"""
+        <div style="border:1px solid #1A2236;border-radius:8px;padding:16px;margin-bottom:12px;background:#0D1421">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+            <div>
+              <span style="font-weight:700;font-size:14px">{asset} {t.get('direction','')}</span>
+              <span style="color:#4A5878;font-size:11px;margin-left:8px">{t.get('time','')[:16]} UTC</span>
+            </div>
+            <div style="text-align:right">
+              <div style="color:{pnl_color};font-weight:700;font-size:16px">${pnl:+,.4f}</div>
+              <div style="color:#4A5878;font-size:10px">Net: ${net:+,.2f}</div>
+            </div>
+          </div>
+          <div style="border-top:1px solid #1A2236;padding-top:10px">
+            {sig_html}{entry_html}{trail_html}{exit_html}
+          </div>
+          <div style="margin-top:8px;text-align:right">
+            <button onclick="navigator.clipboard.writeText(`{copy_text}`)"
+              style="background:#1A2236;color:#8892A4;border:1px solid #2A3550;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:11px">
+              📋 Copy Trade
+            </button>
+          </div>
+        </div>"""
+    return html
 
 def build_diag_html():
     """Build diagnostic HTML from saved file"""
@@ -996,7 +1077,6 @@ def build_diag_html():
     return html
 
 @app.route("/")
-@auth_required
 def dashboard():
     s = state
     mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
@@ -1097,22 +1177,24 @@ def dashboard():
   <title>CB Trader v1</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="30">
+  <meta http-equiv="refresh" content="60">
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px}}
-    .card{{background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:16px;margin-bottom:12px}}
-    .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}}
-    .metric{{background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:12px;text-align:center}}
-    .metric-val{{font-size:22px;font-weight:700;margin-top:4px}}
+    body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:12px;max-width:600px;margin:0 auto}}
+    .card{{background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:14px;margin-bottom:10px}}
+    .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px}}
+    @media(min-width:480px){{.grid{{grid-template-columns:repeat(4,1fr)}}}}
+    .metric{{background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:10px;text-align:center}}
+    .metric-val{{font-size:20px;font-weight:700;margin-top:4px}}
     .metric-lbl{{font-size:10px;color:#4A5878;text-transform:uppercase;letter-spacing:.8px}}
-    h2{{font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin-bottom:10px}}
-    .section{{margin-bottom:20px}}
-    .tab{{display:inline-block;padding:6px 16px;cursor:pointer;border-radius:4px 4px 0 0;font-size:12px;font-weight:600}}
+    h2{{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#4A5878;margin-bottom:8px}}
+    .tabs{{display:flex;overflow-x:auto;gap:4px;margin-bottom:0;padding-bottom:0;-webkit-overflow-scrolling:touch}}
+    .tab{{flex-shrink:0;padding:8px 14px;cursor:pointer;border-radius:6px 6px 0 0;font-size:12px;font-weight:600;white-space:nowrap}}
     .tab.active{{background:#0D1421;color:#E0E6F0}}
     .tab:not(.active){{color:#4A5878}}
     .sec{{display:none}}.sec.active{{display:block}}
-    pre{{background:#0A0F1A;padding:12px;border-radius:6px;font-size:10px;overflow:auto;max-height:400px;color:#8892A4}}
+    pre{{background:#0A0F1A;padding:10px;border-radius:6px;font-size:10px;overflow:auto;max-height:300px;color:#8892A4}}
+    button{{-webkit-tap-highlight-color:transparent;touch-action:manipulation}}
   </style>
   <script>
     function show(id,el){{
@@ -1137,7 +1219,7 @@ def dashboard():
     </div>
     <div style="text-align:right;font-size:11px;color:#4A5878">
       Cycle #{s['cycle']} · {s['status'].upper()}<br>
-      <a href="/logout" style="color:#4A5878">logout</a>
+      <span style="color:#4A5878">📄 PAPER</span>
     </div>
   </div>
 
@@ -1160,12 +1242,12 @@ def dashboard():
     </div>
   </div>
 
-  <div style="margin-bottom:4px">
+  <div class="tabs">
     <span class="tab active" onclick="show('positions',this)">Positions</span>
-    <span class="tab" onclick="show('audit',this)">Audit Log</span>
-    <span class="tab" onclick="show('trades',this)">Trades</span>
+    <span class="tab" onclick="show('journal',this)" style="color:#00D68F">📋 Journal</span>
+    <span class="tab" onclick="show('audit',this)">Audit</span>
     <span class="tab" onclick="show('assets',this)">Assets</span>
-    <span class="tab" onclick="show('diagnostic',this)" style="color:#FFB800">🔬 Diagnostic</span>
+    <span class="tab" onclick="show('diagnostic',this)" style="color:#FFB800">🔬 Diag</span>
   </div>
 
   <div id="positions" class="sec active card">
@@ -1173,14 +1255,14 @@ def dashboard():
     {pos_html}
   </div>
 
+  <div id="journal" class="sec card">
+    <h2>📋 Trade Journal — Full Trade Story</h2>
+    {build_trade_journal()}
+  </div>
+
   <div id="audit" class="sec card">
     <h2>Audit Log — Every Candle Every Decision</h2>
     {audit_html}
-  </div>
-
-  <div id="trades" class="sec card">
-    <h2>Completed Trades</h2>
-    {trade_html}
   </div>
 
   <div id="assets" class="sec card">
@@ -1206,7 +1288,6 @@ def dashboard():
     return html
 
 @app.route("/diagnostic-raw")
-@auth_required
 def diagnostic_raw():
     """Raw diagnostic file — copy and paste"""
     try:
@@ -1217,7 +1298,6 @@ def diagnostic_raw():
     return Response("[]", mimetype="text/plain")
 
 @app.route("/log")
-@auth_required
 def log_export():
     """Plain text log export"""
     lines = [
@@ -1245,7 +1325,6 @@ def log_export():
     return Response("\n".join(lines), mimetype="text/plain")
 
 @app.route("/kill", methods=["POST"])
-@auth_required
 def kill():
     with lock:
         state["kill_switch"] = True
