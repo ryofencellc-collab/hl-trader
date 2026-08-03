@@ -110,6 +110,8 @@ def ts():
 def log(msg):
     print(f"[{ts()}] {msg}", flush=True)
 
+MEANINGFUL_EVENTS = ["SIGNAL", "ENTER", "TRAIL", "EXIT"]
+
 def add_audit(asset, event, detail, candle=None, indicators=None):
     """Full audit entry — records exactly what was seen and why"""
     entry = {
@@ -126,8 +128,9 @@ def add_audit(asset, event, detail, candle=None, indicators=None):
         state["audit"].insert(0, entry)
         if len(state["audit"]) > 500:
             state["audit"] = state["audit"][:500]
-    # Save to diagnostic file
-    save_diagnostic(entry)
+    # Only save meaningful events to diagnostic file — skip noise
+    if any(k in event for k in MEANINGFUL_EVENTS):
+        save_diagnostic(entry)
 
 def save_diagnostic(entry):
     """Save diagnostic entry to file for copy/paste"""
@@ -136,7 +139,7 @@ def save_diagnostic(entry):
         if os.path.exists(DIAG_FILE):
             existing = json.load(open(DIAG_FILE))
         existing.insert(0, entry)
-        existing = existing[:1000]
+        existing = existing[:5000]
         json.dump(existing, open(DIAG_FILE, "w"), indent=2)
     except: pass
 
@@ -485,12 +488,17 @@ def record_tax(asset, direction, entry_p, exit_p, size, pnl, entry_time):
 
 def ntfy(title, body, tags=""):
     try:
-        req.post(NTFY_URL, headers={
+        r = req.post(NTFY_URL, headers={
             "Title": title,
             "Tags": tags,
             "Content-Type": "text/plain"
-        }, data=body.encode(), timeout=5)
-    except: pass
+        }, data=body.encode(), timeout=10)
+        if r.status_code != 200:
+            log(f"⚠️ ntfy failed: {r.status_code} {r.text[:100]}")
+        else:
+            log(f"🔔 ntfy sent: {title}")
+    except Exception as e:
+        log(f"⚠️ ntfy error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -945,31 +953,41 @@ def api_diagnostics():
     return jsonify([])
 
 def build_trade_journal():
-    """Build trade journal — each completed trade as a detailed card"""
-    completed = [t for t in state["trades"] if t.get("action") == "EXIT"]
-    if not completed:
-        return '<div style="color:#4A5878;padding:16px;text-align:center">No completed trades yet</div>'
+    """Build trade journal from state — persists across restarts"""
+    # Get all enter/exit pairs matched by asset
+    enters  = [t for t in reversed(state["trades"]) if t.get("action") == "ENTER"]
+    exits   = [t for t in reversed(state["trades"]) if t.get("action") == "EXIT"]
+
+    if not exits:
+        return '<div style="color:#4A5878;padding:16px;text-align:center">No completed trades yet — waiting for first exit</div>'
 
     html = ""
-    for t in completed[:50]:
-        pnl = t.get("pnl", 0)
+    for t in exits[:30]:
+        pnl       = t.get("pnl", 0)
         pnl_color = "#00D68F" if pnl >= 0 else "#FF4757"
-        emoji = "✅" if pnl >= 0 else "❌"
-        net = pnl * 0.65 if pnl > 0 else pnl
+        emoji     = "✅" if pnl >= 0 else "❌"
+        net       = round(pnl * 0.65, 2) if pnl > 0 else round(pnl, 2)
+        asset     = t.get("asset", "")
+        exit_time = t.get("time", "")
 
-        # Find matching diagnostic entries for this trade
-        asset = t.get("asset","")
-        entry_time = t.get("time","")[:13]
+        # Find matching enter for this exit (same asset, before exit time)
+        enter = next((e for e in enters
+                     if e.get("asset") == asset
+                     and e.get("time","") <= exit_time), None)
 
-        # Find signal, entry, trail updates, exit from diagnostic
+        entry_time = enter.get("time","")[:13] if enter else exit_time[:13]
+
+        # Find all audit entries for this asset between entry and exit time
         diags = []
-        try:
-            if os.path.exists(DIAG_FILE):
-                all_diags = json.load(open(DIAG_FILE))
-                diags = [d for d in all_diags
-                        if d.get("asset") == asset
-                        and d.get("time","")[:10] == t.get("time","")[:10]]
-        except: pass
+        entry_ts = enter.get("time","") if enter else ""
+        for d in state["audit"]:
+            if d.get("asset") != asset: continue
+            d_time = d.get("time","")
+            # Must be between entry and exit
+            if entry_ts and d_time < entry_ts[:16]: continue
+            if d_time > exit_time[:16]: continue
+            diags.append(d)
+        diags = list(reversed(diags))  # chronological order
 
         sig_html = ""
         entry_html = ""
@@ -987,7 +1005,7 @@ def build_trade_journal():
                   <div style="font-size:11px;color:#8892A4">Time: {c.get('dt','')} UTC</div>
                   <div style="font-size:11px;color:#8892A4">OHLC: O:{c.get('o','')} H:{c.get('h','')} L:{c.get('l','')} C:{c.get('c','')}</div>
                   <div style="font-size:11px;color:#8892A4">EMA5:{ind.get('ema5','')} EMA13:{ind.get('ema13','')} EMA34:{ind.get('ema34','')}</div>
-                  <div style="font-size:11px;color:#8892A4">Sep:{ind.get('separation','')} | Vol:{ind.get('vol_ratio','')}x | Brk:{ind.get('brk_level','')}</div>
+                  <div style="font-size:11px;color:#8892A4">Sep:{ind.get('separation',ind.get('sep','?'))} | Vol:{ind.get('vol_ratio','?')}x | Brk:{ind.get('brk_level','?')}</div>
                 </div>"""
             elif "ENTER" in ev and not entry_html:
                 c = d.get("candle",{})
