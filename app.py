@@ -74,7 +74,7 @@ TAX_RATE    = 0.35
 # ── FILE PATHS ────────────────────────────────────────────────────
 TRADES_FILE     = "/tmp/cb_trades.json"
 WEEKLY_FILE     = "/tmp/cb_weekly.json"
-DIAG_FILE       = "/tmp/cb_diagnostics.json"
+DIAG_FILE       = "/tmp/cb_diagnostics.json"  # Railway persists /tmp between restarts
 TAX_FILE        = "/tmp/cb_tax.csv"
 
 
@@ -120,7 +120,12 @@ def log(msg):
 MEANINGFUL_EVENTS = ["SIGNAL", "ENTER", "TRAIL", "EXIT"]
 
 def add_audit(asset, event, detail, candle=None, indicators=None):
-    """Full audit entry — records exactly what was seen and why"""
+    """Full audit entry — only stores meaningful events, skips noise"""
+    # Skip noise events entirely — don't store in memory or file
+    is_meaningful = any(k in event for k in MEANINGFUL_EVENTS)
+    if not is_meaningful:
+        return  # skip SAME CANDLE, HOLDING, NO SIGNAL, WAITING
+
     entry = {
         "time": ts(),
         "asset": asset,
@@ -131,13 +136,14 @@ def add_audit(asset, event, detail, candle=None, indicators=None):
         entry["candle"] = candle
     if indicators:
         entry["indicators"] = indicators
+
     with lock:
         state["audit"].insert(0, entry)
-        if len(state["audit"]) > 500:
-            state["audit"] = state["audit"][:500]
-    # Only save meaningful events to diagnostic file — skip noise
-    if any(k in event for k in MEANINGFUL_EVENTS):
-        save_diagnostic(entry)
+        if len(state["audit"]) > 10000:  # overkill — 10k meaningful events
+            state["audit"] = state["audit"][:10000]
+
+    # Save to diagnostic file
+    save_diagnostic(entry)
 
 def save_diagnostic(entry):
     """Save diagnostic entry to file for copy/paste"""
@@ -146,7 +152,7 @@ def save_diagnostic(entry):
         if os.path.exists(DIAG_FILE):
             existing = json.load(open(DIAG_FILE))
         existing.insert(0, entry)
-        existing = existing[:5000]
+        existing = existing[:50000]
         json.dump(existing, open(DIAG_FILE, "w"), indent=2)
     except: pass
 
@@ -1322,9 +1328,36 @@ def diagnostic_raw():
     try:
         if os.path.exists(DIAG_FILE):
             content = json.dumps(json.load(open(DIAG_FILE)), indent=2)
-            return Response(content, mimetype="text/plain")
+            return Response(content, mimetype="application/json",
+                          headers={"Content-Disposition": "attachment; filename=diagnostic.json"})
     except: pass
-    return Response("[]", mimetype="text/plain")
+    return Response("[]", mimetype="application/json")
+
+@app.route("/diagnostic-summary")
+def diagnostic_summary():
+    """Quick summary of diagnostic data"""
+    try:
+        diags = json.load(open(DIAG_FILE)) if os.path.exists(DIAG_FILE) else []
+        signals  = [d for d in diags if "SIGNAL" in d.get("event","")]
+        enters   = [d for d in diags if "ENTER"  in d.get("event","")]
+        trails   = [d for d in diags if "TRAIL"  in d.get("event","")]
+        exits    = [d for d in diags if "EXIT"   in d.get("event","")]
+        earliest = diags[-1].get("time","?") if diags else "?"
+        latest   = diags[0].get("time","?")  if diags else "?"
+        summary = {
+            "total_entries": len(diags),
+            "signals": len(signals),
+            "entries": len(enters),
+            "trail_updates": len(trails),
+            "exits": len(exits),
+            "earliest": earliest,
+            "latest": latest,
+            "assets": list(set(d.get("asset","") for d in diags)),
+        }
+        from flask import jsonify
+        return jsonify(summary)
+    except Exception as e:
+        return Response(str(e), status=500)
 
 @app.route("/log")
 def log_export():
@@ -1365,6 +1398,19 @@ def kill():
 # ══════════════════════════════════════════════════════════════════
 load_trades()
 load_weekly_pnl()
+
+# Backup diagnostic file on startup so we never lose data
+def backup_diagnostic():
+    try:
+        if os.path.exists(DIAG_FILE):
+            backup = DIAG_FILE.replace(".json", f"_backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.json")
+            import shutil
+            shutil.copy2(DIAG_FILE, backup)
+            log(f"📁 Diagnostic backed up to {backup}")
+    except Exception as e:
+        log(f"⚠️ Backup failed: {e}")
+
+backup_diagnostic()
 
 # Start WebSocket candle feed
 _ws = threading.Thread(target=start_websocket, daemon=True)
