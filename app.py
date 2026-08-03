@@ -486,17 +486,21 @@ def record_tax(asset, direction, entry_p, exit_p, size, pnl, entry_time):
             w.writerow(row)
     except: pass
 
-def ntfy(title, body, tags=""):
+def ntfy(title, body, tags="", priority="default"):
     try:
-        r = req.post(NTFY_URL, headers={
-            "Title": title,
-            "Tags": tags,
-            "Content-Type": "text/plain"
-        }, data=body.encode(), timeout=10)
+        # Strip emojis from title for header (latin-1 safe)
+        safe_title = title.encode("ascii","ignore").decode("ascii").strip()
+        headers = {
+            "Title": safe_title,
+            "Priority": priority,
+            "Content-Type": "text/plain; charset=utf-8"
+        }
+        if tags: headers["Tags"] = tags
+        r = req.post(NTFY_URL, data=body.encode("utf-8"), headers=headers, timeout=10)
         if r.status_code != 200:
             log(f"⚠️ ntfy failed: {r.status_code} {r.text[:100]}")
         else:
-            log(f"🔔 ntfy sent: {title}")
+            log(f"🔔 ntfy sent: {safe_title}")
     except Exception as e:
         log(f"⚠️ ntfy error: {e}")
 
