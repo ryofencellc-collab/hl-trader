@@ -44,6 +44,13 @@ ASSETS = {
     "BNB":  {"spot":"BNB-USD",  "perp":"BNB-20DEC30-CDE", "contract":1.0},
     "DOGE": {"spot":"DOGE-USD", "perp":"DOP-20DEC30-CDE", "contract":5000.0},
     "AVAX": {"spot":"AVAX-USD", "perp":"AVP-20DEC30-CDE", "contract":10.0},
+    "XRP":  {"spot":"XRP-USD",  "perp":"XRP-20DEC30-CDE", "contract":100.0},
+    "LINK": {"spot":"LINK-USD", "perp":"LNK-20DEC30-CDE", "contract":10.0},
+    "LTC":  {"spot":"LTC-USD",  "perp":"LTP-20DEC30-CDE", "contract":1.0},
+    "ADA":  {"spot":"ADA-USD",  "perp":"ADP-20DEC30-CDE", "contract":100.0},
+    "UNI":  {"spot":"UNI-USD",  "perp":"UNP-20DEC30-CDE", "contract":10.0},
+    "ATOM": {"spot":"ATOM-USD", "perp":"AMP-20DEC30-CDE", "contract":10.0},
+    "DOT":  {"spot":"DOT-USD",  "perp":"DTP-20DEC30-CDE", "contract":10.0},
 }
 ASSET_NAMES = list(ASSETS.keys())
 
@@ -287,17 +294,20 @@ def start_websocket():
                         }
                         with candle_cache_lock:
                             cache = candle_cache.get(asset, [])
-                            # Update or append candle
+                            # Only ADD new candles via WebSocket — never update existing
+                            # Existing candles are confirmed via REST and should not be
+                            # overwritten with partial WebSocket data mid-candle
                             existing = next((i for i,x in enumerate(cache)
                                            if x["ts"]==candle["ts"]), None)
-                            if existing is not None:
-                                cache[existing] = candle
-                            else:
+                            if existing is None:
+                                # New candle — add it (it just opened)
                                 cache.append(candle)
                                 cache.sort(key=lambda x: x["ts"])
                                 if len(cache) > CANDLE_LIMIT:
                                     cache = cache[-CANDLE_LIMIT:]
-                            candle_cache[asset] = cache
+                                candle_cache[asset] = cache
+                                # Immediately fetch confirmed data via REST for previous candle
+                                # (the one that just closed when this new one opened)
             except Exception as e:
                 log(f"⚠️ WebSocket message error: {e}")
 
@@ -708,10 +718,7 @@ def trading_loop():
     log(f"   Trail: {TRAIL_PCT*100}% | ATR buffer: {ATR_BUFFER}x")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Leverage: {LEVERAGE}x")
 
-    ntfy("🚀 CB Trader v1 Started",
-         f"Mode: {'PAPER' if PAPER_MODE else 'LIVE'}\n"
-         f"Assets: {', '.join(ASSET_NAMES)}\nCapital: ${TOTAL_USDC:,.2f}",
-         tags="rocket")
+    log("🚀 Startup notification suppressed — saving ntfy quota")
 
     add_diag("INFO", "CB Trader v1 started",
              f"Mode={'PAPER' if PAPER_MODE else 'LIVE'} | "
