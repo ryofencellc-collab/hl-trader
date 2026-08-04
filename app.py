@@ -301,19 +301,22 @@ def start_websocket():
                         with candle_cache_lock:
                             cache = candle_cache.get(asset, [])
                             # Only ADD new candles via WebSocket — never update existing
-                            # Existing candles are confirmed via REST and should not be
-                            # overwritten with partial WebSocket data mid-candle
                             existing = next((i for i,x in enumerate(cache)
                                            if x["ts"]==candle["ts"]), None)
                             if existing is None:
-                                # New candle — add it (it just opened)
+                                # New candle opened — previous one just closed
+                                # Fetch confirmed REST data for the closed candle first
                                 cache.append(candle)
                                 cache.sort(key=lambda x: x["ts"])
                                 if len(cache) > CANDLE_LIMIT:
                                     cache = cache[-CANDLE_LIMIT:]
                                 candle_cache[asset] = cache
-                                # Immediately fetch confirmed data via REST for previous candle
-                                # (the one that just closed when this new one opened)
+                                # Immediately evaluate this asset — don't wait for loop
+                                threading.Thread(
+                                    target=_ws_trigger_eval,
+                                    args=(asset,),
+                                    daemon=True
+                                ).start()
             except Exception as e:
                 log(f"⚠️ WebSocket message error: {e}")
 
@@ -705,6 +708,12 @@ def exit_position(asset, exit_price, reason, current_candle):
     with lock:
         state["positions"] = {k: v for k, v in positions.items()}
 
+    # Immediately re-evaluate for new signal — don't wait for next loop
+    try:
+        process_asset(asset)
+    except Exception as e:
+        log(f"⚠️ Re-entry eval {asset}: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP
@@ -714,6 +723,13 @@ def exit_position(asset, exit_price, reason, current_candle):
 # - Trail + exit on CURRENT candle intrabar
 # ══════════════════════════════════════════════════════════════════
 startup_complete = False
+
+def _ws_trigger_eval(asset):
+    """Called by WebSocket when new candle detected — evaluate immediately"""
+    try:
+        process_asset(asset)
+    except Exception as e:
+        log(f"⚠️ WS eval error {asset}: {e}")
 
 def trading_loop():
     global startup_complete
@@ -762,8 +778,20 @@ def trading_loop():
 
         time.sleep(CHECK_EVERY)
 
+_processing = set()  # guard against recursive calls
+
 def process_asset(asset):
     """Process one asset per loop iteration"""
+    if asset in _processing:
+        return  # already being processed — skip to avoid recursion
+    _processing.add(asset)
+    try:
+        _process_asset_inner(asset)
+    finally:
+        _processing.discard(asset)
+
+def _process_asset_inner(asset):
+    """Inner process function — called by process_asset with recursion guard"""
     candles = fetch_candles(asset)
     if not candles or len(candles) < 52:
         add_issue(asset, "no_candles", "fetch returned insufficient candles")
@@ -1416,11 +1444,17 @@ backup_diagnostic()
 _ws = threading.Thread(target=start_websocket, daemon=True)
 _ws.start()
 
-# Pre-load candles via REST before trading loop starts
-log("📡 Pre-loading candles via REST...")
-for asset in ASSET_NAMES:
+# Pre-load candles via REST in parallel — much faster startup
+log("📡 Pre-loading candles via REST (parallel)...")
+def _preload(asset):
     fetch_candles_rest(asset)
     log(f"  {asset}: {len(candle_cache.get(asset,[]))} candles loaded")
+
+preload_threads = [threading.Thread(target=_preload, args=(a,), daemon=True)
+                   for a in ASSET_NAMES]
+for t in preload_threads: t.start()
+for t in preload_threads: t.join()
+log("✅ All candles pre-loaded")
 
 _t = threading.Thread(target=trading_loop, daemon=True)
 _t.start()
