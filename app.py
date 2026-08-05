@@ -74,7 +74,7 @@ TAX_RATE    = 0.35
 # ── FILE PATHS ────────────────────────────────────────────────────
 TRADES_FILE     = "/tmp/cb_trades.json"
 WEEKLY_FILE     = "/tmp/cb_weekly.json"
-DIAG_FILE       = "/tmp/cb_diagnostics.json"  # Railway persists /tmp between restarts
+DIAG_FILE       = "/app/cb_diagnostics.json"  # /app persists between Railway restartsstarts
 TAX_FILE        = "/tmp/cb_tax.csv"
 
 
@@ -316,6 +316,13 @@ def start_websocket():
                             "c":   float(c["close"]),
                             "v":   float(c["volume"]),
                         }
+                        # Only process standard 15-minute candle closes
+                        # Skip intermediate WebSocket updates (02:35, 02:50 etc)
+                        # This ensures app evaluates same candles as backtest
+                        candle_minute = int(candle["dt"][14:16])
+                        if candle_minute not in [0, 15, 30, 45]:
+                            continue  # skip non-standard timestamp
+
                         with candle_cache_lock:
                             cache = candle_cache.get(asset, [])
                             # Only ADD new candles via WebSocket — never update existing
@@ -323,7 +330,6 @@ def start_websocket():
                                            if x["ts"]==candle["ts"]), None)
                             if existing is None:
                                 # New candle opened — previous one just closed
-                                # Fetch confirmed REST data for the closed candle first
                                 cache.append(candle)
                                 cache.sort(key=lambda x: x["ts"])
                                 if len(cache) > CANDLE_LIMIT:
@@ -343,6 +349,7 @@ def start_websocket():
         ws.open()
         ws.subscribe(product_ids=product_ids, channels=["candles"])
         log(f"🔌 WebSocket candles subscribed for {len(product_ids)} assets")
+        with lock: state["ws_connected"] = True
         ws.run_forever_with_exception_check()
     except Exception as e:
         log(f"⚠️ WebSocket failed: {e} — falling back to REST polling")
@@ -728,20 +735,9 @@ def exit_position(asset, exit_price, reason, current_candle):
     with lock:
         state["positions"] = {k: v for k, v in positions.items()}
 
-    # Immediately re-evaluate for new signal after exit
-    # Use timer to ensure position is fully cleared from state first
-    import threading
-    _asset = asset  # capture for closure
-    def _reentry():
-        try:
-            # Only re-enter if position is truly cleared
-            with lock:
-                still_open = _asset in state.get("positions", {})
-            if not still_open:
-                process_asset(_asset)
-        except Exception as e:
-            log(f"⚠️ Re-entry eval {_asset}: {e}")
-    threading.Timer(1.0, _reentry).start()
+    # No immediate re-entry — wait for next WebSocket candle close
+    # This matches backtest behavior exactly
+    # Re-entry will happen naturally when next candle fires _ws_trigger_eval
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -832,6 +828,13 @@ def _process_asset_inner(asset):
     cur = float(candles[-1]["c"])
     cur_candle = candles[-1]
     last_complete = candles[-2]  # signal candle
+
+    # Only evaluate on standard 15-minute candle timestamps
+    # Skip intermediate WebSocket candles (02:35, 02:50 etc)
+    # This ensures app evaluates same candles as backtest
+    last_complete_minute = int(last_complete["dt"][14:16])
+    if last_complete_minute not in [0, 15, 30, 45]:
+        return  # skip non-standard candle
 
     with lock:
         state["health"]["assets_ok"][asset]["price"] = cur
@@ -1525,10 +1528,14 @@ def system_health():
     critical = [v for k,v in health.items() if isinstance(v,dict) and "❌" in v.get("status","")]
     health["overall"] = "✅ ALL SYSTEMS OK" if not critical else f"❌ {len(critical)} issues detected"
 
-    # Send ntfy if any critical issues
-    if critical:
-        issues = ", ".join(k for k,v in health.items() if isinstance(v,dict) and "❌" in v.get("status",""))
-        ntfy("CB Trader ALERT", f"System issues detected: {issues}", priority="high")
+    # Send ntfy only for real issues — not missing diagnostic on fresh start
+    # Diagnostic missing is expected right after restart
+    real_critical = [k for k,v in health.items()
+                     if isinstance(v,dict) and "❌" in v.get("status","")
+                     and k != "diagnostic_file"]  # suppress diagnostic missing alert
+    if real_critical:
+        issues_str = ", ".join(real_critical)
+        ntfy("CB Trader ALERT", f"System issues: {issues_str}", priority="high")
 
     return jsonify(health)
 
