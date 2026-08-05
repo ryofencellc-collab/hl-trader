@@ -74,7 +74,7 @@ TAX_RATE    = 0.35
 # ── FILE PATHS ────────────────────────────────────────────────────
 TRADES_FILE     = "/tmp/cb_trades.json"
 WEEKLY_FILE     = "/tmp/cb_weekly.json"
-DIAG_FILE       = "/app/cb_diagnostics.json"  # /app persists between Railway restartsstarts
+DIAG_FILE       = "/tmp/cb_diagnostics.json"  # Railway /tmp pathstarts
 TAX_FILE        = "/tmp/cb_tax.csv"
 
 
@@ -316,12 +316,8 @@ def start_websocket():
                             "c":   float(c["close"]),
                             "v":   float(c["volume"]),
                         }
-                        # Only process standard 15-minute candle closes
-                        # Skip intermediate WebSocket updates (02:35, 02:50 etc)
-                        # This ensures app evaluates same candles as backtest
-                        candle_minute = int(candle["dt"][14:16])
-                        if candle_minute not in [0, 15, 30, 45]:
-                            continue  # skip non-standard timestamp
+                        with lock:
+                            state["ws_last_candle"] = candle["dt"]
 
                         with candle_cache_lock:
                             cache = candle_cache.get(asset, [])
@@ -828,13 +824,6 @@ def _process_asset_inner(asset):
     cur = float(candles[-1]["c"])
     cur_candle = candles[-1]
     last_complete = candles[-2]  # signal candle
-
-    # Only evaluate on standard 15-minute candle timestamps
-    # Skip intermediate WebSocket candles (02:35, 02:50 etc)
-    # This ensures app evaluates same candles as backtest
-    last_complete_minute = int(last_complete["dt"][14:16])
-    if last_complete_minute not in [0, 15, 30, 45]:
-        return  # skip non-standard candle
 
     with lock:
         state["health"]["assets_ok"][asset]["price"] = cur
