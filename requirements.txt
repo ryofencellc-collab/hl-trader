@@ -3,3 +3,4 @@ flask
 flask-cors
 gunicorn
 coinbase-advanced-py
+websockets==12.0
