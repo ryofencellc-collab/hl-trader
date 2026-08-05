@@ -250,7 +250,7 @@ def fetch_candles_rest(asset):
         client = get_cb_client()
         product_id = ASSETS[asset]["spot"]
         end = int(time.time())
-        start = end - CANDLE_LIMIT * 15 * 60
+        start = end - CANDLE_LIMIT * 5 * 60   # 5-min candles
         resp = client.get_candles(
             product_id,
             start=str(start),
