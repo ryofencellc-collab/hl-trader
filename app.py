@@ -66,7 +66,7 @@ ATR_BUFFER  = 1.0    # optimized: was 0.5
 LEVERAGE    = 10
 TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
 CHECK_EVERY = 60      # seconds between loop iterations
-CANDLE_TF   = "FIFTEEN_MINUTE"
+CANDLE_TF   = "FIVE_MINUTE"    # switched to 5-min — $100k more net over 5 years
 CANDLE_LIMIT= 200
 
 TAX_RATE    = 0.35
