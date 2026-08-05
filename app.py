@@ -58,11 +58,11 @@ ASSET_NAMES = list(ASSETS.keys())
 EMA_FAST    = 5
 EMA_MID     = 13
 EMA_SLOW    = 34
-SEP_FILTER  = 0.003
-VOL_FILTER  = 0.5
-BRK_BARS    = 12
-TRAIL_PCT   = 0.005   # 0.5% — confirmed best
-ATR_BUFFER  = 0.5
+SEP_FILTER  = 0.002   # optimized: was 0.003
+VOL_FILTER  = 0.3    # optimized: was 0.5
+BRK_BARS    = 8      # optimized: was 12
+TRAIL_PCT   = 0.003   # optimized: was 0.005
+ATR_BUFFER  = 1.0    # optimized: was 0.5
 LEVERAGE    = 10
 TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
 CHECK_EVERY = 60      # seconds between loop iterations
@@ -98,6 +98,13 @@ state = {
                       for a in ASSET_NAMES}
     },
     "paper_mode": PAPER_MODE,
+    # Health tracking
+    "ws_connected":   False,
+    "ws_last_candle": "never",
+    "ntfy_last_sent": "never",
+    "ntfy_errors":    0,
+    "loop_last_run":  "never",
+    "loop_errors":    0,
 }
 
 positions   = {}   # asset → position dict
@@ -117,14 +124,19 @@ def ts():
 def log(msg):
     print(f"[{ts()}] {msg}", flush=True)
 
-MEANINGFUL_EVENTS = ["SIGNAL", "ENTER", "TRAIL", "EXIT"]
+# Noise events to skip — checked BEFORE meaningful check
+NOISE_EVENTS = ["NO SIGNAL", "SAME CANDLE", "HOLDING", "WAITING"]
 
 def add_audit(asset, event, detail, candle=None, indicators=None):
     """Full audit entry — only stores meaningful events, skips noise"""
-    # Skip noise events entirely — don't store in memory or file
-    is_meaningful = any(k in event for k in MEANINGFUL_EVENTS)
-    if not is_meaningful:
-        return  # skip SAME CANDLE, HOLDING, NO SIGNAL, WAITING
+    # Skip noise first — must check before meaningful check
+    # "NO SIGNAL" contains "SIGNAL" so order matters
+    if any(noise in event for noise in NOISE_EVENTS):
+        return
+    # Only save meaningful trading events
+    MEANINGFUL_EVENTS = ["SIGNAL", "ENTER", "TRAIL", "EXIT"]
+    if not any(k in event for k in MEANINGFUL_EVENTS):
+        return
 
     entry = {
         "time": ts(),
@@ -146,15 +158,21 @@ def add_audit(asset, event, detail, candle=None, indicators=None):
     save_diagnostic(entry)
 
 def save_diagnostic(entry):
-    """Save diagnostic entry to file for copy/paste"""
+    """Save diagnostic entry to file — proper file handling"""
     try:
         existing = []
         if os.path.exists(DIAG_FILE):
-            existing = json.load(open(DIAG_FILE))
+            try:
+                with open(DIAG_FILE, "r") as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = []  # corrupted — start fresh
         existing.insert(0, entry)
         existing = existing[:50000]
-        json.dump(existing, open(DIAG_FILE, "w"), indent=2)
-    except: pass
+        with open(DIAG_FILE, "w") as f:
+            json.dump(existing, f, indent=2)
+    except Exception as e:
+        log(f"⚠️ Diagnostic save failed: {e}")
 
 def add_issue(asset, issue, detail):
     entry = {"time": ts(), "asset": asset, "issue": issue, "detail": str(detail)}
@@ -507,7 +525,6 @@ def record_tax(asset, direction, entry_p, exit_p, size, pnl, entry_time):
 
 def ntfy(title, body, tags="", priority="default"):
     try:
-        # Strip emojis from title for header (latin-1 safe)
         safe_title = title.encode("ascii","ignore").decode("ascii").strip()
         headers = {
             "Title": safe_title,
@@ -518,10 +535,13 @@ def ntfy(title, body, tags="", priority="default"):
         r = req.post(NTFY_URL, data=body.encode("utf-8"), headers=headers, timeout=10)
         if r.status_code != 200:
             log(f"⚠️ ntfy failed: {r.status_code} {r.text[:100]}")
+            with lock: state["ntfy_errors"] = state.get("ntfy_errors",0) + 1
         else:
             log(f"🔔 ntfy sent: {safe_title}")
+            with lock: state["ntfy_last_sent"] = ts()
     except Exception as e:
         log(f"⚠️ ntfy error: {e}")
+        with lock: state["ntfy_errors"] = state.get("ntfy_errors",0) + 1
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -708,11 +728,20 @@ def exit_position(asset, exit_price, reason, current_candle):
     with lock:
         state["positions"] = {k: v for k, v in positions.items()}
 
-    # Immediately re-evaluate for new signal — don't wait for next loop
-    try:
-        process_asset(asset)
-    except Exception as e:
-        log(f"⚠️ Re-entry eval {asset}: {e}")
+    # Immediately re-evaluate for new signal after exit
+    # Use timer to ensure position is fully cleared from state first
+    import threading
+    _asset = asset  # capture for closure
+    def _reentry():
+        try:
+            # Only re-enter if position is truly cleared
+            with lock:
+                still_open = _asset in state.get("positions", {})
+            if not still_open:
+                process_asset(_asset)
+        except Exception as e:
+            log(f"⚠️ Re-entry eval {_asset}: {e}")
+    threading.Timer(1.0, _reentry).start()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -776,6 +805,8 @@ def trading_loop():
             add_diag("ERROR", "Loop error", str(e))
             log(f"⚠️ Loop error: {e}")
 
+        with lock:
+            state["loop_last_run"] = ts()
         time.sleep(CHECK_EVERY)
 
 _processing = set()  # guard against recursive calls
@@ -1366,8 +1397,8 @@ def diagnostic_summary():
     """Quick summary of diagnostic data"""
     try:
         diags = json.load(open(DIAG_FILE)) if os.path.exists(DIAG_FILE) else []
-        signals  = [d for d in diags if "SIGNAL" in d.get("event","")]
-        enters   = [d for d in diags if "ENTER"  in d.get("event","")]
+        signals  = [d for d in diags if "SIGNAL" in d.get("event","") and "NO" not in d.get("event","")]
+        enters   = [d for d in diags if "ENTER"  in d.get("event","") and "WAITING" not in d.get("event","")]
         trails   = [d for d in diags if "TRAIL"  in d.get("event","")]
         exits    = [d for d in diags if "EXIT"   in d.get("event","")]
         earliest = diags[-1].get("time","?") if diags else "?"
@@ -1386,6 +1417,120 @@ def diagnostic_summary():
         return jsonify(summary)
     except Exception as e:
         return Response(str(e), status=500)
+
+@app.route("/health")
+def system_health():
+    """Full system health check — every component"""
+    from flask import jsonify
+    health = {}
+
+    # 1. Diagnostic file
+    diag_ok = os.path.exists(DIAG_FILE)
+    diag_size = 0
+    diag_entries = 0
+    diag_last = "never"
+    if diag_ok:
+        try:
+            diags = json.load(open(DIAG_FILE))
+            diag_entries = len(diags)
+            diag_last = diags[0].get("time","?") if diags else "empty"
+            diag_size = os.path.getsize(DIAG_FILE)
+        except: diag_ok = False
+    health["diagnostic_file"] = {
+        "status": "✅ OK" if diag_ok and diag_entries > 0 else "❌ EMPTY" if diag_ok else "❌ MISSING",
+        "entries": diag_entries,
+        "last_entry": diag_last,
+        "size_kb": round(diag_size/1024, 1)
+    }
+
+    # 2. Noise filter
+    noise_in_diag = 0
+    if diag_ok:
+        try:
+            diags = json.load(open(DIAG_FILE))
+            noise_in_diag = sum(1 for d in diags if any(n in d.get("event","")
+                               for n in ["NO SIGNAL","SAME CANDLE","HOLDING","WAITING"]))
+        except: pass
+    health["noise_filter"] = {
+        "status": "✅ OK" if noise_in_diag == 0 else f"❌ {noise_in_diag} noise entries found",
+        "noise_entries_in_file": noise_in_diag
+    }
+
+    # 3. WebSocket status
+    with lock:
+        ws_connected = state.get("ws_connected", False)
+        ws_last = state.get("ws_last_candle", "never")
+    health["websocket"] = {
+        "status": "✅ Connected" if ws_connected else "⚠️ REST fallback",
+        "last_candle": ws_last
+    }
+
+    # 4. ntfy status
+    with lock:
+        ntfy_last = state.get("ntfy_last_sent", "never")
+        ntfy_errors = state.get("ntfy_errors", 0)
+    health["ntfy"] = {
+        "status": "✅ OK" if ntfy_errors == 0 else f"❌ {ntfy_errors} errors",
+        "last_sent": ntfy_last,
+        "errors": ntfy_errors
+    }
+
+    # 5. Candle cache
+    cache_status = {}
+    with candle_cache_lock:
+        for asset in ASSET_NAMES:
+            candles = candle_cache.get(asset, [])
+            last_dt = candles[-1]["dt"] if candles else "none"
+            cache_status[asset] = {"candles": len(candles), "last": last_dt}
+    health["candle_cache"] = {
+        "status": "✅ OK" if all(v["candles"] >= 100 for v in cache_status.values()) else "❌ LOW CANDLES",
+        "assets": cache_status
+    }
+
+    # 6. Open positions
+    with lock:
+        positions = state.get("positions", {})
+    health["positions"] = {
+        "status": "✅ OK",
+        "open": len(positions),
+        "assets": list(positions.keys())
+    }
+
+    # 7. Trading loop
+    with lock:
+        loop_last = state.get("loop_last_run", "never")
+        loop_errors = state.get("loop_errors", 0)
+    health["trading_loop"] = {
+        "status": "✅ OK" if loop_errors == 0 else f"❌ {loop_errors} errors",
+        "last_run": loop_last,
+        "errors": loop_errors
+    }
+
+    # 8. Paper mode
+    health["mode"] = {
+        "status": "📄 PAPER" if PAPER_MODE else "🚨 LIVE",
+        "paper_mode": PAPER_MODE
+    }
+
+    # 9. Audit memory
+    with lock:
+        audit_len = len(state.get("audit", []))
+    health["audit_memory"] = {
+        "status": "✅ OK" if audit_len < 9000 else "⚠️ Near cap",
+        "entries": audit_len,
+        "cap": 10000
+    }
+
+    # Overall status
+    critical = [v for k,v in health.items() if isinstance(v,dict) and "❌" in v.get("status","")]
+    health["overall"] = "✅ ALL SYSTEMS OK" if not critical else f"❌ {len(critical)} issues detected"
+
+    # Send ntfy if any critical issues
+    if critical:
+        issues = ", ".join(k for k,v in health.items() if isinstance(v,dict) and "❌" in v.get("status",""))
+        ntfy("CB Trader ALERT", f"System issues detected: {issues}", priority="high")
+
+    return jsonify(health)
 
 @app.route("/log")
 def log_export():
