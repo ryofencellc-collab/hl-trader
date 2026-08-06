@@ -358,6 +358,93 @@ def start_websocket():
     except Exception as e:
         log(f"⚠️ WebSocket failed: {e} — falling back to REST polling")
 
+def handle_fill(order_id, fill_price, product_id):
+    """
+    Called when Coinbase confirms a stop order filled.
+    Finds the asset matching the order_id and closes the position.
+    Only fires in LIVE mode — paper trades have no real order IDs.
+    """
+    if PAPER_MODE:
+        return  # paper mode has no real fills
+
+    # Find which asset this order belongs to
+    asset = None
+    with lock:
+        for a, oid in list(stop_oids.items()):
+            if oid == order_id:
+                asset = a
+                break
+
+    if not asset:
+        log(f"⚠️ Fill received for unknown order_id={order_id} product={product_id}")
+        return
+
+    if asset not in positions:
+        log(f"⚠️ Fill received for {asset} but no open position")
+        return
+
+    log(f"🔔 FILL confirmed by Coinbase: {asset} order_id={order_id} @ ${fill_price:.4f}")
+
+    # Use a dummy candle for the exit record
+    cur_candle = candle_cache.get(asset, [{}])[-1] if candle_cache.get(asset) else {}
+
+    # Exit the position at the confirmed fill price
+    exit_position(asset, fill_price, "fill", cur_candle)
+
+
+def start_user_websocket():
+    """
+    Subscribe to Coinbase user channel for real-time order fill notifications.
+    When a stop order fills, Coinbase pushes a fill event here instantly.
+    This ensures app state stays in sync with the exchange.
+    Only meaningful in LIVE mode — paper trades have no real orders.
+    """
+    if PAPER_MODE:
+        log("📄 PAPER MODE — user channel not needed")
+        return
+
+    try:
+        from coinbase.websocket import WSUserClient
+        import json as _j
+
+        def on_user_message(msg):
+            try:
+                data = _j.loads(msg) if isinstance(msg, str) else msg
+                channel = data.get("channel", "")
+                if channel != "user": return
+
+                for event in data.get("events", []):
+                    for order in event.get("orders", []):
+                        status = order.get("status", "")
+                        if status != "FILLED": continue
+
+                        order_id    = order.get("order_id", "")
+                        product_id  = order.get("product_id", "")
+                        fill_price  = float(order.get("avg_price", 0) or 0)
+
+                        if not order_id or not fill_price:
+                            continue
+
+                        log(f"🔔 User channel fill: {product_id} order={order_id} @ ${fill_price:.4f}")
+                        handle_fill(order_id, fill_price, product_id)
+
+            except Exception as e:
+                log(f"⚠️ User WebSocket message error: {e}")
+
+        ws_user = WSUserClient(
+            api_key=CB_API_KEY,
+            api_secret=CB_API_SEC,
+            on_message=on_user_message
+        )
+        ws_user.open()
+        ws_user.subscribe([], ["user", "heartbeats"])
+        log("🔌 User channel subscribed — listening for order fills")
+        ws_user.run_forever_with_exception_check()
+
+    except Exception as e:
+        log(f"⚠️ User WebSocket failed: {e}")
+
+
 def get_balance():
     """Get real balance from Coinbase"""
     try:
@@ -701,12 +788,15 @@ def exit_position(asset, exit_price, reason, current_candle):
         4
     )
 
-    # Cancel stop order
-    oid = stop_oids.get(asset)
-    if oid:
-        cancel_order(asset, oid)
-        if asset in stop_oids:
-            del stop_oids[asset]
+    # Place market order to close position (live mode only)
+    # No stop order to cancel — we use market orders for exits
+    if not PAPER_MODE:
+        direction_to_close = "SELL" if pos["direction"] == "LONG" else "BUY"
+        close_oid = place_market_order(asset, direction_to_close, pos["contracts"])
+        if close_oid:
+            log(f"🔔 Market exit order placed: {asset} {direction_to_close} oid={close_oid}")
+        else:
+            log(f"⚠️ Market exit order failed: {asset} — position may need manual close")
 
     # Record
     add_trade(asset, "EXIT", pos["direction"], pos["entry"], exit_price,
@@ -871,11 +961,8 @@ def _process_asset_inner(asset):
                 positions[asset] = pos
                 entry_times[asset] = ts()
 
-                # Place stop order immediately
-                oid = place_stop_order(asset, direction, contracts, trail_stop)
-                if oid:
-                    stop_oids[asset] = oid
-
+                # No stop order — trail monitored via WebSocket on candle close
+                # This matches backtest exactly (exit on candle close, not intrabar stop)
                 with lock:
                     state["positions"] = {k: v for k, v in positions.items()}
 
@@ -883,7 +970,7 @@ def _process_asset_inner(asset):
 
                 add_audit(asset, f"📊 ENTER {direction}",
                           f"entry=${entry_price:,.4f} | contracts={contracts} | size={size} | "
-                          f"trail_stop=${trail_stop:,.4f} | stop_oid={stop_oids.get(asset,'?')}",
+                          f"trail_stop=${trail_stop:,.4f}",
                           candle=last_complete,
                           indicators=pend.get("indicators"))
 
@@ -928,18 +1015,11 @@ def _process_asset_inner(asset):
         result, updated = check_trail_and_exit(asset, pos, cur_candle, atr_val)
 
         if updated:
-            # Cancel old stop, place new stop at updated trail price
-            old_oid = stop_oids.get(asset)
-            if old_oid:
-                cancel_order(asset, old_oid)
-            new_oid = place_stop_order(asset, pos["direction"],
-                                        pos["contracts"], pos["trail_stop"])
-            if new_oid:
-                stop_oids[asset] = new_oid
+            # Trail updated — no stop order to cancel/replace
+            # Exit handled by market order when trail triggered on candle close
             add_audit(asset, "🔄 TRAIL UPDATED",
                       f"trail_peak=${pos['trail_peak']:,.4f} | "
-                      f"trail_stop=${pos['trail_stop']:,.4f} | "
-                      f"new_stop_oid={stop_oids.get(asset,'?')}",
+                      f"trail_stop=${pos['trail_stop']:,.4f}",
                       candle=cur_candle)
 
         if result == "EXIT":
@@ -1592,6 +1672,10 @@ backup_diagnostic()
 # Start WebSocket candle feed
 _ws = threading.Thread(target=start_websocket, daemon=True)
 _ws.start()
+
+# Start WebSocket user channel for order fill notifications (LIVE mode only)
+_ws_user = threading.Thread(target=start_user_websocket, daemon=True)
+_ws_user.start()
 
 # Pre-load candles via REST in parallel — much faster startup
 log("📡 Pre-loading candles via REST (parallel)...")
