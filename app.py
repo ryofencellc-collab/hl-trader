@@ -319,24 +319,32 @@ def start_websocket():
                         with lock:
                             state["ws_last_candle"] = candle["dt"]
 
+                        # Check if this is a new candle OUTSIDE the lock
                         with candle_cache_lock:
                             cache = candle_cache.get(asset, [])
-                            # Only ADD new candles via WebSocket — never update existing
                             existing = next((i for i,x in enumerate(cache)
                                            if x["ts"]==candle["ts"]), None)
-                            if existing is None:
-                                # New candle opened — previous one just closed
-                                cache.append(candle)
-                                cache.sort(key=lambda x: x["ts"])
-                                if len(cache) > CANDLE_LIMIT:
-                                    cache = cache[-CANDLE_LIMIT:]
-                                candle_cache[asset] = cache
-                                # Immediately evaluate this asset — don't wait for loop
-                                threading.Thread(
-                                    target=_ws_trigger_eval,
-                                    args=(asset,),
-                                    daemon=True
-                                ).start()
+                            is_new = existing is None
+
+                        if is_new:
+                            # New candle opened — fetch confirmed REST data OUTSIDE lock
+                            # This avoids deadlock since fetch_candles_rest also acquires lock
+                            rest_candles = fetch_candles_rest(asset)
+                            if not rest_candles:
+                                # Fallback: use WS candle if REST fails
+                                with candle_cache_lock:
+                                    cache = candle_cache.get(asset, [])
+                                    cache.append(candle)
+                                    cache.sort(key=lambda x: x["ts"])
+                                    if len(cache) > CANDLE_LIMIT:
+                                        cache = cache[-CANDLE_LIMIT:]
+                                    candle_cache[asset] = cache
+                            # Immediately evaluate this asset — don't wait for loop
+                            threading.Thread(
+                                target=_ws_trigger_eval,
+                                args=(asset,),
+                                daemon=True
+                            ).start()
             except Exception as e:
                 log(f"⚠️ WebSocket message error: {e}")
 
