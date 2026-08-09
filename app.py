@@ -225,6 +225,14 @@ def fetch_candles_rest(asset):
                 "coin": asset, "interval": CANDLE_TF,
                 "startTime": start_ms, "endTime": end_ms,
             }}, timeout=15)
+        if r.status_code == 429:
+            log(f"  {asset} candle fetch: rate limited, retrying in 2s")
+            time.sleep(2)
+            r = req.post("https://api.hyperliquid.xyz/info",
+                json={"type": "candleSnapshot", "req": {
+                    "coin": asset, "interval": CANDLE_TF,
+                    "startTime": start_ms, "endTime": end_ms,
+                }}, timeout=15)
         if r.status_code != 200:
             log(f"  {asset} candle fetch failed: HTTP {r.status_code} {r.text[:100]}")
             return None
@@ -750,13 +758,11 @@ def dashboard():
 </body></html>"""
 
 # ── STARTUP ───────────────────────────────────────────────────────
-log("📡 Pre-loading candles via HL REST (parallel)...")
-def _preload(a):
-    c=fetch_candles_rest(a)
-    log(f"  {a}: {len(c) if c else 0} candles loaded")
-threads=[threading.Thread(target=_preload,args=(a,),daemon=True) for a in ASSET_NAMES]
-for t in threads: t.start()
-for t in threads: t.join()
+log("📡 Pre-loading candles via HL REST (sequential)...")
+for _asset in ASSET_NAMES:
+    _c = fetch_candles_rest(_asset)
+    log(f"  {_asset}: {len(_c) if _c else 0} candles loaded")
+    time.sleep(0.5)  # avoid 429 rate limit
 log("✅ All candles pre-loaded")
 
 check_weekly_reset()
