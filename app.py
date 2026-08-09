@@ -762,7 +762,7 @@ log("📡 Pre-loading candles via HL REST (sequential)...")
 for _asset in ASSET_NAMES:
     _c = fetch_candles_rest(_asset)
     log(f"  {_asset}: {len(_c) if _c else 0} candles loaded")
-    time.sleep(0.5)  # avoid 429 rate limit
+    time.sleep(0.5)
 log("✅ All candles pre-loaded")
 
 check_weekly_reset()
@@ -775,5 +775,5 @@ log(f"   Capital: ${TOTAL_USDC:,.2f} | Leverage: {LEVERAGE}x")
 threading.Thread(target=start_websocket, daemon=True).start()
 threading.Thread(target=trading_loop,    daemon=True).start()
 
-port=int(os.environ.get("PORT",8080))
-app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+# Gunicorn handles serving — no app.run() needed
+# Start command: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
