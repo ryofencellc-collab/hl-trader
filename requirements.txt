@@ -1,9 +1,5 @@
-requests
 flask
-flask-cors
 gunicorn
+requests
 coinbase-advanced-py
 websockets==12.0
-websocket-client
-ccxt
-eth_account
