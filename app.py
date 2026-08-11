@@ -67,7 +67,7 @@ BRK_BARS    = 8
 TRAIL_PCT   = 0.003
 ATR_BUFFER  = 1.0
 CANDLE_TF   = "FIVE_MINUTE"
-CANDLE_LIMIT= 200
+CANDLE_LIMIT= 201  # fetch 201 so complete = 200 after excluding forming candle
 LEVERAGE    = 10
 TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
 CHECK_EVERY = 60
@@ -292,13 +292,15 @@ def start_websocket():
                 events  = data.get("events",[])
                 if channel != "candles": return
                 for event in events:
+                    event_type = event.get("type","")
                     for c in event.get("candles",[]):
                         product_id = c.get("product_id","")
                         asset = next((a for a,cfg in ASSETS.items()
                                      if cfg["spot"]==product_id), None)
                         if not asset: continue
+                        candle_ts = int(float(c["start"]))*1000
                         candle = {
-                            "ts": int(float(c["start"]))*1000,
+                            "ts": candle_ts,
                             "dt": datetime.fromtimestamp(int(float(c["start"])),
                                   tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
                             "o":float(c["open"]),"h":float(c["high"]),
@@ -306,10 +308,15 @@ def start_websocket():
                             "v":float(c["volume"]),
                         }
                         with lock: state["ws_last_candle"] = candle["dt"]
+                        # Skip snapshot events — historical replay on connect
+                        if event_type == "snapshot": continue
+                        # Only trigger on update events for current 5-min bucket
+                        import time as _t
+                        current_bucket = (_t.time() // 300) * 300 * 1000
                         with candle_cache_lock:
                             cache    = candle_cache.get(asset, [])
                             existing = next((i for i,x in enumerate(cache)
-                                            if x["ts"]==candle["ts"]), None)
+                                            if x["ts"]==candle_ts), None)
                             is_new   = existing is None
                         if is_new:
                             rest = fetch_candles_rest(asset)
