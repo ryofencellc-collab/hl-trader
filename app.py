@@ -542,12 +542,15 @@ def _process_asset(asset):
                   f"Waiting for next candle | signal_candle={sig_candle['dt']} | "
                   f"sep={indic.get('sep')} | vol={indic.get('vol')}x",
                   candle=sig_candle, indicators=indic)
+    else:
+        # Not logged individually — cycle summary logged in trading_loop
+        pass
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
-    log("🚀 CB Trader v26 started")
+    log("🚀 CB Trader v28 started")
     log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR buffer: {ATR_BUFFER}x")
@@ -557,7 +560,10 @@ def trading_loop():
         if bal:
             with lock: state["balance"] = round(bal, 2)
             log(f"   Balance: ${state['balance']:,.2f}")
+
+    last_bucket = (int(time.time()) // 300) * 300
     cycle = 0
+
     while True:
         try:
             cycle += 1
@@ -565,16 +571,34 @@ def trading_loop():
                 state["cycle"]         = cycle
                 state["loop_last_run"] = ts()
             check_weekly_reset()
-            if cycle % 10 == 0: sync_positions()
-            for asset in ASSET_NAMES:
-                if asset not in _processing:
-                    threading.Thread(target=_ws_trigger_eval,
-                                     args=(asset,), daemon=True).start()
-                    time.sleep(0.05)
+            if cycle % 20 == 0: sync_positions()
+
+            # Check if 5-min bucket changed — primary trigger
+            current_bucket = (int(time.time()) // 300) * 300
+            if current_bucket != last_bucket:
+                last_bucket = current_bucket
+                bucket_dt = datetime.fromtimestamp(current_bucket, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                log(f"🕐 New candle: {bucket_dt} UTC — evaluating {len(ASSET_NAMES)} assets | open={len(positions)} positions")
+                for asset in ASSET_NAMES:
+                    if asset not in _processing:
+                        threading.Thread(target=_ws_trigger_eval,
+                                         args=(asset,), daemon=True).start()
+                        time.sleep(0.05)
+                # Log cycle heartbeat to diagnostic
+                add_audit("SYSTEM", "💓 CYCLE",
+                          f"candle={bucket_dt} | open_positions={len(positions)} | "
+                          f"balance=${state.get('balance',0):,.2f} | trades={state.get('total_trades',0)}")
+            else:
+                # Between candles — only check trail on open positions
+                for asset in list(positions.keys()):
+                    if asset not in _processing:
+                        threading.Thread(target=_ws_trigger_eval,
+                                         args=(asset,), daemon=True).start()
+
         except Exception as e:
             with lock: state["loop_errors"] += 1
             log(f"Loop error: {e}")
-        time.sleep(CHECK_EVERY)
+        time.sleep(30)  # check every 30 seconds
 
 # ══════════════════════════════════════════════════════════════════
 # FLASK DASHBOARD
