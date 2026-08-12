@@ -24,7 +24,7 @@ import requests as req
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
 PAPER_MODE  = True   # ← SET False TO GO LIVE
-PASSWORD    = os.environ.get("DASHBOARD_PASSWORD", "cb2026")
+PASSWORD    = ""  # No password — open dashboard
 NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "hl-trader-lunchm0ney")
 NTFY_URL    = f"https://ntfy.sh/{NTFY_TOPIC}"
 
@@ -604,31 +604,8 @@ def trading_loop():
 # FLASK DASHBOARD
 # ══════════════════════════════════════════════════════════════════
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
 
-def auth(): return session.get("authed") == True
 
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method=="POST":
-        if request.form.get("password")==PASSWORD:
-            session["authed"]=True; return redirect("/")
-        return "<p>Wrong password</p><a href='/login'>Try again</a>"
-    return """<!DOCTYPE html><html><head><title>CB Trader v26</title>
-    <style>body{background:#060D1A;color:#E0E6F0;font-family:sans-serif;
-    display:flex;align-items:center;justify-content:center;height:100vh}
-    input{background:#0D1421;border:1px solid #1A2236;color:#E0E6F0;
-    padding:10px;border-radius:6px;margin:8px 0;width:200px}
-    button{background:#00D68F;color:#000;border:none;padding:10px 20px;
-    border-radius:6px;cursor:pointer;font-weight:700}</style></head>
-    <body><form method=post style='text-align:center'>
-    <div style='font-size:24px;font-weight:700;margin-bottom:16px'>CB Trader v26</div>
-    <input type=password name=password placeholder='Password'><br>
-    <button type=submit>Login</button></form></body></html>"""
-
-@app.route("/logout")
-def logout():
-    session.clear(); return redirect("/login")
 
 @app.route("/health")
 def health():
@@ -677,7 +654,6 @@ def diagnostic_raw():
 
 @app.route("/tax-export")
 def tax_export():
-    if not auth(): return redirect("/login")
     try:
         return Response(open(TAX_FILE).read(), mimetype="text/csv",
             headers={"Content-Disposition":"attachment;filename=cb_trades.csv"})
@@ -686,119 +662,210 @@ def tax_export():
 
 @app.route("/")
 def dashboard():
-    if not auth(): return redirect("/login")
     with lock: s=dict(state); pos=dict(positions)
     wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
     bal = s["balance"]
     mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
     mode_label = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     wk_color   = "#00D68F" if s["weekly_pnl"]>=0 else "#FF4757"
+    tot_color  = "#00D68F" if s["total_pnl"]>=0 else "#FF4757"
 
-    pos_html=""
-    for asset,p in pos.items():
-        pos_html+=f"""<div class='card'>
-          <b>{asset} {p['direction']}</b><br>
-          Entry: ${p['entry']:,.4f}<br>
-          Trail: ${p.get('trail_stop',0):,.4f} | Peak: ${p.get('trail_peak',0):,.4f}<br>
-          Since: {p.get('entry_time','?')}</div>"""
-    if not pos_html:
-        pos_html="<div style='color:#4A5878;padding:16px'>No open positions</div>"
+    # Open positions
+    pos_rows = ""
+    for asset, p in pos.items():
+        pnl_est = round((p.get("trail_stop",p["entry"])-p["entry"])*p["size"],2) if p["direction"]=="LONG" else round((p["entry"]-p.get("trail_stop",p["entry"]))*p["size"],2)
+        pnl_color = "#00D68F" if pnl_est>=0 else "#FF4757"
+        pos_rows += f"""
+        <div style='background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:12px;margin-bottom:8px'>
+          <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'>
+            <span style='font-size:16px;font-weight:700'>{asset}</span>
+            <span style='font-size:13px;font-weight:700;color:{"#00D68F" if p["direction"]=="LONG" else "#FF4757"}'>{p["direction"]}</span>
+            <span style='font-size:13px;font-weight:700;color:{pnl_color}'>${pnl_est:+,.2f}</span>
+          </div>
+          <div style='display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px;color:#8892A4'>
+            <div>Entry<br><b style='color:#E0E6F0'>${p["entry"]:,.4f}</b></div>
+            <div>Trail Stop<br><b style='color:#FFB800'>${p.get("trail_stop",0):,.4f}</b></div>
+            <div>Peak<br><b style='color:#E0E6F0'>${p.get("trail_peak",0):,.4f}</b></div>
+            <div>Since<br><b style='color:#E0E6F0'>{p.get("entry_time","?")}</b></div>
+          </div>
+        </div>"""
+    if not pos_rows:
+        pos_rows = "<div style='color:#4A5878;padding:24px;text-align:center'>No open positions</div>"
 
+    # Journal
     try:
         audit_data=json.load(open(DIAG_FILE)) if os.path.exists(DIAG_FILE) else []
     except:
         audit_data=[]
 
-    journal_html=""
-    for a in [x for x in audit_data if not any(n in x.get("event","") for n in NOISE)][:50]:
-        evt=a.get("event","")
-        color=("#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt
-               else "#FFB800" if "SIGNAL" in evt else "#4A5878")
-        journal_html+=(f"<div style='border-left:3px solid {color};"
-                        f"padding:8px 12px;margin-bottom:6px;background:#0D1421'>"
-                        f"<div style='font-size:10px;color:#4A5878'>{a['time']} | {a.get('asset','')}</div>"
-                        f"<div style='font-weight:600;color:{color}'>{evt}</div>"
-                        f"<div style='font-size:11px;color:#8892A4'>{a.get('detail','')[:100]}</div></div>")
+    journal_rows = ""
+    shown = 0
+    for a in audit_data:
+        if shown >= 100: break
+        evt = a.get("event","")
+        if any(n in evt for n in ["NO SIGNAL"]): continue
+        if "CYCLE" in evt:
+            journal_rows += f"<div style='padding:6px 0;border-bottom:1px solid #0D1421;font-size:11px;color:#4A5878'>{a['time']} — {a.get('detail','')[:80]}</div>"
+        else:
+            color = "#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt else "#FFB800" if "SIGNAL" in evt else "#E0E6F0"
+            journal_rows += f"""<div style='border-left:3px solid {color};padding:8px 10px;margin-bottom:6px;background:#0D1421;border-radius:0 6px 6px 0'>
+              <div style='font-size:10px;color:#4A5878'>{a["time"]} · {a.get("asset","SYSTEM")}</div>
+              <div style='font-size:13px;font-weight:600;color:{color}'>{evt}</div>
+              <div style='font-size:11px;color:#8892A4;margin-top:2px'>{a.get("detail","")[:120]}</div>
+            </div>"""
+        shown += 1
+    if not journal_rows:
+        journal_rows = "<div style='color:#4A5878;padding:24px;text-align:center'>No events yet</div>"
 
-    assets_html=""
+    # Assets grid
+    assets_rows = ""
     for a_name in ASSET_NAMES:
         with candle_cache_lock:
-            cache=candle_cache.get(a_name,[])
-        price=cache[-1]["c"] if cache else 0
-        last_dt=cache[-1]["dt"] if cache else "?"
-        st="OPEN" if a_name in pos else "READY"
-        sc="#00D68F" if a_name in pos else "#4A5878"
-        assets_html+=(f"<div style='display:flex;justify-content:space-between;"
-                       f"padding:6px 0;border-bottom:1px solid #1A2236;font-size:12px'>"
-                       f"<b>{a_name}</b>"
-                       f"<span style='color:#8892A4'>${price:,.4f}</span>"
-                       f"<span style='color:#6B7A99'>{last_dt}</span>"
-                       f"<span style='color:{sc}'>{st}</span></div>")
+            cache = candle_cache.get(a_name,[])
+        price = cache[-1]["c"] if cache else 0
+        last_dt = cache[-1]["dt"] if cache else "?"
+        is_open = a_name in pos
+        status_color = "#00D68F" if is_open else "#4A5878"
+        status = "● OPEN" if is_open else "○ READY"
+        assets_rows += f"""<div style='display:flex;justify-content:space-between;align-items:center;
+            padding:10px 0;border-bottom:1px solid #1A2236;font-size:13px'>
+          <b style='width:50px'>{a_name}</b>
+          <span style='color:#E0E6F0;font-weight:600'>${price:,.4f}</span>
+          <span style='color:#4A5878;font-size:11px'>{last_dt}</span>
+          <span style='color:{status_color};font-size:11px;font-weight:600'>{status}</span>
+        </div>"""
 
-    return f"""<!DOCTYPE html><html><head>
-  <title>CB Trader v26</title><meta charset=utf-8>
-  <meta name=viewport content='width=device-width,initial-scale=1'>
-  <meta http-equiv=refresh content=30>
-  <style>
-    *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;padding:16px;max-width:600px;margin:0 auto}}
-    .card{{background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:14px;margin-bottom:8px}}
-    .grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px}}
-    @media(min-width:480px){{.grid{{grid-template-columns:repeat(4,1fr)}}}}
-    .metric{{background:#0D1421;border:1px solid #1A2236;border-radius:8px;padding:10px;text-align:center}}
-    .mv{{font-size:20px;font-weight:700;margin-top:4px}}
-    .ml{{font-size:10px;color:#4A5878;text-transform:uppercase;letter-spacing:.8px}}
-    .tabs{{display:flex;overflow-x:auto;gap:4px;margin-bottom:0}}
-    .tab{{flex-shrink:0;padding:8px 14px;cursor:pointer;border-radius:6px 6px 0 0;
-          font-size:12px;font-weight:600;background:#060D1A;color:#4A5878;border:1px solid #1A2236}}
-    .tab.active{{background:#0D1421;color:#E0E6F0}}
-    .sec{{display:none;background:#0D1421;border:1px solid #1A2236;
-          border-radius:0 8px 8px 8px;padding:12px}}
-    .sec.active{{display:block}}
-  </style>
-  <script>
-    function show(id,el){{
-      document.querySelectorAll('.sec').forEach(s=>s.classList.remove('active'));
-      document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-      document.getElementById(id).classList.add('active');
-      el.classList.add('active');
-    }}
-  </script>
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    return f"""<!DOCTYPE html>
+<html><head>
+<title>CB Trader v29</title>
+<meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1'>
+<meta http-equiv=refresh content=30>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+       padding:12px;max-width:600px;margin:0 auto;padding-bottom:40px}}
+  .hdr{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px}}
+  .title{{font-size:22px;font-weight:800;letter-spacing:-0.5px}}
+  .mode{{font-size:12px;font-weight:700;margin-top:2px}}
+  .meta{{text-align:right;font-size:11px;color:#4A5878;line-height:1.6}}
+  .kpis{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}}
+  @media(min-width:400px){{.kpis{{grid-template-columns:repeat(4,1fr)}}}}
+  .kpi{{background:#0D1421;border:1px solid #1A2236;border-radius:10px;padding:12px;text-align:center}}
+  .kpi-label{{font-size:10px;color:#4A5878;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}}
+  .kpi-val{{font-size:22px;font-weight:800}}
+  .tabs{{display:flex;gap:4px;margin-bottom:0;overflow-x:auto;-webkit-overflow-scrolling:touch}}
+  .tab{{flex-shrink:0;padding:9px 16px;cursor:pointer;border-radius:8px 8px 0 0;
+        font-size:13px;font-weight:600;background:#060D1A;color:#4A5878;
+        border:1px solid #1A2236;border-bottom:none;-webkit-tap-highlight-color:transparent}}
+  .tab.on{{background:#0D1421;color:#E0E6F0;border-color:#1A2236}}
+  .panel{{display:none;background:#0D1421;border:1px solid #1A2236;
+          border-radius:0 8px 8px 8px;padding:12px;min-height:200px}}
+  .panel.on{{display:block}}
+  .link{{color:#8892A4;font-size:12px;text-decoration:none}}
+  .link:hover{{color:#E0E6F0}}
+  .divider{{height:1px;background:#1A2236;margin:8px 0}}
+</style>
+<script>
+function show(id,el){{
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  document.getElementById(id).classList.add('on');
+  el.classList.add('on');
+}}
+</script>
 </head><body>
-  <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:16px'>
-    <div>
-      <div style='font-size:20px;font-weight:700'>CB Trader v26</div>
-      <div style='font-size:12px;color:{mode_color};font-weight:700'>{mode_label}</div>
-    </div>
-    <div style='text-align:right;font-size:11px;color:#4A5878'>
-      Cycle #{s['cycle']}<br>
-      <a href='/logout' style='color:#4A5878;text-decoration:none'>logout</a>
-    </div>
+
+<div class=hdr>
+  <div>
+    <div class=title>CB Trader</div>
+    <div class=mode style='color:{mode_color}'>{mode_label}</div>
   </div>
-  <div class=grid>
-    <div class=metric><div class=ml>Balance</div><div class=mv>${bal:,.2f}</div></div>
-    <div class=metric><div class=ml>Weekly P&L</div>
-      <div class=mv style='color:{wk_color}'>${s['weekly_pnl']:+,.2f}</div></div>
-    <div class=metric><div class=ml>Open</div><div class=mv>{len(pos)}</div></div>
-    <div class=metric><div class=ml>Trades</div>
-      <div class=mv>{s['total_trades']} <span style='font-size:12px;color:#4A5878'>({wr}%)</span></div></div>
+  <div class=meta>
+    {now_utc}<br>
+    Cycle #{s['cycle']} · {s['total_trades']} trades
   </div>
-  <div class=tabs>
-    <span class='tab active' onclick="show('positions',this)">Positions</span>
-    <span class=tab onclick="show('journal',this)">Journal</span>
-    <span class=tab onclick="show('assets',this)">Assets</span>
-    <span class=tab onclick="show('diag',this)">Diag</span>
+</div>
+
+<div class=kpis>
+  <div class=kpi>
+    <div class=kpi-label>Balance</div>
+    <div class=kpi-val>${bal:,.2f}</div>
   </div>
-  <div id=positions class='sec active'>{pos_html}</div>
-  <div id=journal class=sec>{journal_html or "<div style='color:#4A5878;padding:16px'>No events yet</div>"}</div>
-  <div id=assets class=sec>{assets_html}</div>
-  <div id=diag class=sec>
-    <a href='/diagnostic-raw' style='color:#8892A4;font-size:12px'>📥 Diagnostic JSON</a>
-    &nbsp;|&nbsp;
-    <a href='/tax-export' style='color:#8892A4;font-size:12px'>📊 Tax CSV</a>
-    &nbsp;|&nbsp;
-    <a href='/health' style='color:#8892A4;font-size:12px'>🔍 Health</a>
+  <div class=kpi>
+    <div class=kpi-label>This Week</div>
+    <div class=kpi-val style='color:{wk_color}'>${s["weekly_pnl"]:+,.2f}</div>
   </div>
+  <div class=kpi>
+    <div class=kpi-label>Total P&L</div>
+    <div class=kpi-val style='color:{tot_color}'>${s["total_pnl"]:+,.2f}</div>
+  </div>
+  <div class=kpi>
+    <div class=kpi-label>Win Rate</div>
+    <div class=kpi-val>{wr}%</div>
+  </div>
+</div>
+
+<div class=kpis style='margin-bottom:16px'>
+  <div class=kpi>
+    <div class=kpi-label>Open Positions</div>
+    <div class=kpi-val style='color:{"#00D68F" if len(pos)>0 else "#4A5878"}'>{len(pos)}</div>
+  </div>
+  <div class=kpi>
+    <div class=kpi-label>WS Status</div>
+    <div class=kpi-val style='font-size:14px;color:{"#00D68F" if s["ws_connected"] else "#FF4757"}'>{"● Live" if s["ws_connected"] else "● Down"}</div>
+  </div>
+  <div class=kpi>
+    <div class=kpi-label>Last Candle</div>
+    <div class=kpi-val style='font-size:13px;color:#8892A4'>{s["ws_last_candle"]}</div>
+  </div>
+  <div class=kpi>
+    <div class=kpi-label>Loop Errors</div>
+    <div class=kpi-val style='color:{"#FF4757" if s["loop_errors"]>0 else "#00D68F"}'>{s["loop_errors"]}</div>
+  </div>
+</div>
+
+<div class=tabs>
+  <span class='tab on' onclick="show('pos',this)">Positions</span>
+  <span class=tab onclick="show('journal',this)">Journal</span>
+  <span class=tab onclick="show('assets',this)">Markets</span>
+  <span class=tab onclick="show('info',this)">Info</span>
+</div>
+
+<div id=pos class='panel on'>{pos_rows}</div>
+
+<div id=journal class=panel>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:8px'>Last 100 events (auto-refresh 30s)</div>
+  {journal_rows}
+</div>
+
+<div id=assets class=panel>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:8px'>15 assets · updates every 5 min</div>
+  {assets_rows}
+</div>
+
+<div id=info class=panel>
+  <div style='font-size:13px;line-height:1.8;color:#8892A4'>
+    <b style='color:#E0E6F0'>Strategy</b><br>
+    EMA 5/13/34 · Sep ≥0.2% · Vol ≥0.3x · 8-bar breakout<br>
+    Trail 0.3% · ATR buffer 1.0x · 5-min candles<br>
+    <div class=divider></div>
+    <b style='color:#E0E6F0'>Exchange</b><br>
+    Coinbase CFM Futures (CFTC regulated)<br>
+    10x leverage · 15 assets<br>
+    <div class=divider></div>
+    <b style='color:#E0E6F0'>Backtest (5yr)</b><br>
+    263/263 green weeks · $339k net · $1,290/wk avg<br>
+    <div class=divider></div>
+    <b style='color:#E0E6F0'>Links</b><br>
+    <a href='/health' class=link>Health check</a> &nbsp;·&nbsp;
+    <a href='/diagnostic-raw' class=link>Diagnostic</a> &nbsp;·&nbsp;
+    <a href='/tax-export' class=link>Tax CSV</a>
+  </div>
+</div>
+
 </body></html>"""
 
 # ══════════════════════════════════════════════════════════════════
