@@ -83,6 +83,9 @@ state = {
     # PERP strategy stats
     "p_balance": TOTAL_USDC, "p_weekly_pnl": 0.0, "p_total_pnl": 0.0,
     "p_wins": 0, "p_total_trades": 0,
+    "skipped_assets": [],
+    "skip_streak":    {},
+    "api_errors":     {},
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -160,19 +163,24 @@ def fetch_candles(asset, use_perp=False):
         client = get_cb_client()
         product_id = ASSETS[asset]["perp"] if use_perp else ASSETS[asset]["spot"]
         end   = int(time.time())
-        start = end - CANDLE_LIMIT * 5 * 60
+        start = end - 300 * 5 * 60
         resp  = client.get_candles(product_id, start=str(start),
                                    end=str(end), granularity=CANDLE_TF)
-        if not resp.candles: return None
+        if not resp.candles:
+            log(f"WARNING {asset}: API returned 0 candles")
+            return None
         candles = sorted([{
             "ts": int(c.start)*1000,
             "dt": datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             "o":float(c.open),"h":float(c.high),
-            "l":float(c.low), "c":float(c.close),"v":float(c.volume),
+            "l":float(c.low),"c":float(c.close),"v":float(c.volume),
         } for c in resp.candles], key=lambda x:x["ts"])[-CANDLE_LIMIT:]
+        if candles and candles[-1]["c"] == 0:
+            log(f"WARNING {asset}: last candle close=0 dead feed")
+            return None
         return candles
     except Exception as e:
-        log(f"Candle fetch error {asset}: {e}")
+        log(f"WARNING {asset}: candle fetch failed {e}")
         return None
 
 def place_market_order(asset, side, contracts):
@@ -294,7 +302,10 @@ def enter_position(asset, direction, entry_price, candle):
     side = "BUY" if direction=="LONG" else "SELL"
     oid  = place_market_order(asset, side, contracts)
     if not oid and not PAPER_MODE:
-        log(f"⚠️ {asset} entry order rejected")
+        msg = f"{asset} {side} {contracts} contracts rejected by Coinbase"
+        log(f"CRITICAL order rejected: {msg}")
+        add_audit(asset, "ORDER REJECTED", msg)
+        ntfy(f"CRITICAL ORDER REJECTED {asset}", msg, priority="urgent")
         return
     positions[asset] = {
         "direction":direction, "entry":entry_price,
@@ -366,10 +377,27 @@ def trading_loop():
                     f"open={len(positions)} positions | pending={list(pending_entry.keys())}")
 
                 # ── SEQUENTIAL: process one asset at a time ──────────
+                skipped_assets = []
                 for asset in ASSET_NAMES:
                     try:
                         candles = fetch_candles(asset)
-                        if not candles or len(candles) < 200: continue
+                        if not candles or len(candles) < 200:
+                            cnt = len(candles) if candles else 0
+                            skipped_assets.append(f"{asset}({cnt})")
+                            add_audit(asset, "SKIPPED",
+                                      f"only {cnt} candles after 300 fetch — need 200 complete")
+                            with lock:
+                                streak = state["skip_streak"].get(asset, 0) + 1
+                                state["skip_streak"][asset] = streak
+                            if streak == 3:
+                                msg = f"{asset} skipped 3 cycles — only {cnt} candles from 300 fetch"
+                                ntfy(f"WARNING {asset} skipping", msg, priority="high")
+                            continue
+                        with lock:
+                            if state["skip_streak"].get(asset, 0) > 0:
+                                if state["skip_streak"].get(asset, 0) >= 3:
+                                    ntfy(f"{asset} recovered", f"{asset} candles back to normal", priority="default")
+                                state["skip_streak"][asset] = 0
 
                         cur = candles[-1]
                         at  = atr_calc([c["h"] for c in candles],
@@ -470,14 +498,27 @@ def trading_loop():
                         log(f"Perp strategy error {asset}: {e}")
 
                 # ── Heartbeat after all assets processed ─────────────
+                if skipped_assets:
+                    log(f"⚠️ Skipped assets (insufficient candles): {skipped_assets}")
+                    with lock:
+                        state["skipped_assets"] = skipped_assets
+                else:
+                    with lock:
+                        state["skipped_assets"] = []
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
                           f"pending={list(pending_entry.keys())} | "
+                          f"skipped={skipped_assets} | "
                           f"balance=${state['balance']:,.2f} | trades={state['total_trades']}")
 
         except Exception as e:
-            with lock: state["loop_errors"] = state.get("loop_errors",0)+1
-            log(f"Loop error: {e}")
+            with lock:
+                state["loop_errors"] = state.get("loop_errors",0)+1
+                errs = state["loop_errors"]
+            log(f"Loop error {errs}: {e}")
+            if errs in (3, 10, 25):
+                pri = "urgent" if errs >= 10 else "high"
+                ntfy(f"CRITICAL loop errors: {errs}", f"Loop error #{errs}: {str(e)[:100]}", priority=pri)
 
         time.sleep(30)
 
@@ -527,6 +568,7 @@ def start_websocket():
     except Exception as e:
         log(f"WebSocket error: {e}")
         with lock: state["ws_connected"] = False
+        ntfy("WARNING WebSocket dropped", f"WS error: {str(e)[:100]}", priority="high")
 
 # ══════════════════════════════════════════════════════════════════
 # FLASK DASHBOARD
@@ -574,6 +616,8 @@ def health():
         "candle_cache": {a:{"candles":200,"last":state.get("ws_last_candle","?")} for a in ASSET_NAMES},
         "websocket":  {"last_candle":s["ws_last_candle"],
                        "status":"✅ Connected" if s["ws_connected"] else "❌ Down"},
+        "skipped_assets": s.get("skipped_assets",[]),
+        "skip_streaks": {k:v for k,v in s.get("skip_streak",{}).items() if v>0},
         "trading_loop":{"errors":s.get("loop_errors",0),"last_run":s["loop_last_run"],
                         "status":"✅ OK" if s.get("loop_errors",0)<5 else "❌ errors"},
         "diagnostic": {"entries":len(json.load(open(DIAG_FILE))) if os.path.exists(DIAG_FILE) else 0,
@@ -730,6 +774,7 @@ function show(id,el){{
 </script>
 </head><body>
 
+{'' if not s.get('skipped_assets') else "<div style='background:#FF475722;border:1px solid #FF4757;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#FF4757'><b>⚠️ SKIPPED ASSETS</b> — not enough candles: "+ ', '.join(s.get('skipped_assets',[])) + "<br>These assets are NOT evaluated this cycle.</div>"}
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px'>
   <div>
     <div style='font-size:24px;font-weight:800;letter-spacing:-0.5px'>CB Trader</div>
