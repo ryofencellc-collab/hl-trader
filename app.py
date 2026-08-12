@@ -68,9 +68,11 @@ TAX_FILE    = "/tmp/cb_trades.csv"
 # ══════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════
-positions     = {}   # asset -> pos dict
-pending_entry = {}   # asset -> {direction, signal_ts}
-lock          = threading.Lock()
+positions       = {}  # SPOT strategy positions
+pending_entry   = {}  # SPOT strategy pending
+positions_p     = {}  # PERP strategy positions
+pending_entry_p = {}  # PERP strategy pending
+lock            = threading.Lock()
 
 state = {
     "balance": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
@@ -531,6 +533,16 @@ def start_websocket():
 # ══════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
+@app.route("/login", methods=["POST"])
+def login():
+    from flask import make_response
+    pw = request.form.get("pw","")
+    if pw == "3757":
+        resp = make_response(redirect("/"))
+        resp.set_cookie("auth", "3757", max_age=60*60*24*30)
+        return resp
+    return redirect("/")
+
 @app.route("/health")
 def health():
     with lock: s=dict(state)
@@ -582,7 +594,25 @@ def tax_export():
 
 @app.route("/")
 def dashboard():
+    if request.cookies.get("auth") != "3757":
+        return """<!DOCTYPE html><html><head><title>CB Trader</title>
+<meta name=viewport content='width=device-width,initial-scale=1'>
+<style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center;padding:40px;background:#0A1628;border:1px solid #1E2D45;border-radius:12px}
+input{background:#060D1A;border:1px solid #1E2D45;color:#E0E6F0;padding:12px;
+border-radius:8px;margin:10px 0;width:200px;font-size:16px;display:block}
+button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius:8px;
+cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
+h2{margin-bottom:20px;font-size:20px}</style></head>
+<body><form method=post action=/login class=box>
+<h2>CB Trader</h2>
+<input type=password name=pw placeholder='Password' autofocus>
+<button type=submit>Login</button>
+</form></body></html>"""
     with lock: s=dict(state); pos=dict(positions); pend=dict(pending_entry)
+    pos_p  = dict(positions_p)
+    pend_p = dict(pending_entry_p)
     wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
     mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
     mode_label = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
@@ -744,9 +774,9 @@ function show(id,el){{
 </div>
 <div class=kpis style='margin-bottom:14px'>
   <div class=kpi><div class=kpi-l>Open</div>
-    <div class=kpi-v style='color:{"#00D68F" if len(positions_p)>0 else "#4A5878"}'>{len(positions_p)}</div></div>
+    <div class=kpi-v style='color:{"#00D68F" if len(pos_p)>0 else "#4A5878"}'>{len(pos_p)}</div></div>
   <div class=kpi><div class=kpi-l>Pending</div>
-    <div class=kpi-v style='color:{"#FFB800" if pending_entry_p else "#4A5878"}'>{len(pending_entry_p)}</div></div>
+    <div class=kpi-v style='color:{"#FFB800" if pend_p else "#4A5878"}'>{len(pend_p)}</div></div>
   <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s["p_total_trades"]}</div></div>
   <div class=kpi><div class=kpi-l>WS</div><div class=kpi-v style='font-size:12px;color:{"#00D68F" if s["ws_connected"] else "#FF4757"}'>{"● Live" if s["ws_connected"] else "● Down"}</div></div>
 </div>
