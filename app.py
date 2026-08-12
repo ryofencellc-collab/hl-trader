@@ -78,6 +78,9 @@ state = {
     "ws_last_candle": "never", "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
     "wins": 0, "total_trades": 0,
+    # PERP strategy stats
+    "p_balance": TOTAL_USDC, "p_weekly_pnl": 0.0, "p_total_pnl": 0.0,
+    "p_wins": 0, "p_total_trades": 0,
 }
 
 # ══════════════════════════════════════════════════════════════════
@@ -150,10 +153,10 @@ def get_cb_client():
     from coinbase.rest import RESTClient
     return RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
 
-def fetch_candles(asset):
+def fetch_candles(asset, use_perp=False):
     try:
         client = get_cb_client()
-        product_id = ASSETS[asset]["spot"]
+        product_id = ASSETS[asset]["perp"] if use_perp else ASSETS[asset]["spot"]
         end   = int(time.time())
         start = end - CANDLE_LIMIT * 5 * 60
         resp  = client.get_candles(product_id, start=str(start),
@@ -404,6 +407,66 @@ def trading_loop():
                     except Exception as e:
                         log(f"Asset error {asset}: {e}")
 
+                # ── PERP STRATEGY: same logic, CFM futures candles ────
+                for asset in ASSET_NAMES:
+                    try:
+                        candles = fetch_candles(asset, use_perp=True)
+                        if not candles or len(candles) < 200: continue
+                        cur = candles[-1]
+                        at  = atr_calc([c["h"] for c in candles],
+                                       [c["l"] for c in candles],
+                                       [c["c"] for c in candles])
+                        av  = at[-1] or 0
+                        pos = positions_p.get(asset)
+                        if pos:
+                            result = check_trail(pos, cur, av)
+                            if result == "EXIT":
+                                pnl = round(
+                                    (pos["trail_stop"]-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                                    else (pos["entry"]-pos["trail_stop"])*pos["size"], 4)
+                                with lock:
+                                    state["p_total_pnl"]   = round(state["p_total_pnl"]+pnl, 4)
+                                    state["p_weekly_pnl"]  = round(state["p_weekly_pnl"]+pnl, 4)
+                                    state["p_balance"]     = round(TOTAL_USDC+state["p_total_pnl"], 4)
+                                    state["p_total_trades"] += 1
+                                    if pnl>=0: state["p_wins"]+=1
+                                del positions_p[asset]
+                                add_audit(asset, f"{'✅' if pnl>=0 else '❌'} [PERP] EXIT",
+                                          f"{pos['direction']} ${pos['entry']:,.4f} → ${pos['trail_stop']:,.4f} | P&L=${pnl:+,.4f}", candle=cur)
+                            continue
+                        pend = pending_entry_p.get(asset)
+                        if pend:
+                            entry_price = float(cur["o"])
+                            direction   = pend["direction"]
+                            del pending_entry_p[asset]
+                            cs        = ASSETS[asset]["contract"]
+                            cap       = TOTAL_USDC / len(ASSET_NAMES)
+                            contracts = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
+                            size      = contracts * cs
+                            trail_stop = round_price(
+                                entry_price*(1-TRAIL_PCT) if direction=="LONG"
+                                else entry_price*(1+TRAIL_PCT))
+                            positions_p[asset] = {
+                                "direction":direction, "entry":entry_price,
+                                "contracts":contracts, "size":size,
+                                "trail_peak":entry_price, "trail_stop":trail_stop,
+                                "entry_time":ts(),
+                            }
+                            add_audit(asset, f"📊 [PERP] ENTER {direction}",
+                                      f"entry=${entry_price:,.4f} | perp candles used", candle=cur)
+                            continue
+                        direction, sig_candle, indic = evaluate_signal(candles)
+                        if direction:
+                            pending_entry_p[asset] = {
+                                "direction": direction,
+                                "signal_ts": candles[-2]["ts"]
+                            }
+                            add_audit(asset, f"🚨 [PERP] SIGNAL {direction}",
+                                      f"signal_candle={sig_candle['dt']} | sep={indic.get('sep')} | vol={indic.get('vol')}x",
+                                      candle=sig_candle, indicators=indic)
+                    except Exception as e:
+                        log(f"Perp strategy error {asset}: {e}")
+
                 # ── Heartbeat after all assets processed ─────────────
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
@@ -480,6 +543,20 @@ def health():
         "total_pnl":  f"${s['total_pnl']:+,.2f}",
         "trades":     s["total_trades"],
         "win_rate":   f"{wr}%",
+        "spot_strategy": {
+            "open_positions": list(positions.keys()),
+            "pending_entries": list(pending_entry.keys()),
+            "total_pnl": f"${state['total_pnl']:+,.2f}",
+            "trades": state['total_trades'],
+            "win_rate": f"{round(state['wins']/state['total_trades']*100,1) if state['total_trades'] else 0}%",
+        },
+        "perp_strategy": {
+            "open_positions": list(positions_p.keys()),
+            "pending_entries": list(pending_entry_p.keys()),
+            "total_pnl": f"${state['p_total_pnl']:+,.2f}",
+            "trades": state['p_total_trades'],
+            "win_rate": f"{round(state['p_wins']/state['p_total_trades']*100,1) if state['p_total_trades'] else 0}%",
+        },
         "open_positions": list(positions.keys()),
         "pending_entries": list(pending_entry.keys()),
         "candle_cache": {a:{"candles":200,"last":state.get("ws_last_candle","?")} for a in ASSET_NAMES},
@@ -636,6 +713,7 @@ function show(id,el){{
   </div>
 </div>
 
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.8px'>📈 Spot Candles Strategy</div>
 <div class=kpis>
   <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
   <div class=kpi><div class=kpi-l>This Week</div>
@@ -644,7 +722,6 @@ function show(id,el){{
     <div class=kpi-v style='color:{tot_color}'>${s["total_pnl"]:+,.2f}</div></div>
   <div class=kpi><div class=kpi-l>Win Rate</div><div class=kpi-v>{wr}%</div></div>
 </div>
-
 <div class=kpis style='margin-bottom:14px'>
   <div class=kpi><div class=kpi-l>Open</div>
     <div class=kpi-v style='color:{"#00D68F" if len(pos)>0 else "#4A5878"}'>{len(pos)}</div></div>
@@ -652,6 +729,26 @@ function show(id,el){{
     <div class=kpi-v style='color:{"#FFB800" if pend else "#4A5878"}'>{len(pend)}</div></div>
   <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s["total_trades"]}</div></div>
   <div class=kpi><div class=kpi-l>Cycle</div><div class=kpi-v style='font-size:14px;color:#4A5878'>#{s.get("cycle",0)}</div></div>
+</div>
+
+<div style='height:1px;background:#1E2D45;margin:10px 0'></div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.8px'>📉 Perp Candles Strategy</div>
+<div class=kpis>
+  <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['p_balance']:,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>This Week</div>
+    <div class=kpi-v style='color:{"#00D68F" if s["p_weekly_pnl"]>=0 else "#FF4757"}'>${s["p_weekly_pnl"]:+,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>Total P&L</div>
+    <div class=kpi-v style='color:{"#00D68F" if s["p_total_pnl"]>=0 else "#FF4757"}'>${s["p_total_pnl"]:+,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>Win Rate</div>
+    <div class=kpi-v>{"%.1f" % (s["p_wins"]/s["p_total_trades"]*100) if s["p_total_trades"] else 0}%</div></div>
+</div>
+<div class=kpis style='margin-bottom:14px'>
+  <div class=kpi><div class=kpi-l>Open</div>
+    <div class=kpi-v style='color:{"#00D68F" if len(positions_p)>0 else "#4A5878"}'>{len(positions_p)}</div></div>
+  <div class=kpi><div class=kpi-l>Pending</div>
+    <div class=kpi-v style='color:{"#FFB800" if pending_entry_p else "#4A5878"}'>{len(pending_entry_p)}</div></div>
+  <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s["p_total_trades"]}</div></div>
+  <div class=kpi><div class=kpi-l>WS</div><div class=kpi-v style='font-size:12px;color:{"#00D68F" if s["ws_connected"] else "#FF4757"}'>{"● Live" if s["ws_connected"] else "● Down"}</div></div>
 </div>
 
 <div class=tabs>
