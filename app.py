@@ -493,10 +493,25 @@ def trading_loop():
                             direction   = pend["direction"]
                             del pending_entry[asset]
                             enter_position(asset, direction, entry_price, cur)
-                            # Save sim data — entry executed
+                            # Build position snapshot directly — don't rely on positions dict
+                            # which may be modified by WebSocket between enter and save
+                            cs_  = ASSETS[asset]["contract"]
+                            cap_ = TOTAL_USDC / len(ASSET_NAMES)
+                            cts_ = max(1, int((cap_ * LEVERAGE) / (entry_price * cs_)))
+                            pos_snapshot = {
+                                "direction":  direction,
+                                "entry":      entry_price,
+                                "contracts":  cts_,
+                                "size":       cts_ * cs_,
+                                "trail_peak": entry_price,
+                                "trail_stop": round_price(
+                                    entry_price*(1-TRAIL_PCT) if direction=="LONG"
+                                    else entry_price*(1+TRAIL_PCT)),
+                                "entry_time": ts(),
+                            }
                             save_sim_data(asset, current_bucket*1000, candles, {},
                                          f"ENTER_{direction}",
-                                         position=positions.get(asset))
+                                         position=pos_snapshot)
                             continue
 
                         # 3. Evaluate signal
