@@ -576,7 +576,16 @@ def start_websocket():
                         av = 0  # ATR not available here, use 0
                         result = check_trail(pos, cur, av)
                         if result == "EXIT":
-                            exit_position(asset, pos["trail_stop"], cur)
+                            exit_price = pos["trail_stop"]
+                            pnl_est = round(
+                                (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                                else (pos["entry"]-exit_price)*pos["size"], 4)
+                            # Save exit to sim data before position is deleted
+                            save_sim_data(asset, int(float(c["start"]))*1000, [],
+                                         {}, "EXIT_TRAIL_WS",
+                                         position=dict(pos), pnl=pnl_est)
+                            exit_position(asset, exit_price, cur)
+                            skip_entry[asset] = 1
             except Exception as e:
                 log(f"WS error: {e}")
 
