@@ -71,6 +71,7 @@ TAX_FILE    = "/tmp/cb_trades.csv"
 # ══════════════════════════════════════════════════════════════════
 positions       = {}  # SPOT strategy positions
 pending_entry   = {}  # SPOT strategy pending
+skip_entry      = {}  # SPOT strategy skip — asset: buckets_to_skip
 # PERP strategy removed in v33
 lock            = threading.Lock()
 
@@ -455,7 +456,14 @@ def trading_loop():
                                        [c["c"] for c in candles])
                         av  = at[-1] or 0
 
-                        # 1. Trail check on open position
+                        # 1. Check skip — if we just exited, skip this bucket
+                        if skip_entry.get(asset, 0) > 0:
+                            skip_entry[asset] -= 1
+                            save_sim_data(asset, current_bucket*1000, candles, {},
+                                         f"SKIP_REENTRY({skip_entry[asset]+1} left)")
+                            continue
+
+                        # 2. Trail check on open position
                         pos = positions.get(asset)
                         if pos:
                             result = check_trail(pos, cur, av)
@@ -468,14 +476,16 @@ def trading_loop():
                                              "EXIT_TRAIL",
                                              position=dict(pos), pnl=pnl_est)
                                 exit_position(asset, exit_price, cur)
+                                # Set skip — no re-entry for 1 bucket after exit
+                                skip_entry[asset] = 1
                             else:
                                 # Save HOLD state — position open, trail not triggered
                                 save_sim_data(asset, current_bucket*1000, candles, {},
                                              "HOLD",
                                              position=dict(pos))
-                            continue
+                            continue  # never evaluate signal in same bucket as position
 
-                        # 2. Pending entry — enter at this candle's open
+                        # 3. Pending entry — enter at this candle's open
                         pend = pending_entry.get(asset)
                         if pend:
                             entry_price = float(cur["o"])
