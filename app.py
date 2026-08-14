@@ -63,21 +63,30 @@ TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
 TAX_RATE    = 0.35
 
 DIAG_FILE   = "/tmp/cb_diagnostic.json"
-DATA_FILE   = "/tmp/cb_sim_data.json"    # sim replay data — saved every bucket
+DATA_FILE_WS  = "/tmp/cb_sim_ws.json"     # WS strategy sim data
+DATA_FILE_BKT = "/tmp/cb_sim_bucket.json"  # BUCKET strategy sim data
 TAX_FILE    = "/tmp/cb_trades.csv"
 
 # ══════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════
-positions       = {}  # SPOT strategy positions
-pending_entry   = {}  # SPOT strategy pending
-skip_entry      = {}  # SPOT strategy skip — asset: buckets_to_skip
+# ── WS STRATEGY (WebSocket exits — current) ──────────────────────
+positions       = {}  # WS strategy positions
+pending_entry   = {}  # WS strategy pending
+skip_entry      = {}  # WS strategy skip
+
+# ── BUCKET STRATEGY (bucket-only exits — matches backtest) ────────
+positions_b     = {}  # BUCKET strategy positions
+pending_entry_b = {}  # BUCKET strategy pending
+skip_entry_b    = {}  # BUCKET strategy skip
 # PERP strategy removed in v33
 lock            = threading.Lock()
 sim_lock        = threading.Lock()   # separate lock for sim data file writes
 
 state = {
     "balance": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
+    "b_balance": TOTAL_USDC, "b_weekly_pnl": 0.0, "b_total_pnl": 0.0,
+    "b_wins": 0, "b_total_trades": 0,
     "week": None, "cycle": 0, "ws_connected": False,
     "ws_last_candle": "never", "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
@@ -146,7 +155,7 @@ def record_tax(asset, direction, entry_p, exit_p, size, pnl, entry_time):
 # File: DATA_FILE — appended every bucket, never overwritten
 # Download via /sim-data endpoint after 1 week of trading
 # ══════════════════════════════════════════════════════════════════
-def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None):
+def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None, data_file=None):
     """
     Saves everything needed to replay the sim and verify the app.
     Uses file locking to prevent corruption from concurrent reads/writes.
@@ -175,9 +184,10 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             "pnl": pnl,
         }
         # Use lock to prevent concurrent read/write corruption
+        target = data_file if data_file else DATA_FILE_WS
         with sim_lock:
             try:
-                existing = json.load(open(DATA_FILE))
+                existing = json.load(open(target))
                 if not isinstance(existing, list):
                     existing = []
             except:
@@ -186,10 +196,10 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             if len(existing) > 50000:
                 existing = existing[-50000:]
             # Atomic write — write to temp then rename
-            tmp = DATA_FILE + ".tmp"
+            tmp = target + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(existing, f)
-            os.replace(tmp, DATA_FILE)
+            os.replace(tmp, target)
     except Exception as e:
         log(f"sim_data save error: {e}")  # log instead of silent pass
 
@@ -404,7 +414,7 @@ def exit_position(asset, exit_price, candle):
 # Mirrors backtest exactly: one asset at a time per bucket
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
-    log("🚀 CB Trader v33 started")
+    log("🚀 CB Trader v34 started")
     log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
@@ -533,6 +543,102 @@ def trading_loop():
                     except Exception as e:
                         log(f"Asset error {asset}: {e}")
 
+                # ── BUCKET STRATEGY: same signals, bucket-only exits ──────
+                for asset in ASSET_NAMES:
+                    try:
+                        candles = fetch_candles(asset)
+                        if not candles or len(candles) < 200: continue
+
+                        cur = candles[-1]
+                        at  = atr_calc([c["h"] for c in candles],
+                                       [c["l"] for c in candles],
+                                       [c["c"] for c in candles])
+                        av  = at[-1] or 0
+
+                        # Skip check
+                        if skip_entry_b.get(asset, 0) > 0:
+                            skip_entry_b[asset] -= 1
+                            save_sim_data(asset, current_bucket*1000, candles, {},
+                                         f"SKIP_REENTRY({skip_entry_b[asset]+1} left)",
+                                         data_file=DATA_FILE_BKT)
+                            continue
+
+                        # Trail check — BUCKET ONLY, no WebSocket
+                        pos_b = positions_b.get(asset)
+                        if pos_b:
+                            result = check_trail(pos_b, cur, av)
+                            if result == "EXIT":
+                                exit_price = pos_b["trail_stop"]
+                                pnl_est = round(
+                                    (exit_price-pos_b["entry"])*pos_b["size"] if pos_b["direction"]=="LONG"
+                                    else (pos_b["entry"]-exit_price)*pos_b["size"], 4)
+                                save_sim_data(asset, current_bucket*1000, candles, {},
+                                             "EXIT_TRAIL", position=dict(pos_b), pnl=pnl_est,
+                                             data_file=DATA_FILE_BKT)
+                                # Exit BUCKET position — update state
+                                with lock:
+                                    state["b_total_trades"] += 1
+                                    if pnl_est > 0: state["b_wins"] += 1
+                                    state["b_total_pnl"]  = round(state["b_total_pnl"]+pnl_est, 4)
+                                    state["b_weekly_pnl"] = round(state["b_weekly_pnl"]+pnl_est, 4)
+                                    state["b_balance"]    = round(TOTAL_USDC+state["b_total_pnl"], 4)
+                                add_audit(asset, f"{'✅' if pnl_est>=0 else '❌'} [BKT] EXIT TRAIL",
+                                         f"{pos_b['direction']} ${pos_b['entry']:.4f} → ${exit_price:.4f} | P&L=${pnl_est:.4f}")
+                                del positions_b[asset]
+                                skip_entry_b[asset] = 1
+                            else:
+                                save_sim_data(asset, current_bucket*1000, candles, {},
+                                             "HOLD", position=dict(pos_b),
+                                             data_file=DATA_FILE_BKT)
+                            continue
+
+                        # Pending entry
+                        pend_b = pending_entry_b.get(asset)
+                        if pend_b:
+                            entry_price = float(cur["o"])
+                            direction   = pend_b["direction"]
+                            del pending_entry_b[asset]
+                            cs_  = ASSETS[asset]["contract"]
+                            cap_ = TOTAL_USDC / len(ASSET_NAMES)
+                            cts_ = max(1, int((cap_ * LEVERAGE) / (entry_price * cs_)))
+                            trail_stop_ = round_price(
+                                entry_price*(1-TRAIL_PCT) if direction=="LONG"
+                                else entry_price*(1+TRAIL_PCT))
+                            positions_b[asset] = {
+                                "direction":  direction,
+                                "entry":      entry_price,
+                                "contracts":  cts_,
+                                "size":       cts_ * cs_,
+                                "trail_peak": entry_price,
+                                "trail_stop": trail_stop_,
+                                "entry_time": ts(),
+                            }
+                            pos_snap = dict(positions_b[asset])
+                            save_sim_data(asset, current_bucket*1000, candles, {},
+                                         f"ENTER_{direction}", position=pos_snap,
+                                         data_file=DATA_FILE_BKT)
+                            add_audit(asset, f"📊 [BKT] ENTER {direction}",
+                                     f"entry=${entry_price:.4f} | trail_stop=${trail_stop_:.4f} | PAPER")
+                            continue
+
+                        # Signal evaluation — shared with WS strategy
+                        direction, sig_candle, indic = evaluate_signal(candles)
+                        save_sim_data(asset, current_bucket*1000, candles, indic,
+                                     f"SIGNAL_{direction}" if direction else f"NO_SIGNAL:{indic.get('fail','?')}",
+                                     position=positions_b.get(asset),
+                                     data_file=DATA_FILE_BKT)
+                        if direction:
+                            pending_entry_b[asset] = {
+                                "direction": direction,
+                                "signal_ts": candles[-2]["ts"]
+                            }
+                            add_audit(asset, f"🚨 [BKT] SIGNAL {direction}",
+                                     f"signal_candle={sig_candle['dt']} | sep={indic.get('sep')} | vol={indic.get('vol')}x",
+                                     candle=sig_candle, indicators=indic)
+
+                    except Exception as e:
+                        log(f"[BKT] Asset error {asset}: {e}")
+
                 # ── Heartbeat after all assets processed ─────────────
                 if skipped_assets:
                     log(f"⚠️ Skipped assets (insufficient candles): {skipped_assets}")
@@ -649,6 +755,14 @@ def health():
             "trades": state['total_trades'],
             "win_rate": f"{round(state['wins']/state['total_trades']*100,1) if state['total_trades'] else 0}%",
         },
+        "bucket_strategy": {
+            "open_positions": list(positions_b.keys()),
+            "pending_entries": list(pending_entry_b.keys()),
+            "total_pnl": f"${state['b_total_pnl']:+,.2f}",
+            "trades": state['b_total_trades'],
+            "win_rate": f"{round(state['b_wins']/state['b_total_trades']*100,1) if state['b_total_trades'] else 0}%",
+            "balance": f"${state['b_balance']:,.2f}",
+        },
 
         "open_positions": list(positions.keys()),
         "pending_entries": list(pending_entry.keys()),
@@ -668,14 +782,25 @@ def diagnostic_raw():
     try: return Response(open(DIAG_FILE).read(), mimetype="application/json")
     except: return Response("[]", mimetype="application/json")
 
-@app.route("/sim-data")
-def sim_data():
-    """Download sim replay data as JSON"""
+@app.route("/sim-data-ws")
+def sim_data_ws():
+    """Download WS strategy sim data"""
     if request.cookies.get("auth") != "3757":
         return Response("Unauthorized", status=401)
     try:
-        return Response(open(DATA_FILE).read(), mimetype="application/json",
-                       headers={"Content-Disposition":"attachment;filename=cb_sim_data.json"})
+        return Response(open(DATA_FILE_WS).read(), mimetype="application/json",
+                       headers={"Content-Disposition":"attachment;filename=cb_sim_ws.json"})
+    except:
+        return Response("[]", mimetype="application/json")
+
+@app.route("/sim-data-bucket")
+def sim_data_bucket():
+    """Download BUCKET strategy sim data"""
+    if request.cookies.get("auth") != "3757":
+        return Response("Unauthorized", status=401)
+    try:
+        return Response(open(DATA_FILE_BKT).read(), mimetype="application/json",
+                       headers={"Content-Disposition":"attachment;filename=cb_sim_bucket.json"})
     except:
         return Response("[]", mimetype="application/json")
 
@@ -704,7 +829,10 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 <input type=password name=pw placeholder='Password' autofocus>
 <button type=submit>Login</button>
 </form></body></html>"""
-    with lock: s=dict(state); pos=dict(positions); pend=dict(pending_entry)
+    with lock:
+        s=dict(state)
+        pos=dict(positions);   pend=dict(pending_entry)
+        pos_b=dict(positions_b); pend_b=dict(pending_entry_b)
 
     wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
     mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
@@ -878,6 +1006,26 @@ function show(id,el){{
     EMA 5/13/34 · Sep ≥0.2% · Vol ≥0.3x · 8-bar breakout<br>
     Trail 0.3% · ATR 1.0x · 5-min candles · Sequential processing<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 WS STRATEGY (WebSocket exits)</div>
+<div class=kpis>
+  <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>P&L</div>
+    <div class=kpi-v style='color:{"#00D68F" if s["total_pnl"]>=0 else "#FF4757"}'>${s["total_pnl"]:+,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s['total_trades']}</div></div>
+  <div class=kpi><div class=kpi-l>WR</div><div class=kpi-v>{round(s['wins']/s['total_trades']*100,1) if s['total_trades'] else 0}%</div></div>
+  <div class=kpi><div class=kpi-l>Open</div><div class=kpi-v>{len(pos)}</div></div>
+</div>
+<div style='height:1px;background:#1E2D45;margin:10px 0'></div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>🎯 BUCKET STRATEGY (backtest logic)</div>
+<div class=kpis>
+  <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['b_balance']:,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>P&L</div>
+    <div class=kpi-v style='color:{"#00D68F" if s["b_total_pnl"]>=0 else "#FF4757"}'>${s["b_total_pnl"]:+,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s['b_total_trades']}</div></div>
+  <div class=kpi><div class=kpi-l>WR</div><div class=kpi-v>{round(s['b_wins']/s['b_total_trades']*100,1) if s['b_total_trades'] else 0}%</div></div>
+  <div class=kpi><div class=kpi-l>Open</div><div class=kpi-v>{len(pos_b)}</div></div>
+</div>
+<div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Exchange</b><br>
     Coinbase CFM Futures · CFTC regulated · Legal NYC<br>
     10x leverage · 15 assets · Contract roll Aug 28<br>
