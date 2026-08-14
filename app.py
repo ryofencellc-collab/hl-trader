@@ -74,6 +74,7 @@ pending_entry   = {}  # SPOT strategy pending
 skip_entry      = {}  # SPOT strategy skip — asset: buckets_to_skip
 # PERP strategy removed in v33
 lock            = threading.Lock()
+sim_lock        = threading.Lock()   # separate lock for sim data file writes
 
 state = {
     "balance": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
@@ -148,49 +149,49 @@ def record_tax(asset, direction, entry_p, exit_p, size, pnl, entry_time):
 def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None):
     """
     Saves everything needed to replay the sim and verify the app.
-    Saved per bucket per asset:
-      - Timestamp + datetime
-      - Last 3 candles: signal candle (complete[-2]), prev, current
-      - All indicators: EMA5/13/50, sep, vol_ratio, ATR, breakout result
-      - Decision: SIGNAL_LONG/SHORT, NO_SIGNAL:reason, ENTER, EXIT_TRAIL, SKIP
-      - Position state: entry, trail_peak, trail_stop, direction, contracts
-      - P&L on exit
+    Uses file locking to prevent corruption from concurrent reads/writes.
     """
     try:
         record = {
-            "ts":         bucket_ts,
-            "dt":         datetime.fromtimestamp(bucket_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-            "asset":      asset,
-            "decision":   decision,
+            "ts":       bucket_ts,
+            "dt":       datetime.fromtimestamp(bucket_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "asset":    asset,
+            "decision": decision,
             "candles": {
-                "signal":  candles[-3] if len(candles) >= 3 else None,
-                "prev":    candles[-2] if len(candles) >= 2 else None,
-                "current": candles[-1] if len(candles) >= 1 else None,
+                "signal":  candles[-3] if isinstance(candles, list) and len(candles) >= 3 else None,
+                "prev":    candles[-2] if isinstance(candles, list) and len(candles) >= 2 else None,
+                "current": candles[-1] if isinstance(candles, list) and len(candles) >= 1 else None,
             },
-            "indicators": indicators if indicators else {},
-            "position":   {
-                "direction":   position.get("direction"),
-                "entry":       position.get("entry"),
-                "contracts":   position.get("contracts"),
-                "size":        position.get("size"),
-                "trail_peak":  position.get("trail_peak"),
-                "trail_stop":  position.get("trail_stop"),
-                "entry_time":  position.get("entry_time"),
-            } if position else None,
+            "indicators": indicators if isinstance(indicators, dict) else {},
+            "position": {
+                "direction":  position.get("direction"),
+                "entry":      position.get("entry"),
+                "contracts":  position.get("contracts"),
+                "size":       position.get("size"),
+                "trail_peak": position.get("trail_peak"),
+                "trail_stop": position.get("trail_stop"),
+                "entry_time": position.get("entry_time"),
+            } if isinstance(position, dict) else None,
             "pnl": pnl,
         }
-        try:
-            existing = json.load(open(DATA_FILE))
-        except:
-            existing = []
-        existing.append(record)
-        # Keep last 50,000 records — ~3 days for 15 assets at 5min intervals
-        if len(existing) > 50000:
-            existing = existing[-50000:]
-        with open(DATA_FILE, "w") as f:
-            json.dump(existing, f)
+        # Use lock to prevent concurrent read/write corruption
+        with sim_lock:
+            try:
+                existing = json.load(open(DATA_FILE))
+                if not isinstance(existing, list):
+                    existing = []
+            except:
+                existing = []
+            existing.append(record)
+            if len(existing) > 50000:
+                existing = existing[-50000:]
+            # Atomic write — write to temp then rename
+            tmp = DATA_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(existing, f)
+            os.replace(tmp, DATA_FILE)
     except Exception as e:
-        pass  # never crash the app over data saving
+        log(f"sim_data save error: {e}")  # log instead of silent pass
 
 def ntfy(title, body, priority="default"):
     try:
