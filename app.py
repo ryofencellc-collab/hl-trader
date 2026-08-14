@@ -468,6 +468,11 @@ def trading_loop():
                                              "EXIT_TRAIL",
                                              position=dict(pos), pnl=pnl_est)
                                 exit_position(asset, exit_price, cur)
+                            else:
+                                # Save HOLD state — position open, trail not triggered
+                                save_sim_data(asset, current_bucket*1000, candles, {},
+                                             "HOLD",
+                                             position=dict(pos))
                             continue
 
                         # 2. Pending entry — enter at this candle's open
@@ -494,9 +499,6 @@ def trading_loop():
                                 "direction": direction,
                                 "signal_ts": candles[-2]["ts"]
                             }
-                            # Save sim data — signal fired
-                            save_sim_data(asset, current_bucket*1000, candles, indic,
-                                         f"SIGNAL_{direction}")
                             add_audit(asset, f"🚨 SIGNAL {direction}",
                                       f"signal_candle={sig_candle['dt']} | "
                                       f"sep={indic.get('sep')} | vol={indic.get('vol')}x",
