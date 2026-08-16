@@ -63,30 +63,22 @@ TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
 TAX_RATE    = 0.35
 
 DIAG_FILE   = "/tmp/cb_diagnostic.json"
-DATA_FILE_WS  = "/tmp/cb_sim_ws.json"     # WS strategy sim data
-DATA_FILE_BKT = "/tmp/cb_sim_bucket.json"  # BUCKET strategy sim data
+DATA_FILE = "/tmp/cb_sim_data.json"  # sim replay data
 TAX_FILE    = "/tmp/cb_trades.csv"
 
 # ══════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════
-# ── WS STRATEGY (WebSocket exits — current) ──────────────────────
-positions       = {}  # WS strategy positions
-pending_entry   = {}  # WS strategy pending
-skip_entry      = {}  # WS strategy skip
-
-# ── BUCKET STRATEGY (bucket-only exits — matches backtest) ────────
-positions_b     = {}  # BUCKET strategy positions
-pending_entry_b = {}  # BUCKET strategy pending
-skip_entry_b    = {}  # BUCKET strategy skip
+# ── BUCKET STRATEGY (bucket-only exits — matches backtest) ──────
+positions     = {}  # positions
+pending_entry = {}  # pending entries
+skip_entry    = {}  # skip after exit: asset -> buckets remaining
 # PERP strategy removed in v33
 lock            = threading.Lock()
 sim_lock        = threading.Lock()   # separate lock for sim data file writes
 
 state = {
     "balance": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
-    "b_balance": TOTAL_USDC, "b_weekly_pnl": 0.0, "b_total_pnl": 0.0,
-    "b_wins": 0, "b_total_trades": 0,
     "week": None, "cycle": 0, "ws_connected": False,
     "ws_last_candle": "never", "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
@@ -155,7 +147,7 @@ def record_tax(asset, direction, entry_p, exit_p, size, pnl, entry_time):
 # File: DATA_FILE — appended every bucket, never overwritten
 # Download via /sim-data endpoint after 1 week of trading
 # ══════════════════════════════════════════════════════════════════
-def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None, data_file=None):
+def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None, ):
     """
     Saves everything needed to replay the sim and verify the app.
     Uses file locking to prevent corruption from concurrent reads/writes.
@@ -184,7 +176,7 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             "pnl": pnl,
         }
         # Use lock to prevent concurrent read/write corruption
-        target = data_file if data_file else DATA_FILE_WS
+        target = DATA_FILE
         with sim_lock:
             try:
                 existing = json.load(open(target))
@@ -380,9 +372,7 @@ def enter_position(asset, direction, entry_price, candle):
               f"size={size} | trail_stop=${trail_stop:,.4f} | "
               f"{'PAPER' if PAPER_MODE else 'LIVE'}",
               candle=candle)
-    ntfy(f"{asset} {direction} ENTER",
-         f"Entry: ${entry_price:,.4f}\nSize: {size}\n"
-         f"{'PAPER' if PAPER_MODE else 'LIVE'}")
+    # ntfy removed for entries — only errors alerted
 
 def exit_position(asset, exit_price, candle):
     pos = positions.get(asset)
@@ -406,15 +396,14 @@ def exit_position(asset, exit_price, candle):
     add_audit(asset, f"{emoji} EXIT TRAIL",
               f"{pos['direction']} ${pos['entry']:,.4f} → ${exit_price:,.4f} | "
               f"P&L=${pnl:+,.4f}", candle=candle)
-    ntfy(f"{emoji} {asset} {pos['direction']} EXIT",
-         f"${pos['entry']:,.4f} → ${exit_price:,.4f}\nP&L: ${pnl:+,.4f}")
+    # ntfy removed for exits — only errors alerted
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP — SEQUENTIAL, no threads, no processing guard
 # Mirrors backtest exactly: one asset at a time per bucket
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
-    log("🚀 CB Trader v34 started")
+    log("🚀 CB Trader v35 started")
     log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
@@ -438,112 +427,8 @@ def trading_loop():
                 log(f"🕐 New candle: {bucket_dt} UTC — evaluating {len(ASSET_NAMES)} assets | "
                     f"open={len(positions)} positions | pending={list(pending_entry.keys())}")
 
-                # ── SEQUENTIAL: process one asset at a time ──────────
+                # ── BUCKET STRATEGY: bucket-only exits, matches backtest ─
                 skipped_assets = []
-                for asset in ASSET_NAMES:
-                    try:
-                        candles = fetch_candles(asset)
-                        if not candles or len(candles) < 200:
-                            cnt = len(candles) if candles else 0
-                            skipped_assets.append(f"{asset}({cnt})")
-                            add_audit(asset, "SKIPPED",
-                                      f"only {cnt} candles after 300 fetch — need 200 complete")
-                            with lock:
-                                streak = state["skip_streak"].get(asset, 0) + 1
-                                state["skip_streak"][asset] = streak
-                            if streak == 3:
-                                msg = f"{asset} skipped 3 cycles — only {cnt} candles from 300 fetch"
-                                ntfy(f"WARNING {asset} skipping", msg, priority="high")
-                            continue
-                        with lock:
-                            if state["skip_streak"].get(asset, 0) > 0:
-                                if state["skip_streak"].get(asset, 0) >= 3:
-                                    ntfy(f"{asset} recovered", f"{asset} candles back to normal", priority="default")
-                                state["skip_streak"][asset] = 0
-
-                        cur = candles[-1]
-                        at  = atr_calc([c["h"] for c in candles],
-                                       [c["l"] for c in candles],
-                                       [c["c"] for c in candles])
-                        av  = at[-1] or 0
-
-                        # 1. Check skip — if we just exited, skip this bucket
-                        if skip_entry.get(asset, 0) > 0:
-                            skip_entry[asset] -= 1
-                            save_sim_data(asset, current_bucket*1000, candles, {},
-                                         f"SKIP_REENTRY({skip_entry[asset]+1} left)")
-                            continue
-
-                        # 2. Trail check on open position
-                        pos = positions.get(asset)
-                        if pos:
-                            result = check_trail(pos, cur, av)
-                            if result == "EXIT":
-                                exit_price = pos["trail_stop"]
-                                pnl_est = round(
-                                    (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
-                                    else (pos["entry"]-exit_price)*pos["size"], 4)
-                                save_sim_data(asset, current_bucket*1000, candles, {},
-                                             "EXIT_TRAIL",
-                                             position=dict(pos), pnl=pnl_est)
-                                exit_position(asset, exit_price, cur)
-                                # Set skip — no re-entry for 1 bucket after exit
-                                skip_entry[asset] = 1
-                            else:
-                                # Save HOLD state — position open, trail not triggered
-                                save_sim_data(asset, current_bucket*1000, candles, {},
-                                             "HOLD",
-                                             position=dict(pos))
-                            continue  # never evaluate signal in same bucket as position
-
-                        # 3. Pending entry — enter at this candle's open
-                        pend = pending_entry.get(asset)
-                        if pend:
-                            entry_price = float(cur["o"])
-                            direction   = pend["direction"]
-                            del pending_entry[asset]
-                            enter_position(asset, direction, entry_price, cur)
-                            # Build position snapshot directly — don't rely on positions dict
-                            # which may be modified by WebSocket between enter and save
-                            cs_  = ASSETS[asset]["contract"]
-                            cap_ = TOTAL_USDC / len(ASSET_NAMES)
-                            cts_ = max(1, int((cap_ * LEVERAGE) / (entry_price * cs_)))
-                            pos_snapshot = {
-                                "direction":  direction,
-                                "entry":      entry_price,
-                                "contracts":  cts_,
-                                "size":       cts_ * cs_,
-                                "trail_peak": entry_price,
-                                "trail_stop": round_price(
-                                    entry_price*(1-TRAIL_PCT) if direction=="LONG"
-                                    else entry_price*(1+TRAIL_PCT)),
-                                "entry_time": ts(),
-                            }
-                            save_sim_data(asset, current_bucket*1000, candles, {},
-                                         f"ENTER_{direction}",
-                                         position=pos_snapshot)
-                            continue
-
-                        # 3. Evaluate signal
-                        direction, sig_candle, indic = evaluate_signal(candles)
-                        # Save sim data every bucket — signal or not
-                        save_sim_data(asset, current_bucket*1000, candles, indic,
-                                     f"SIGNAL_{direction}" if direction else f"NO_SIGNAL:{indic.get('fail','?')}",
-                                     position=positions.get(asset))
-                        if direction:
-                            pending_entry[asset] = {
-                                "direction": direction,
-                                "signal_ts": candles[-2]["ts"]
-                            }
-                            add_audit(asset, f"🚨 SIGNAL {direction}",
-                                      f"signal_candle={sig_candle['dt']} | "
-                                      f"sep={indic.get('sep')} | vol={indic.get('vol')}x",
-                                      candle=sig_candle, indicators=indic)
-
-                    except Exception as e:
-                        log(f"Asset error {asset}: {e}")
-
-                # ── BUCKET STRATEGY: same signals, bucket-only exits ──────
                 for asset in ASSET_NAMES:
                     try:
                         candles = fetch_candles(asset)
@@ -556,55 +441,57 @@ def trading_loop():
                         av  = at[-1] or 0
 
                         # Skip check
-                        if skip_entry_b.get(asset, 0) > 0:
-                            skip_entry_b[asset] -= 1
+                        if skip_entry.get(asset, 0) > 0:
+                            skip_entry[asset] -= 1
                             save_sim_data(asset, current_bucket*1000, candles, {},
-                                         f"SKIP_REENTRY({skip_entry_b[asset]+1} left)",
-                                         data_file=DATA_FILE_BKT)
+                                         f"SKIP_REENTRY({skip_entry[asset]+1} left)",
+                                         )
                             continue
 
                         # Trail check — BUCKET ONLY, no WebSocket
-                        pos_b = positions_b.get(asset)
-                        if pos_b:
-                            result = check_trail(pos_b, cur, av)
+                        pos = positions.get(asset)
+                        if pos:
+                            result = check_trail(pos, cur, av)
                             if result == "EXIT":
-                                exit_price = pos_b["trail_stop"]
+                                exit_price = pos["trail_stop"]
                                 pnl_est = round(
-                                    (exit_price-pos_b["entry"])*pos_b["size"] if pos_b["direction"]=="LONG"
-                                    else (pos_b["entry"]-exit_price)*pos_b["size"], 4)
+                                    (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+                                    else (pos["entry"]-exit_price)*pos["size"], 4)
                                 save_sim_data(asset, current_bucket*1000, candles, {},
-                                             "EXIT_TRAIL", position=dict(pos_b), pnl=pnl_est,
-                                             data_file=DATA_FILE_BKT)
+                                             "EXIT_TRAIL", position=dict(pos), pnl=pnl_est,
+                                             )
                                 # Exit BUCKET position — update state
                                 with lock:
-                                    state["b_total_trades"] += 1
-                                    if pnl_est > 0: state["b_wins"] += 1
-                                    state["b_total_pnl"]  = round(state["b_total_pnl"]+pnl_est, 4)
-                                    state["b_weekly_pnl"] = round(state["b_weekly_pnl"]+pnl_est, 4)
-                                    state["b_balance"]    = round(TOTAL_USDC+state["b_total_pnl"], 4)
-                                add_audit(asset, f"{'✅' if pnl_est>=0 else '❌'} [BKT] EXIT TRAIL",
-                                         f"{pos_b['direction']} ${pos_b['entry']:.4f} → ${exit_price:.4f} | P&L=${pnl_est:.4f}")
-                                del positions_b[asset]
-                                skip_entry_b[asset] = 1
+                                    state["total_trades"] += 1
+                                    if pnl_est > 0: state["wins"] += 1
+                                    state["total_pnl"]  = round(state["total_pnl"]+pnl_est, 4)
+                                    state["weekly_pnl"] = round(state["weekly_pnl"]+pnl_est, 4)
+                                    state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)
+                                add_audit(asset, f"{'✅' if pnl_est>=0 else '❌'} EXIT TRAIL",
+                                         f"{pos['direction']} ${pos['entry']:.4f} → ${exit_price:.4f} | P&L=${pnl_est:.4f}")
+                                del positions[asset]
+                                skip_entry[asset] = 1
                             else:
                                 save_sim_data(asset, current_bucket*1000, candles, {},
-                                             "HOLD", position=dict(pos_b),
-                                             data_file=DATA_FILE_BKT)
+                                             "HOLD", position=dict(pos),
+                                             )
                             continue
 
                         # Pending entry
-                        pend_b = pending_entry_b.get(asset)
-                        if pend_b:
+                        pend = pending_entry.get(asset)
+                        if pend:
                             entry_price = float(cur["o"])
-                            direction   = pend_b["direction"]
-                            del pending_entry_b[asset]
+                            direction   = pend["direction"]
+                            del pending_entry[asset]
                             cs_  = ASSETS[asset]["contract"]
-                            cap_ = TOTAL_USDC / len(ASSET_NAMES)
+                            # Compounding: use current balance, not fixed TOTAL_USDC
+                            with lock: current_balance = state["balance"]
+                            cap_ = current_balance / len(ASSET_NAMES)
                             cts_ = max(1, int((cap_ * LEVERAGE) / (entry_price * cs_)))
                             trail_stop_ = round_price(
                                 entry_price*(1-TRAIL_PCT) if direction=="LONG"
                                 else entry_price*(1+TRAIL_PCT))
-                            positions_b[asset] = {
+                            positions[asset] = {
                                 "direction":  direction,
                                 "entry":      entry_price,
                                 "contracts":  cts_,
@@ -613,11 +500,11 @@ def trading_loop():
                                 "trail_stop": trail_stop_,
                                 "entry_time": ts(),
                             }
-                            pos_snap = dict(positions_b[asset])
+                            pos_snap = dict(positions[asset])
                             save_sim_data(asset, current_bucket*1000, candles, {},
                                          f"ENTER_{direction}", position=pos_snap,
-                                         data_file=DATA_FILE_BKT)
-                            add_audit(asset, f"📊 [BKT] ENTER {direction}",
+                                         )
+                            add_audit(asset, f"📊 📊 ENTER {direction}",
                                      f"entry=${entry_price:.4f} | trail_stop=${trail_stop_:.4f} | PAPER")
                             continue
 
@@ -625,19 +512,19 @@ def trading_loop():
                         direction, sig_candle, indic = evaluate_signal(candles)
                         save_sim_data(asset, current_bucket*1000, candles, indic,
                                      f"SIGNAL_{direction}" if direction else f"NO_SIGNAL:{indic.get('fail','?')}",
-                                     position=positions_b.get(asset),
-                                     data_file=DATA_FILE_BKT)
+                                     position=positions.get(asset),
+                                     )
                         if direction:
-                            pending_entry_b[asset] = {
+                            pending_entry[asset] = {
                                 "direction": direction,
                                 "signal_ts": candles[-2]["ts"]
                             }
-                            add_audit(asset, f"🚨 [BKT] SIGNAL {direction}",
+                            add_audit(asset, f"🚨 🚨 SIGNAL {direction}",
                                      f"signal_candle={sig_candle['dt']} | sep={indic.get('sep')} | vol={indic.get('vol')}x",
                                      candle=sig_candle, indicators=indic)
 
                     except Exception as e:
-                        log(f"[BKT] Asset error {asset}: {e}")
+                        log(f"Asset error {asset}: {e}")
 
                 # ── Heartbeat after all assets processed ─────────────
                 if skipped_assets:
@@ -693,20 +580,11 @@ def start_websocket():
                                "o":float(c["open"]),"c":float(c["close"]),
                                "dt":datetime.fromtimestamp(int(float(c["start"])),
                                     tz=timezone.utc).strftime("%Y-%m-%d %H:%M")}
-                        # Quick trail check — exit if hit
-                        av = 0  # ATR not available here, use 0
+                        # WebSocket used for trail peak updates only — exits at bucket
+                        av = 0
                         result = check_trail(pos, cur, av)
                         if result == "EXIT":
-                            exit_price = pos["trail_stop"]
-                            pnl_est = round(
-                                (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
-                                else (pos["entry"]-exit_price)*pos["size"], 4)
-                            # Save exit to sim data before position is deleted
-                            save_sim_data(asset, int(float(c["start"]))*1000, [],
-                                         {}, "EXIT_TRAIL_WS",
-                                         position=dict(pos), pnl=pnl_est)
-                            exit_position(asset, exit_price, cur)
-                            skip_entry[asset] = 1
+                            pass  # BUCKET strategy exits at bucket eval, not WebSocket
             except Exception as e:
                 log(f"WS error: {e}")
 
@@ -756,12 +634,12 @@ def health():
             "win_rate": f"{round(state['wins']/state['total_trades']*100,1) if state['total_trades'] else 0}%",
         },
         "bucket_strategy": {
-            "open_positions": list(positions_b.keys()),
-            "pending_entries": list(pending_entry_b.keys()),
-            "total_pnl": f"${state['b_total_pnl']:+,.2f}",
-            "trades": state['b_total_trades'],
-            "win_rate": f"{round(state['b_wins']/state['b_total_trades']*100,1) if state['b_total_trades'] else 0}%",
-            "balance": f"${state['b_balance']:,.2f}",
+            "open_positions": list(positions.keys()),
+            "pending_entries": list(pending_entry.keys()),
+            "total_pnl": f"${state['total_pnl']:+,.2f}",
+            "trades": state['total_trades'],
+            "win_rate": f"{round(state['wins']/state['total_trades']*100,1) if state['total_trades'] else 0}%",
+            "balance": f"${state['balance']:,.2f}",
         },
 
         "open_positions": list(positions.keys()),
@@ -782,25 +660,14 @@ def diagnostic_raw():
     try: return Response(open(DIAG_FILE).read(), mimetype="application/json")
     except: return Response("[]", mimetype="application/json")
 
-@app.route("/sim-data-ws")
-def sim_data_ws():
-    """Download WS strategy sim data"""
+@app.route("/sim-data")
+def sim_data():
+    """Download sim replay data"""
     if request.cookies.get("auth") != "3757":
         return Response("Unauthorized", status=401)
     try:
-        return Response(open(DATA_FILE_WS).read(), mimetype="application/json",
-                       headers={"Content-Disposition":"attachment;filename=cb_sim_ws.json"})
-    except:
-        return Response("[]", mimetype="application/json")
-
-@app.route("/sim-data-bucket")
-def sim_data_bucket():
-    """Download BUCKET strategy sim data"""
-    if request.cookies.get("auth") != "3757":
-        return Response("Unauthorized", status=401)
-    try:
-        return Response(open(DATA_FILE_BKT).read(), mimetype="application/json",
-                       headers={"Content-Disposition":"attachment;filename=cb_sim_bucket.json"})
+        return Response(open(DATA_FILE).read(), mimetype="application/json",
+                       headers={"Content-Disposition":"attachment;filename=cb_sim_data.json"})
     except:
         return Response("[]", mimetype="application/json")
 
@@ -832,7 +699,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     with lock:
         s=dict(state)
         pos=dict(positions);   pend=dict(pending_entry)
-        pos_b=dict(positions_b); pend_b=dict(pending_entry_b)
+        pos=dict(positions); pend=dict(pending_entry)
 
     wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
     mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
@@ -1006,7 +873,7 @@ function show(id,el){{
     EMA 5/13/34 · Sep ≥0.2% · Vol ≥0.3x · 8-bar breakout<br>
     Trail 0.3% · ATR 1.0x · 5-min candles · Sequential processing<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 WS STRATEGY (WebSocket exits)</div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
 <div class=kpis>
   <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
   <div class=kpi><div class=kpi-l>P&L</div>
@@ -1014,16 +881,6 @@ function show(id,el){{
   <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s['total_trades']}</div></div>
   <div class=kpi><div class=kpi-l>WR</div><div class=kpi-v>{round(s['wins']/s['total_trades']*100,1) if s['total_trades'] else 0}%</div></div>
   <div class=kpi><div class=kpi-l>Open</div><div class=kpi-v>{len(pos)}</div></div>
-</div>
-<div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>🎯 BUCKET STRATEGY (backtest logic)</div>
-<div class=kpis>
-  <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['b_balance']:,.2f}</div></div>
-  <div class=kpi><div class=kpi-l>P&L</div>
-    <div class=kpi-v style='color:{"#00D68F" if s["b_total_pnl"]>=0 else "#FF4757"}'>${s["b_total_pnl"]:+,.2f}</div></div>
-  <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s['b_total_trades']}</div></div>
-  <div class=kpi><div class=kpi-l>WR</div><div class=kpi-v>{round(s['b_wins']/s['b_total_trades']*100,1) if s['b_total_trades'] else 0}%</div></div>
-  <div class=kpi><div class=kpi-l>Open</div><div class=kpi-v>{len(pos_b)}</div></div>
 </div>
 <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Exchange</b><br>
