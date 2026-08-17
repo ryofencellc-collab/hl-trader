@@ -219,9 +219,19 @@ def ntfy(title, body, priority="default"):
 # ══════════════════════════════════════════════════════════════════
 # COINBASE API
 # ══════════════════════════════════════════════════════════════════
+# Single global client — created once, reused everywhere
+# Prevents 429 rate limits from creating new connections on every call
+_cb_client = None
+_cb_client_lock = threading.Lock()
+
 def get_cb_client():
-    from coinbase.rest import RESTClient
-    return RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
+    global _cb_client
+    if _cb_client is None:
+        with _cb_client_lock:
+            if _cb_client is None:
+                from coinbase.rest import RESTClient
+                _cb_client = RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
+    return _cb_client
 
 def fetch_candles(asset, use_perp=False):
     try:
@@ -510,7 +520,7 @@ def trading_loop():
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v40 started")
+    log("🚀 CB Trader v40b started")
     log("   Mode: 🔴 LIVE")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
@@ -1044,6 +1054,7 @@ log("📡 Pre-loading candles via REST...")
 for a in ASSET_NAMES:
     c = fetch_candles(a)
     log(f"  {a}: {len(c) if c else 0} candles loaded")
+    time.sleep(0.3)  # avoid 429 rate limit on startup
 log("✅ All candles pre-loaded")
 
 check_weekly_reset()
