@@ -29,23 +29,38 @@ CB_API_KEY  = os.environ.get("CB_API_KEY",
 CB_API_SEC  = os.environ.get("CB_API_SECRET",
     "m9coUDw6sCE+7KotbjF0xEyu1I7kpCun4Ez6bEVFm6ug+jk2hGtv3CiibvIThzmeXv2F8R0Kyui5kFhxi4tweQ==")
 
+# Contract expiry dates — auto-roll checks these
+EXPIRY_AUG = "2026-08-28"
+EXPIRY_SEP = "2026-09-25"
+ROLL_DAYS_BEFORE = 5  # roll 5 days before expiry
+
 ASSETS = {
-    "BTC":  {"spot":"BTC-USD",  "perp":"BIT-28AUG26-CDE", "contract":0.01},
-    "ETH":  {"spot":"ETH-USD",  "perp":"ET-28AUG26-CDE",  "contract":0.1},
-    "SOL":  {"spot":"SOL-USD",  "perp":"SOL-28AUG26-CDE", "contract":1.0},
-    "XRP":  {"spot":"XRP-USD",  "perp":"XRP-28AUG26-CDE", "contract":100.0},
-    "DOGE": {"spot":"DOGE-USD", "perp":"DOG-28AUG26-CDE", "contract":5000.0},
-    "ADA":  {"spot":"ADA-USD",  "perp":"ADA-28AUG26-CDE", "contract":100.0},
-    "DOT":  {"spot":"DOT-USD",  "perp":"DOT-28AUG26-CDE", "contract":10.0},
-    "LINK": {"spot":"LINK-USD", "perp":"LNK-28AUG26-CDE", "contract":10.0},
-    "LTC":  {"spot":"LTC-USD",  "perp":"LC-28AUG26-CDE",  "contract":1.0},
-    "BCH":  {"spot":"BCH-USD",  "perp":"BCH-28AUG26-CDE", "contract":1.0},
-    "BNB":  {"spot":"BNB-USD",  "perp":"BNF-28AUG26-CDE", "contract":1.0},
-    "SUI":  {"spot":"SUI-USD",  "perp":"SUI-28AUG26-CDE", "contract":100.0},
-    "XLM":  {"spot":"XLM-USD",  "perp":"XLM-28AUG26-CDE", "contract":1000.0},
-    "AVAX": {"spot":"AVAX-USD", "perp":"AVA-28AUG26-CDE", "contract":10.0},
-    "HBAR": {"spot":"HBAR-USD", "perp":"HED-28AUG26-CDE", "contract":1000.0},
+    "BTC":  {"spot":"BTC-USD",  "aug":"BIT-28AUG26-CDE", "sep":"BIT-25SEP26-CDE", "contract":0.01},
+    "ETH":  {"spot":"ETH-USD",  "aug":"ET-28AUG26-CDE",  "sep":"ET-25SEP26-CDE",  "contract":0.1},
+    "SOL":  {"spot":"SOL-USD",  "aug":"SOL-28AUG26-CDE", "sep":"SOL-25SEP26-CDE", "contract":1.0},
+    "XRP":  {"spot":"XRP-USD",  "aug":"XRP-28AUG26-CDE", "sep":"XRP-25SEP26-CDE", "contract":100.0},
+    "DOGE": {"spot":"DOGE-USD", "aug":"DOG-28AUG26-CDE", "sep":"DOG-25SEP26-CDE", "contract":5000.0},
+    "ADA":  {"spot":"ADA-USD",  "aug":"ADA-28AUG26-CDE", "sep":"ADA-25SEP26-CDE", "contract":100.0},
+    "DOT":  {"spot":"DOT-USD",  "aug":"DOT-28AUG26-CDE", "sep":"DOT-25SEP26-CDE", "contract":10.0},
+    "LINK": {"spot":"LINK-USD", "aug":"LNK-28AUG26-CDE", "sep":"LNK-25SEP26-CDE", "contract":10.0},
+    "LTC":  {"spot":"LTC-USD",  "aug":"LC-28AUG26-CDE",  "sep":"LC-25SEP26-CDE",  "contract":1.0},
+    "BCH":  {"spot":"BCH-USD",  "aug":"BCH-28AUG26-CDE", "sep":"BCH-25SEP26-CDE", "contract":1.0},
+    "BNB":  {"spot":"BNB-USD",  "aug":"BNF-28AUG26-CDE", "sep":"BNF-25SEP26-CDE", "contract":1.0},
+    "SUI":  {"spot":"SUI-USD",  "aug":"SUI-28AUG26-CDE", "sep":"SUI-25SEP26-CDE", "contract":100.0},
+    "XLM":  {"spot":"XLM-USD",  "aug":"XLM-28AUG26-CDE", "sep":"XLM-25SEP26-CDE", "contract":1000.0},
+    "AVAX": {"spot":"AVAX-USD", "aug":"AVA-28AUG26-CDE", "sep":"AVA-25SEP26-CDE", "contract":10.0},
+    "HBAR": {"spot":"HBAR-USD", "aug":"HED-28AUG26-CDE", "sep":"HED-25SEP26-CDE", "contract":1000.0},
 }
+
+def get_active_ticker(asset):
+    """Returns the active futures ticker — auto-rolls 5 days before expiry"""
+    from datetime import date
+    today = date.today()
+    expiry = date(2026, 8, 28)
+    days_to_expiry = (expiry - today).days
+    if days_to_expiry <= ROLL_DAYS_BEFORE:
+        return ASSETS[asset]["sep"]
+    return ASSETS[asset]["aug"]
 ASSET_NAMES = list(ASSETS.keys())
 
 EMA_FAST    = 5
@@ -215,7 +230,7 @@ def get_cb_client():
 def fetch_candles(asset, use_perp=False):
     try:
         client = get_cb_client()
-        product_id = ASSETS[asset]["perp"] if use_perp else ASSETS[asset]["spot"]
+        product_id = get_active_ticker(asset) if use_perp else ASSETS[asset]["spot"]
         end   = int(time.time())
         start = end - 300 * 5 * 60
         resp  = client.get_candles(product_id, start=str(start),
@@ -319,7 +334,7 @@ def place_market_order(asset, side, contracts):
         return oid
     try:
         client  = get_cb_client()
-        product = ASSETS[asset]["perp"]
+        product = get_active_ticker(asset)
         size    = str(int(contracts))
         if side in ("BUY","LONG"):
             order = client.market_order_buy(
@@ -330,12 +345,22 @@ def place_market_order(asset, side, contracts):
                 client_order_id=str(uuid.uuid4()),
                 product_id=product, base_size=size)
         success = getattr(order, "success", False)
+        if isinstance(order, dict): success = order.get("success", False)
         if success:
-            oid = getattr(order, "order_id", f"CB-{asset}-{int(time.time())}")
+            oid = getattr(order, "order_id", None) or (order.get("success_response",{}).get("order_id") if isinstance(order,dict) else None) or f"CB-{asset}-{int(time.time())}"
             log(f"✅ CB order: {asset} {side} {size} → {oid}")
+            # Verify fill after 2 seconds
+            time.sleep(2)
+            try:
+                fill = client.get_order(order_id=oid)
+                status = fill.get("order",{}).get("status","?") if isinstance(fill,dict) else "?"
+                if status not in ("FILLED","OPEN"):
+                    log(f"⚠️ Order {oid} status: {status} — may not be filled")
+            except: pass
             return oid
         else:
-            log(f"⚠️ CB order failed: {asset} {getattr(order,'error_response',order)}")
+            err = getattr(order,'error_response',None) or (order.get("error_response") if isinstance(order,dict) else order)
+            log(f"⚠️ CB order failed: {asset} {err}")
             return None
     except Exception as e:
         log(f"Order error {asset}: {e}")
@@ -473,7 +498,12 @@ def exit_position(asset, exit_price, candle):
     add_audit(asset, f"{emoji} EXIT TRAIL",
               f"{pos['direction']} ${pos['entry']:,.4f} → ${exit_price:,.4f} | "
               f"P&L=${pnl:+,.4f}", candle=candle)
-    # ntfy removed for exits — only errors alerted
+    # Refresh real balance from Coinbase after every exit
+    try:
+        live_bal = get_live_balance()
+        if live_bal > 0:
+            with lock: state["balance"] = live_bal
+    except: pass
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP — SEQUENTIAL, no threads, no processing guard
@@ -489,7 +519,7 @@ def trading_loop():
         sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v36 started")
+    log("🚀 CB Trader v37 started")
     log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
@@ -633,6 +663,39 @@ def trading_loop():
                           f"pending={list(pending_entry.keys())} | "
                           f"skipped={skipped_assets} | "
                           f"balance=${state['balance']:,.2f} | trades={state['total_trades']}")
+
+                # ── Weekly P&L report — every Monday at 9am UTC ──────────
+                bucket_dt_obj = datetime.fromtimestamp(current_bucket, tz=timezone.utc)
+                if bucket_dt_obj.weekday() == 0 and bucket_dt_obj.hour == 9 and bucket_dt_obj.minute < 5:
+                    with lock:
+                        wpnl = state["weekly_pnl"]
+                        bal  = state["balance"]
+                        trd  = state["total_trades"]
+                        wr   = round(state["wins"]/trd*100,1) if trd else 0
+                    week_str = bucket_dt_obj.strftime("%Y-%m-%d")
+                    ntfy("Weekly P&L Report",
+                         f"Week: {week_str} | P&L: ${wpnl:+,.2f} | Bal: ${bal:,.2f} | Trades: {trd} | WR: {wr}%",
+                         priority="default")
+                    with lock: state["weekly_pnl"] = 0.0
+
+                # ── Emergency stop — balance below 50% ───────────────────
+                with lock:
+                    bal      = state["balance"]
+                    starting = TOTAL_USDC
+                if bal < starting * 0.5 and len(positions) == 0:
+                    ntfy("EMERGENCY Balance Alert",
+                         f"Balance ${bal:,.2f} below 50% of ${starting:,.2f} — review immediately",
+                         priority="urgent")
+
+                # ── Auto-roll check — 5 days before Aug 28 expiry ────────
+                from datetime import date as ddate
+                today      = ddate.today()
+                expiry_aug = ddate(2026, 8, 28)
+                days_left  = (expiry_aug - today).days
+                if days_left == ROLL_DAYS_BEFORE and bucket_dt_obj.hour == 9 and bucket_dt_obj.minute < 5:
+                    ntfy("Contract Roll Starting",
+                         f"Aug 28 expires in {days_left} days — auto-rolling to Sep 25 tickers",
+                         priority="high")
 
         except Exception as e:
             with lock:
