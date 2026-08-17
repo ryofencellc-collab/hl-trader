@@ -1,5 +1,5 @@
 """
-CB TRADER v38
+CB TRADER v39
 ═══════════════════════════════════════════════════════════════════
 Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
 Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
@@ -8,7 +8,7 @@ Candles:  Coinbase spot API (ADA-USD etc)
 Assets:   10 (affordable at $99 capital — scale to 15 at $1,000)
 Balance:  Reads from Coinbase on startup + after every exit + every 50 cycles
 Compounding: cap = current_balance / N_ASSETS — grows automatically with account
-PAPER_MODE: set env var PAPER_MODE=false in Railway to go live
+Mode: Always LIVE — real orders on every signal
 """
 
 import time, os, math, json, csv, uuid, threading
@@ -19,7 +19,7 @@ import requests as req
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
-PAPER_MODE  = os.environ.get("PAPER_MODE", "true").lower() != "false"
+PAPER_MODE  = False  # Always live — no paper mode
 NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "hl-trader-lunchm0ney")
 NTFY_URL    = f"https://ntfy.sh/{NTFY_TOPIC}"
 
@@ -277,7 +277,6 @@ def sync_open_positions():
     On startup, sync positions dict with any open CFM positions on Coinbase.
     Prevents the app from entering a position that's already open.
     """
-    if PAPER_MODE: return
     try:
         client = get_cb_client()
         resp = client.list_futures_positions()
@@ -318,10 +317,6 @@ def sync_open_positions():
         log(f"Position sync error: {e}")
 
 def place_market_order(asset, side, contracts):
-    if PAPER_MODE:
-        oid = f"PAPER-{asset}-{int(time.time())}"
-        log(f"📄 PAPER: {asset} {side} {contracts} contracts → {oid}")
-        return oid
     try:
         client  = get_cb_client()
         product = get_active_ticker(asset)
@@ -447,7 +442,7 @@ def enter_position(asset, direction, entry_price, candle):
         else entry_price*(1+TRAIL_PCT))
     side = "BUY" if direction=="LONG" else "SELL"
     oid  = place_market_order(asset, side, contracts)
-    if not oid and not PAPER_MODE:
+    if not oid:
         msg = f"{asset} {side} {contracts} contracts rejected by Coinbase"
         log(f"CRITICAL order rejected: {msg}")
         add_audit(asset, "ORDER REJECTED", msg)
@@ -462,7 +457,7 @@ def enter_position(asset, direction, entry_price, candle):
     add_audit(asset, f"📊 ENTER {direction}",
               f"entry=${entry_price:,.4f} | contracts={contracts} | "
               f"size={size} | trail_stop=${trail_stop:,.4f} | "
-              f"{'PAPER' if PAPER_MODE else 'LIVE'}",
+              f"LIVE",
               candle=candle)
     # ntfy removed for entries — only errors alerted
 
@@ -472,9 +467,8 @@ def exit_position(asset, exit_price, candle):
     pnl = round(
         (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
         else (pos["entry"]-exit_price)*pos["size"], 4)
-    if not PAPER_MODE:
-        side = "SELL" if pos["direction"]=="LONG" else "BUY"
-        place_market_order(asset, side, pos["contracts"])
+    side = "SELL" if pos["direction"]=="LONG" else "BUY"
+    place_market_order(asset, side, pos["contracts"])
     record_tax(asset, pos["direction"], pos["entry"], exit_price,
                pos["size"], pnl, pos["entry_time"])
     with lock:
@@ -509,12 +503,11 @@ def trading_loop():
     live_bal = get_live_balance()
     if live_bal > 0:
         TOTAL_USDC = live_bal
-    if not PAPER_MODE:
-        sync_open_positions()
+    sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v38 started")
-    log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
+    log("🚀 CB Trader v39 started")
+    log("   Mode: 🔴 LIVE")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Leverage: {LEVERAGE}x")
@@ -615,7 +608,7 @@ def trading_loop():
                                          f"ENTER_{direction}", position=pos_snap,
                                          )
                             add_audit(asset, f"📊 📊 ENTER {direction}",
-                                     f"entry=${entry_price:.4f} | trail_stop=${trail_stop_:.4f} | PAPER")
+                                     f"entry=${entry_price:.4f} | trail_stop=${trail_stop_:.4f} | LIVE")
                             continue
 
                         # Signal evaluation — shared with WS strategy
@@ -771,7 +764,7 @@ def health():
     wr = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
     return Response(json.dumps({
         "overall":    "✅ ALL SYSTEMS OK" if s.get("loop_errors",0)<5 else "❌ errors",
-        "mode":       {"paper_mode":PAPER_MODE,"status":"📄 PAPER" if PAPER_MODE else "🔴 LIVE"},
+        "mode":       {"paper_mode":False,"status":"🔴 LIVE"},
         "balance":    f"${s['balance']:,.2f}",
         "weekly_pnl": f"${s['weekly_pnl']:+,.2f}",
         "total_pnl":  f"${s['total_pnl']:+,.2f}",
@@ -853,8 +846,8 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
         pos=dict(positions); pend=dict(pending_entry)
 
     wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
-    mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
-    mode_label = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
+    mode_color = "#00D68F"
+    mode_label = "🔴 LIVE"
     wk_color   = "#00D68F" if s["weekly_pnl"]>=0 else "#FF4757"
     tot_color  = "#00D68F" if s["total_pnl"]>=0 else "#FF4757"
     # Contract countdown
