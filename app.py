@@ -34,18 +34,15 @@ EXPIRY_AUG = "2026-08-28"
 EXPIRY_SEP = "2026-09-25"
 ROLL_DAYS_BEFORE = 5  # roll 5 days before expiry
 
+# Assets selected for $99 test capital — min margin per contract < $10
+# When we scale to $1,000: add back BTC, ETH, BCH, BNB, DOGE
 ASSETS = {
-    "BTC":  {"spot":"BTC-USD",  "aug":"BIT-28AUG26-CDE", "sep":"BIT-25SEP26-CDE", "contract":0.01},
-    "ETH":  {"spot":"ETH-USD",  "aug":"ET-28AUG26-CDE",  "sep":"ET-25SEP26-CDE",  "contract":0.1},
+    "ADA":  {"spot":"ADA-USD",  "aug":"ADA-28AUG26-CDE", "sep":"ADA-25SEP26-CDE", "contract":100.0},
     "SOL":  {"spot":"SOL-USD",  "aug":"SOL-28AUG26-CDE", "sep":"SOL-25SEP26-CDE", "contract":1.0},
     "XRP":  {"spot":"XRP-USD",  "aug":"XRP-28AUG26-CDE", "sep":"XRP-25SEP26-CDE", "contract":100.0},
-    "DOGE": {"spot":"DOGE-USD", "aug":"DOG-28AUG26-CDE", "sep":"DOG-25SEP26-CDE", "contract":5000.0},
-    "ADA":  {"spot":"ADA-USD",  "aug":"ADA-28AUG26-CDE", "sep":"ADA-25SEP26-CDE", "contract":100.0},
     "DOT":  {"spot":"DOT-USD",  "aug":"DOT-28AUG26-CDE", "sep":"DOT-25SEP26-CDE", "contract":10.0},
     "LINK": {"spot":"LINK-USD", "aug":"LNK-28AUG26-CDE", "sep":"LNK-25SEP26-CDE", "contract":10.0},
     "LTC":  {"spot":"LTC-USD",  "aug":"LC-28AUG26-CDE",  "sep":"LC-25SEP26-CDE",  "contract":1.0},
-    "BCH":  {"spot":"BCH-USD",  "aug":"BCH-28AUG26-CDE", "sep":"BCH-25SEP26-CDE", "contract":1.0},
-    "BNB":  {"spot":"BNB-USD",  "aug":"BNF-28AUG26-CDE", "sep":"BNF-25SEP26-CDE", "contract":1.0},
     "SUI":  {"spot":"SUI-USD",  "aug":"SUI-28AUG26-CDE", "sep":"SUI-25SEP26-CDE", "contract":100.0},
     "XLM":  {"spot":"XLM-USD",  "aug":"XLM-28AUG26-CDE", "sep":"XLM-25SEP26-CDE", "contract":1000.0},
     "AVAX": {"spot":"AVAX-USD", "aug":"AVA-28AUG26-CDE", "sep":"AVA-25SEP26-CDE", "contract":10.0},
@@ -255,27 +252,21 @@ def fetch_candles(asset, use_perp=False):
 def get_live_balance():
     """
     Reads real CFM futures_buying_power from Coinbase.
-    futures_buying_power includes USDC spot + CFM cash — the true tradeable balance.
-    Confirmed working: returns $99 for current account.
+    Confirmed response structure from debug_balance.py:
+      resp                  = GetFuturesBalanceSummaryResponse (SDK object)
+      resp.balance_summary  = FCMBalanceSummary (SDK object, attribute access)
+      .futures_buying_power = plain dict {"value": "98.31", "currency": "USD"}
     """
     try:
         client = get_cb_client()
-        resp = client.get_futures_balance_summary()
-        # Handle dict response (confirmed format from API test)
-        if isinstance(resp, dict):
-            bs = resp.get("balance_summary", {})
-        else:
-            bs = getattr(resp, "balance_summary", {})
-            if not isinstance(bs, dict):
-                bs = vars(bs) if hasattr(bs, "__dict__") else {}
-        fbp = bs.get("futures_buying_power", {})
-        if not isinstance(fbp, dict):
-            fbp = vars(fbp) if hasattr(fbp, "__dict__") else {}
-        val = float(fbp.get("value", 0))
+        resp   = client.get_futures_balance_summary()
+        bs     = resp.balance_summary
+        fbp    = bs.futures_buying_power   # plain dict
+        val    = float(fbp["value"])
         if val > 0:
             log(f"💰 Live balance: ${val:,.2f} (Coinbase futures buying power)")
             return val
-        log(f"💰 Balance returned $0 — using fallback")
+        log("💰 Balance returned $0 — using fallback")
     except Exception as e:
         log(f"Balance fetch error: {e}")
     fallback = float(os.environ.get("TOTAL_USDC", "1000"))
@@ -344,23 +335,23 @@ def place_market_order(asset, side, contracts):
             order = client.market_order_sell(
                 client_order_id=str(uuid.uuid4()),
                 product_id=product, base_size=size)
-        success = getattr(order, "success", False)
-        if isinstance(order, dict): success = order.get("success", False)
+        # Confirmed access pattern from test_order_raw.py:
+        # order["success"] = True/False
+        # order["success_response"]["order_id"] = uuid string
+        # order["success_response"] can be None if order fails
+        success = order["success"]
         if success:
-            oid = getattr(order, "order_id", None) or (order.get("success_response",{}).get("order_id") if isinstance(order,dict) else None) or f"CB-{asset}-{int(time.time())}"
+            sr  = order["success_response"]
+            oid = sr["order_id"] if isinstance(sr, dict) else None
+            if not oid: oid = f"CB-{asset}-{int(time.time())}"
             log(f"✅ CB order: {asset} {side} {size} → {oid}")
-            # Verify fill after 2 seconds
-            time.sleep(2)
-            try:
-                fill = client.get_order(order_id=oid)
-                status = fill.get("order",{}).get("status","?") if isinstance(fill,dict) else "?"
-                if status not in ("FILLED","OPEN"):
-                    log(f"⚠️ Order {oid} status: {status} — may not be filled")
-            except: pass
             return oid
         else:
-            err = getattr(order,'error_response',None) or (order.get("error_response") if isinstance(order,dict) else order)
+            err = order.get("error_response", order)
             log(f"⚠️ CB order failed: {asset} {err}")
+            ntfy(f"ORDER REJECTED {asset}",
+                 f"{side} {size} contracts rejected: {err}",
+                 priority="high")
             return None
     except Exception as e:
         log(f"Order error {asset}: {e}")
@@ -490,7 +481,7 @@ def exit_position(asset, exit_price, candle):
     with lock:
         state["total_pnl"]  = round(state["total_pnl"]+pnl, 4)
         state["weekly_pnl"] = round(state["weekly_pnl"]+pnl, 4)
-        state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)  # compounds from real starting balance
+        state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)  # updated below with real CB balance
         state["total_trades"] += 1
         if pnl>=0: state["wins"]+=1
     del positions[asset]
@@ -498,12 +489,16 @@ def exit_position(asset, exit_price, candle):
     add_audit(asset, f"{emoji} EXIT TRAIL",
               f"{pos['direction']} ${pos['entry']:,.4f} → ${exit_price:,.4f} | "
               f"P&L=${pnl:+,.4f}", candle=candle)
-    # Refresh real balance from Coinbase after every exit
+    # Always read real Coinbase balance after exit — captures fees automatically
+    # This keeps app 1:1 with Coinbase regardless of fees or spread
     try:
         live_bal = get_live_balance()
         if live_bal > 0:
-            with lock: state["balance"] = live_bal
-    except: pass
+            with lock:
+                state["balance"] = live_bal
+                log(f"💰 Balance after exit: ${live_bal:,.2f} (Coinbase)")
+    except Exception as e:
+        log(f"Balance refresh error after exit: {e}")
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP — SEQUENTIAL, no threads, no processing guard
@@ -519,7 +514,7 @@ def trading_loop():
         sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v37 started")
+    log("🚀 CB Trader v38 started")
     log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
