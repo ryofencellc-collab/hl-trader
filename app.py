@@ -209,12 +209,17 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
 
 def ntfy(title, body, priority="default"):
     try:
-        req.post(NTFY_URL, data=body.encode("utf-8"),
+        resp = req.post(NTFY_URL, data=body.encode("utf-8"),
             headers={"Title":title.encode("ascii","ignore").decode().strip(),
                      "Priority":priority,"Content-Type":"text/plain; charset=utf-8"},
             timeout=10)
         with lock: state["ntfy_last_sent"]=ts()
-    except:
+        if resp.status_code != 200:
+            log(f"⚠️ ntfy failed: status={resp.status_code} body={resp.text[:100]}")
+        else:
+            log(f"📲 ntfy sent: {title}")
+    except Exception as e:
+        log(f"⚠️ ntfy error: {e}")
         with lock: state["ntfy_errors"]+=1
 
 # ══════════════════════════════════════════════════════════════════
