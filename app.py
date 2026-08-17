@@ -1,15 +1,14 @@
 """
-CB TRADER v30
+CB TRADER v38
 ═══════════════════════════════════════════════════════════════════
-CRITICAL FIX from v29: Sequential asset processing
-- v28/v29 used threads + _processing guard → blocked pending entries
-- v30 processes all assets sequentially per bucket — no threads, no guard
-- This matches backtest logic exactly → true 1:1:1
-
-Strategy: EMA 5/13/34 + sep≥0.002 + vol≥0.3 + 8-bar breakout + 0.3% trail
+Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
+Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
 Exchange: Coinbase CFM Futures (CFTC regulated, legal NYC)
-Candles:  Coinbase spot API (BTC-USD etc)
-Assets:   15
+Candles:  Coinbase spot API (ADA-USD etc)
+Assets:   10 (affordable at $99 capital — scale to 15 at $1,000)
+Balance:  Reads from Coinbase on startup + after every exit + every 50 cycles
+Compounding: cap = current_balance / N_ASSETS — grows automatically with account
+PAPER_MODE: set env var PAPER_MODE=false in Railway to go live
 """
 
 import time, os, math, json, csv, uuid, threading
@@ -20,7 +19,7 @@ import requests as req
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
-PAPER_MODE  = True
+PAPER_MODE  = os.environ.get("PAPER_MODE", "true").lower() != "false"
 NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "hl-trader-lunchm0ney")
 NTFY_URL    = f"https://ntfy.sh/{NTFY_TOPIC}"
 
