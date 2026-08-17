@@ -858,6 +858,17 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     mode_label = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     wk_color   = "#00D68F" if s["weekly_pnl"]>=0 else "#FF4757"
     tot_color  = "#00D68F" if s["total_pnl"]>=0 else "#FF4757"
+    # Contract countdown
+    from datetime import date as ddate
+    today_d     = ddate.today()
+    expiry_aug  = ddate(2026, 8, 28)
+    expiry_sep  = ddate(2026, 9, 25)
+    days_to_aug = (expiry_aug - today_d).days
+    active_exp  = expiry_aug if days_to_aug > 0 else expiry_sep
+    days_left   = (active_exp - today_d).days
+    active_label= "AUG 28" if days_to_aug > 0 else "SEP 25"
+    roll_color  = "#00D68F" if days_left > 10 else "#FFB800" if days_left > 5 else "#FF4757"
+    roll_status = "Trading normally" if days_left > ROLL_DAYS_BEFORE else f"AUTO-ROLLING to {'SEP 25' if days_to_aug <= 0 else 'SEP 25'} ✅" if days_left <= 0 else f"Rolling in {days_left} days"
 
     # Positions
     pos_rows = ""
@@ -1016,14 +1027,14 @@ function show(id,el){{
   {journal_rows}
 </div>
 <div id=markets class=panel>
-  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>15 assets · evaluates every 5 min</div>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>{len(ASSET_NAMES)} assets · evaluates every 5 min</div>
   {assets_rows}
 </div>
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
-    EMA 5/13/34 · Sep ≥0.2% · Vol ≥0.3x · 8-bar breakout<br>
-    Trail 0.3% · ATR 1.0x · 5-min candles · Sequential processing<br>
+    EMA 5/13/50 · Sep ≥0.2% · Vol ≥0.3x · 10-bar breakout<br>
+    Trail 0.2% · ATR 2.0x · 5-min candles · Bucket exits only<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
 <div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
 <div class=kpis>
@@ -1037,11 +1048,14 @@ function show(id,el){{
 <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Exchange</b><br>
     Coinbase CFM Futures · CFTC regulated · Legal NYC<br>
-    10x leverage · 15 assets · Contract roll Aug 28<br>
+    10x leverage · {len(ASSET_NAMES)} assets · Contract roll Aug 28<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-    <b style='color:#E0E6F0;font-size:14px'>5-Year Backtest</b><br>
-    263/263 green weeks · $339k net · $1,290/week avg<br>
-    Best week: $8,809 · Worst week: $77<br>
+    <b style='color:#E0E6F0;font-size:14px'>Contract Status</b><br>
+    Active: {active_label} contracts · <span style='color:{roll_color}'>{days_left} days left</span><br>
+    Status: <span style='color:{roll_color}'>{roll_status}</span><br>
+    <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
+    <b style='color:#E0E6F0;font-size:14px'>2026 Q1 Backtest</b><br>
+    Fixed $1k · $33k gross · 56.3% WR · 14/14 green weeks<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Links</b><br>
     <a href='/health'>Health</a> &nbsp;·&nbsp;
