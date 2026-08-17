@@ -237,6 +237,81 @@ def fetch_candles(asset, use_perp=False):
         log(f"WARNING {asset}: candle fetch failed {e}")
         return None
 
+def get_live_balance():
+    """
+    Reads real CFM futures_buying_power from Coinbase.
+    This is the actual capital available to trade futures.
+    Falls back to TOTAL_USDC env var if API fails.
+    """
+    try:
+        client = get_cb_client()
+        resp = client.get_futures_balance_summary()
+        bs = resp.get("balance_summary", {}) if isinstance(resp, dict) else {}
+        fbp = bs.get("futures_buying_power", {})
+        val = float(fbp.get("value", 0))
+        if val > 0:
+            log(f"💰 Live balance: ${val:,.2f} (CFM buying power)")
+            return val
+        # Fallback: check USDC spot balance
+        accounts = client.get_accounts()
+        accs = accounts.get("accounts", []) if isinstance(accounts, dict) else []
+        for a in accs:
+            if a.get("currency") == "USDC":
+                usdc = float(a.get("available_balance", {}).get("value", 0))
+                if usdc > 0:
+                    log(f"💰 Live balance: ${usdc:,.2f} (USDC spot)")
+                    return usdc
+    except Exception as e:
+        log(f"Balance fetch error: {e}")
+    fallback = float(os.environ.get("TOTAL_USDC", "1000"))
+    log(f"💰 Using fallback balance: ${fallback:,.2f}")
+    return fallback
+
+def sync_open_positions():
+    """
+    On startup, sync positions dict with any open CFM positions on Coinbase.
+    Prevents the app from entering a position that's already open.
+    """
+    if PAPER_MODE: return
+    try:
+        client = get_cb_client()
+        resp = client.list_futures_positions()
+        open_pos = resp.get("positions", []) if isinstance(resp, dict) else []
+        if not open_pos:
+            log("📊 No open CFM positions on Coinbase")
+            return
+        log(f"📊 Found {len(open_pos)} open CFM position(s) on Coinbase — syncing...")
+        for p in open_pos:
+            product_id = p.get("product_id", "")
+            # Map product_id back to asset name
+            asset = None
+            for a, cfg in ASSETS.items():
+                if cfg.get("spot") == product_id or product_id.startswith(a):
+                    asset = a; break
+            if not asset:
+                log(f"  Unknown position: {product_id} — skipping")
+                continue
+            side     = p.get("side", "UNKNOWN")
+            n_cont   = int(float(p.get("number_of_contracts", 0)))
+            avg_entry= float(p.get("avg_entry_price", 0))
+            direction = "LONG" if side == "LONG" else "SHORT"
+            cs = ASSETS[asset]["contract"]
+            trail_stop = round_price(
+                avg_entry*(1-TRAIL_PCT) if direction=="LONG"
+                else avg_entry*(1+TRAIL_PCT))
+            positions[asset] = {
+                "direction": direction,
+                "entry":     avg_entry,
+                "contracts": n_cont,
+                "size":      n_cont * cs,
+                "trail_peak":avg_entry,
+                "trail_stop":trail_stop,
+                "entry_time":ts(),
+            }
+            log(f"  ✅ Synced {asset} {direction} @ ${avg_entry:.4f} | {n_cont} contracts")
+    except Exception as e:
+        log(f"Position sync error: {e}")
+
 def place_market_order(asset, side, contracts):
     if PAPER_MODE:
         oid = f"PAPER-{asset}-{int(time.time())}"
@@ -346,8 +421,10 @@ def check_trail(pos, cur_candle, av):
 # ENTER / EXIT
 # ══════════════════════════════════════════════════════════════════
 def enter_position(asset, direction, entry_price, candle):
-    cs        = ASSETS[asset]["contract"]
-    cap       = TOTAL_USDC / len(ASSET_NAMES)
+    cs  = ASSETS[asset]["contract"]
+    # Compounding: use current balance for cap, not fixed TOTAL_USDC
+    with lock: current_bal = state["balance"]
+    cap = current_bal / len(ASSET_NAMES)
     contracts = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
     size      = contracts * cs
     trail_stop = round_price(
@@ -388,7 +465,7 @@ def exit_position(asset, exit_price, candle):
     with lock:
         state["total_pnl"]  = round(state["total_pnl"]+pnl, 4)
         state["weekly_pnl"] = round(state["weekly_pnl"]+pnl, 4)
-        state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)
+        state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)  # compounds from real starting balance
         state["total_trades"] += 1
         if pnl>=0: state["wins"]+=1
     del positions[asset]
@@ -403,7 +480,14 @@ def exit_position(asset, exit_price, candle):
 # Mirrors backtest exactly: one asset at a time per bucket
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
-    log("🚀 CB Trader v35 started")
+    global TOTAL_USDC
+    # Sync real balance and positions from Coinbase on startup
+    if not PAPER_MODE:
+        TOTAL_USDC = get_live_balance()
+        sync_open_positions()
+    with lock:
+        state["balance"] = TOTAL_USDC
+    log("🚀 CB Trader v36 started")
     log(f"   Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
@@ -534,6 +618,13 @@ def trading_loop():
                 else:
                     with lock:
                         state["skipped_assets"] = []
+                # Refresh live balance every 50 cycles
+                with lock: cycle_num = state.get("cycle", 0) + 1; state["cycle"] = cycle_num
+                if not PAPER_MODE and cycle_num % 50 == 0:
+                    try:
+                        live_bal = get_live_balance()
+                        with lock: state["balance"] = live_bal
+                    except: pass
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
                           f"pending={list(pending_entry.keys())} | "
