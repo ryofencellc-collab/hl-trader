@@ -1,5 +1,5 @@
 """
-CB TRADER v40
+CB TRADER v41
 ═══════════════════════════════════════════════════════════════════
 Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
 Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
@@ -23,10 +23,11 @@ PAPER_MODE  = False  # Always live — no paper mode
 NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "hl-trader-lunchm0ney")
 NTFY_URL    = f"https://ntfy.sh/{NTFY_TOPIC}"
 
-CB_API_KEY  = os.environ.get("CB_API_KEY",
-    "organizations/983775da-fb7b-45d1-8b79-3f58bde1f58a/apiKeys/126549d5-dd93-4e50-99b4-2752266a7d09")
-CB_API_SEC  = os.environ.get("CB_API_SECRET",
-    "m9coUDw6sCE+7KotbjF0xEyu1I7kpCun4Ez6bEVFm6ug+jk2hGtv3CiibvIThzmeXv2F8R0Kyui5kFhxi4tweQ==")
+# API keys loaded from Railway environment variables — never hardcoded
+CB_API_KEY  = os.environ.get("CB_API_KEY", "")
+CB_API_SEC  = os.environ.get("CB_API_SECRET", "")
+if not CB_API_KEY or not CB_API_SEC:
+    raise RuntimeError("CB_API_KEY and CB_API_SECRET must be set in Railway environment variables")
 
 # Contract expiry dates — auto-roll checks these
 EXPIRY_AUG = "2026-08-28"
@@ -260,25 +261,32 @@ def fetch_candles(asset, use_perp=False):
 
 def get_live_balance():
     """
-    Reads real CFM futures_buying_power from Coinbase.
-    Confirmed response structure from debug_balance.py:
-      resp                  = GetFuturesBalanceSummaryResponse (SDK object)
-      resp.balance_summary  = FCMBalanceSummary (SDK object, attribute access)
-      .futures_buying_power = plain dict {"value": "98.31", "currency": "USD"}
+    Reads real available_margin from Coinbase — what Coinbase actually
+    allows us to use for new positions.
+    available_margin is always <= futures_buying_power.
+    Using buying_power caused INSUFFICIENT_FUNDS rejections.
     """
     try:
         client = get_cb_client()
         resp   = client.get_futures_balance_summary()
         bs     = resp.balance_summary
-        fbp    = bs.futures_buying_power   # plain dict
-        val    = float(fbp["value"])
+        # Use available_margin — confirmed from debug: this is what Coinbase
+        # actually approves orders against, not futures_buying_power
+        avail  = bs.available_margin      # plain dict
+        val    = float(avail["value"])
+        fbp    = bs.futures_buying_power  # log both for visibility
+        bp_val = float(fbp["value"])
+        log(f"💰 Live balance: ${val:,.2f} available_margin (buying_power=${bp_val:,.2f})")
         if val > 0:
-            log(f"💰 Live balance: ${val:,.2f} (Coinbase futures buying power)")
             return val
-        log("💰 Balance returned $0 — using fallback")
+        # fallback to buying_power if margin is 0
+        if bp_val > 0:
+            log(f"💰 Using buying_power as fallback: ${bp_val:,.2f}")
+            return bp_val
+        log("💰 Both margin and buying_power are $0")
     except Exception as e:
         log(f"Balance fetch error: {e}")
-    fallback = float(os.environ.get("TOTAL_USDC", "1000"))
+    fallback = float(os.environ.get("TOTAL_USDC", "0"))
     log(f"💰 Fallback balance: ${fallback:,.2f}")
     return fallback
 
@@ -327,38 +335,44 @@ def sync_open_positions():
         log(f"Position sync error: {e}")
 
 def place_market_order(asset, side, contracts):
-    log(f"🔄 Placing order: {asset} {side} {contracts} contracts")
+    # Retry logic — confirmed working from terminal test:
+    # Start at calculated contracts, reduce by 1 until Coinbase accepts
+    # Handles intraday vs overnight margin differences automatically
     try:
         client  = get_cb_client()
-        log(f"🔄 Got client for {asset}")
         product = get_active_ticker(asset)
-        log(f"🔄 Product: {product}")
-        size    = str(int(contracts))
-        if side in ("BUY","LONG"):
-            log(f"🔄 Calling market_order_buy: {product} size={size}")
-            order = client.market_order_buy(
-                client_order_id=str(uuid.uuid4()),
-                product_id=product, base_size=size)
-        else:
-            log(f"🔄 Calling market_order_sell: {product} size={size}")
-            order = client.market_order_sell(
-                client_order_id=str(uuid.uuid4()),
-                product_id=product, base_size=size)
-        log(f"🔄 Raw order response: {order}")
-        success = order["success"]
-        if success:
-            sr  = order["success_response"]
-            oid = sr["order_id"] if isinstance(sr, dict) else None
-            if not oid: oid = f"CB-{asset}-{int(time.time())}"
-            log(f"✅ CB order: {asset} {side} {size} → {oid}")
-            return oid
-        else:
-            err = order.get("error_response", order)
-            log(f"⚠️ CB order failed: {asset} {err}")
-            ntfy(f"ORDER REJECTED {asset}",
-                 f"{side} {size} contracts rejected: {err}",
-                 priority="high")
-            return None
+        max_try = max(1, int(contracts))
+        for attempt in range(max_try, 0, -1):
+            size = str(attempt)
+            if side in ("BUY", "LONG"):
+                order = client.market_order_buy(
+                    client_order_id=str(uuid.uuid4()),
+                    product_id=product, base_size=size)
+            else:
+                order = client.market_order_sell(
+                    client_order_id=str(uuid.uuid4()),
+                    product_id=product, base_size=size)
+            success = order["success"]
+            if success:
+                sr  = order["success_response"]
+                oid = sr["order_id"] if isinstance(sr, dict) else None
+                if not oid: oid = f"CB-{asset}-{int(time.time())}"
+                log(f"✅ CB order: {asset} {side} {size} contracts → {oid}")
+                return oid
+            else:
+                err = order["error_response"]
+                reason = err.get("preview_failure_reason", "") if isinstance(err, dict) else ""
+                if "INSUFFICIENT_FUNDS" in reason and attempt > 1:
+                    log(f"⚠️ {asset} {attempt} contracts insufficient — trying {attempt-1}")
+                    continue
+                else:
+                    log(f"⚠️ CB order failed: {asset} {err}")
+                    ntfy(f"ORDER REJECTED {asset}",
+                         f"{side} {attempt} contracts rejected: {err}",
+                         priority="high")
+                    return None
+        log(f"❌ {asset} could not place even 1 contract")
+        return None
     except Exception as e:
         import traceback
         log(f"❌ Order exception {asset}: {e}")
@@ -449,7 +463,12 @@ def enter_position(asset, direction, entry_price, candle):
     # Compounding: use current balance for cap, not fixed TOTAL_USDC
     with lock: current_bal = state["balance"]
     cap = current_bal / len(ASSET_NAMES)
+    # Size based on available margin per asset
+    # Cap at what margin can actually cover to prevent rejections
     contracts = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
+    # Safety cap: never use more than 80% of per-asset allocation
+    max_contracts = max(1, int((cap * 0.8) / (entry_price * cs / LEVERAGE)))
+    contracts = min(contracts, max_contracts)
     size      = contracts * cs
     trail_stop = round_price(
         entry_price*(1-TRAIL_PCT) if direction=="LONG"
@@ -520,7 +539,7 @@ def trading_loop():
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v40b started")
+    log("🚀 CB Trader v41 started")
     log("   Mode: 🔴 LIVE")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
