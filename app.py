@@ -1,5 +1,5 @@
 """
-CB TRADER v39
+CB TRADER v40
 ═══════════════════════════════════════════════════════════════════
 Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
 Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
@@ -510,7 +510,7 @@ def trading_loop():
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v39 started")
+    log("🚀 CB Trader v40 started")
     log("   Mode: 🔴 LIVE")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
@@ -567,16 +567,8 @@ def trading_loop():
                                 save_sim_data(asset, current_bucket*1000, candles, {},
                                              "EXIT_TRAIL", position=dict(pos), pnl=pnl_est,
                                              )
-                                # Exit BUCKET position — update state
-                                with lock:
-                                    state["total_trades"] += 1
-                                    if pnl_est > 0: state["wins"] += 1
-                                    state["total_pnl"]  = round(state["total_pnl"]+pnl_est, 4)
-                                    state["weekly_pnl"] = round(state["weekly_pnl"]+pnl_est, 4)
-                                    state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)
-                                add_audit(asset, f"{'✅' if pnl_est>=0 else '❌'} EXIT TRAIL",
-                                         f"{pos['direction']} ${pos['entry']:.4f} → ${exit_price:.4f} | P&L=${pnl_est:.4f}")
-                                del positions[asset]
+                                # Exit — call exit_position which places real SELL/BUY on Coinbase
+                                exit_position(asset, exit_price, cur)
                                 skip_entry[asset] = 1
                             else:
                                 save_sim_data(asset, current_bucket*1000, candles, {},
@@ -584,35 +576,18 @@ def trading_loop():
                                              )
                             continue
 
-                        # Pending entry
+                        # Pending entry — call enter_position which places real order
                         pend = pending_entry.get(asset)
                         if pend:
                             entry_price = float(cur["o"])
                             direction   = pend["direction"]
                             del pending_entry[asset]
-                            cs_  = ASSETS[asset]["contract"]
-                            # Compounding: use current balance, not fixed TOTAL_USDC
-                            with lock: current_balance = state["balance"]
-                            cap_ = current_balance / len(ASSET_NAMES)
-                            cts_ = max(1, int((cap_ * LEVERAGE) / (entry_price * cs_)))
-                            trail_stop_ = round_price(
-                                entry_price*(1-TRAIL_PCT) if direction=="LONG"
-                                else entry_price*(1+TRAIL_PCT))
-                            positions[asset] = {
-                                "direction":  direction,
-                                "entry":      entry_price,
-                                "contracts":  cts_,
-                                "size":       cts_ * cs_,
-                                "trail_peak": entry_price,
-                                "trail_stop": trail_stop_,
-                                "entry_time": ts(),
-                            }
-                            pos_snap = dict(positions[asset])
-                            save_sim_data(asset, current_bucket*1000, candles, {},
-                                         f"ENTER_{direction}", position=pos_snap,
-                                         )
-                            add_audit(asset, f"📊 📊 ENTER {direction}",
-                                     f"entry=${entry_price:.4f} | trail_stop=${trail_stop_:.4f} | LIVE")
+                            # enter_position places real order on Coinbase then tracks position
+                            enter_position(asset, direction, entry_price, cur)
+                            # Save sim data for monitor comparison
+                            if positions.get(asset):
+                                save_sim_data(asset, current_bucket*1000, candles, {},
+                                             f"ENTER_{direction}", position=dict(positions[asset]))
                             continue
 
                         # Signal evaluation — shared with WS strategy
