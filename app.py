@@ -317,22 +317,24 @@ def sync_open_positions():
         log(f"Position sync error: {e}")
 
 def place_market_order(asset, side, contracts):
+    log(f"🔄 Placing order: {asset} {side} {contracts} contracts")
     try:
         client  = get_cb_client()
+        log(f"🔄 Got client for {asset}")
         product = get_active_ticker(asset)
+        log(f"🔄 Product: {product}")
         size    = str(int(contracts))
         if side in ("BUY","LONG"):
+            log(f"🔄 Calling market_order_buy: {product} size={size}")
             order = client.market_order_buy(
                 client_order_id=str(uuid.uuid4()),
                 product_id=product, base_size=size)
         else:
+            log(f"🔄 Calling market_order_sell: {product} size={size}")
             order = client.market_order_sell(
                 client_order_id=str(uuid.uuid4()),
                 product_id=product, base_size=size)
-        # Confirmed access pattern from test_order_raw.py:
-        # order["success"] = True/False
-        # order["success_response"]["order_id"] = uuid string
-        # order["success_response"] can be None if order fails
+        log(f"🔄 Raw order response: {order}")
         success = order["success"]
         if success:
             sr  = order["success_response"]
@@ -348,7 +350,9 @@ def place_market_order(asset, side, contracts):
                  priority="high")
             return None
     except Exception as e:
-        log(f"Order error {asset}: {e}")
+        import traceback
+        log(f"❌ Order exception {asset}: {e}")
+        log(f"❌ Traceback: {traceback.format_exc()}")
         return None
 
 # ══════════════════════════════════════════════════════════════════
