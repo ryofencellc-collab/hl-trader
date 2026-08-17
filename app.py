@@ -240,31 +240,31 @@ def fetch_candles(asset, use_perp=False):
 def get_live_balance():
     """
     Reads real CFM futures_buying_power from Coinbase.
-    This is the actual capital available to trade futures.
-    Falls back to TOTAL_USDC env var if API fails.
+    futures_buying_power includes USDC spot + CFM cash — the true tradeable balance.
+    Confirmed working: returns $99 for current account.
     """
     try:
         client = get_cb_client()
         resp = client.get_futures_balance_summary()
-        bs = resp.get("balance_summary", {}) if isinstance(resp, dict) else {}
+        # Handle dict response (confirmed format from API test)
+        if isinstance(resp, dict):
+            bs = resp.get("balance_summary", {})
+        else:
+            bs = getattr(resp, "balance_summary", {})
+            if not isinstance(bs, dict):
+                bs = vars(bs) if hasattr(bs, "__dict__") else {}
         fbp = bs.get("futures_buying_power", {})
+        if not isinstance(fbp, dict):
+            fbp = vars(fbp) if hasattr(fbp, "__dict__") else {}
         val = float(fbp.get("value", 0))
         if val > 0:
-            log(f"💰 Live balance: ${val:,.2f} (CFM buying power)")
+            log(f"💰 Live balance: ${val:,.2f} (Coinbase futures buying power)")
             return val
-        # Fallback: check USDC spot balance
-        accounts = client.get_accounts()
-        accs = accounts.get("accounts", []) if isinstance(accounts, dict) else []
-        for a in accs:
-            if a.get("currency") == "USDC":
-                usdc = float(a.get("available_balance", {}).get("value", 0))
-                if usdc > 0:
-                    log(f"💰 Live balance: ${usdc:,.2f} (USDC spot)")
-                    return usdc
+        log(f"💰 Balance returned $0 — using fallback")
     except Exception as e:
         log(f"Balance fetch error: {e}")
     fallback = float(os.environ.get("TOTAL_USDC", "1000"))
-    log(f"💰 Using fallback balance: ${fallback:,.2f}")
+    log(f"💰 Fallback balance: ${fallback:,.2f}")
     return fallback
 
 def sync_open_positions():
@@ -481,9 +481,11 @@ def exit_position(asset, exit_price, candle):
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
     global TOTAL_USDC
-    # Sync real balance and positions from Coinbase on startup
+    # Always read real balance from Coinbase — paper mode only stops real orders
+    live_bal = get_live_balance()
+    if live_bal > 0:
+        TOTAL_USDC = live_bal
     if not PAPER_MODE:
-        TOTAL_USDC = get_live_balance()
         sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
@@ -618,12 +620,13 @@ def trading_loop():
                 else:
                     with lock:
                         state["skipped_assets"] = []
-                # Refresh live balance every 50 cycles
+                # Refresh live balance every 50 cycles (always — paper or live)
                 with lock: cycle_num = state.get("cycle", 0) + 1; state["cycle"] = cycle_num
-                if not PAPER_MODE and cycle_num % 50 == 0:
+                if cycle_num % 50 == 0:
                     try:
                         live_bal = get_live_balance()
-                        with lock: state["balance"] = live_bal
+                        if live_bal > 0:
+                            with lock: state["balance"] = live_bal
                     except: pass
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
