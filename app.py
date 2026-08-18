@@ -90,7 +90,7 @@ lock            = threading.Lock()
 sim_lock        = threading.Lock()   # separate lock for sim data file writes
 
 state = {
-    "balance": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
+    "balance": TOTAL_USDC, "buying_power": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
     "week": None, "cycle": 0, "ws_connected": False,
     "ws_last_candle": "never", "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
@@ -283,10 +283,13 @@ def get_live_balance():
         bp_val = float(fbp["value"])
         log(f"💰 Live balance: ${val:,.2f} available_margin (buying_power=${bp_val:,.2f})")
         if val > 0:
+            # Store buying_power separately for contract sizing
+            with lock: state["buying_power"] = bp_val
             return val
         # fallback to buying_power if margin is 0
         if bp_val > 0:
             log(f"💰 Using buying_power as fallback: ${bp_val:,.2f}")
+            with lock: state["buying_power"] = bp_val
             return bp_val
         log("💰 Both margin and buying_power are $0")
     except Exception as e:
@@ -478,10 +481,14 @@ def enter_position(asset, direction, entry_price, candle):
     # cts_start caps starting point at balance/50 to limit retries
     # At $1,000 → starts at 20, at $80 → starts at 1
     # Retry logic in place_market_order reduces until Coinbase accepts
-    with lock: current_bal = state["balance"]
+    with lock:
+        current_bal  = state["balance"]
+        buying_power = state.get("buying_power", current_bal)
     cap         = current_bal / len(ASSET_NAMES)
     cts_formula = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
-    cts_start   = max(1, int(current_bal / 100))  # confirmed: $569 → 5 contracts
+    # Use buying_power for start cap — this is what Coinbase actually checks
+    # Scale down as more positions open to avoid margin exhaustion
+    cts_start   = max(1, int(buying_power / 100 / (len(positions) + 1)))
     contracts   = min(cts_formula, cts_start)
     size        = contracts * cs
     trail_stop = round_price(
