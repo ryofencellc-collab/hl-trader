@@ -1,5 +1,5 @@
 """
-CB TRADER v41
+CB TRADER v42
 ═══════════════════════════════════════════════════════════════════
 Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
 Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
@@ -36,15 +36,15 @@ ROLL_DAYS_BEFORE = 5  # roll 5 days before expiry
 
 # Assets selected for $99 test capital — min margin per contract < $10
 # When we scale to $1,000: add back BTC, ETH, BCH, BNB, DOGE
+# 7 assets confirmed affordable at current balance (~$80)
+# XRP/LINK/XLM removed — their 1-contract margin exceeds per-asset cap
+# Add back when balance reaches $1,000
 ASSETS = {
     "ADA":  {"spot":"ADA-USD",  "aug":"ADA-28AUG26-CDE", "sep":"ADA-25SEP26-CDE", "contract":100.0},
     "SOL":  {"spot":"SOL-USD",  "aug":"SOL-28AUG26-CDE", "sep":"SOL-25SEP26-CDE", "contract":1.0},
-    "XRP":  {"spot":"XRP-USD",  "aug":"XRP-28AUG26-CDE", "sep":"XRP-25SEP26-CDE", "contract":100.0},
     "DOT":  {"spot":"DOT-USD",  "aug":"DOT-28AUG26-CDE", "sep":"DOT-25SEP26-CDE", "contract":10.0},
-    "LINK": {"spot":"LINK-USD", "aug":"LNK-28AUG26-CDE", "sep":"LNK-25SEP26-CDE", "contract":10.0},
     "LTC":  {"spot":"LTC-USD",  "aug":"LC-28AUG26-CDE",  "sep":"LC-25SEP26-CDE",  "contract":1.0},
     "SUI":  {"spot":"SUI-USD",  "aug":"SUI-28AUG26-CDE", "sep":"SUI-25SEP26-CDE", "contract":100.0},
-    "XLM":  {"spot":"XLM-USD",  "aug":"XLM-28AUG26-CDE", "sep":"XLM-25SEP26-CDE", "contract":1000.0},
     "AVAX": {"spot":"AVAX-USD", "aug":"AVA-28AUG26-CDE", "sep":"AVA-25SEP26-CDE", "contract":10.0},
     "HBAR": {"spot":"HBAR-USD", "aug":"HED-28AUG26-CDE", "sep":"HED-25SEP26-CDE", "contract":1000.0},
 }
@@ -464,16 +464,11 @@ def check_trail(pos, cur_candle, av):
 # ENTER / EXIT
 # ══════════════════════════════════════════════════════════════════
 def enter_position(asset, direction, entry_price, candle):
-    cs  = ASSETS[asset]["contract"]
-    # Compounding: use current balance for cap, not fixed TOTAL_USDC
-    with lock: current_bal = state["balance"]
-    cap = current_bal / len(ASSET_NAMES)
-    # Size based on available margin per asset
-    # Cap at what margin can actually cover to prevent rejections
-    contracts = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
-    # Safety cap: never use more than 80% of per-asset allocation
-    max_contracts = max(1, int((cap * 0.8) / (entry_price * cs / LEVERAGE)))
-    contracts = min(contracts, max_contracts)
+    cs        = ASSETS[asset]["contract"]
+    # Always 1 contract — minimum size, confirmed working at current balance
+    # Retry logic in place_market_order handles any rejections
+    # Revisit sizing when balance reaches $1,000
+    contracts = 1
     size      = contracts * cs
     trail_stop = round_price(
         entry_price*(1-TRAIL_PCT) if direction=="LONG"
@@ -544,7 +539,7 @@ def trading_loop():
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v41 started")
+    log("🚀 CB Trader v42 started")
     log("   Mode: 🔴 LIVE")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
