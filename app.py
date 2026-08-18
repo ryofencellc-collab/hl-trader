@@ -303,13 +303,25 @@ def sync_open_positions():
     try:
         client = get_cb_client()
         resp = client.list_futures_positions()
-        open_pos = resp.get("positions", []) if isinstance(resp, dict) else []
+        # SDK returns object — access positions attribute directly
+        try:
+            open_pos = resp.positions if hasattr(resp, "positions") else resp.get("positions", [])
+        except:
+            open_pos = []
         if not open_pos:
             log("📊 No open CFM positions on Coinbase")
             return
         log(f"📊 Found {len(open_pos)} open CFM position(s) on Coinbase — syncing...")
         for p in open_pos:
-            product_id = p.get("product_id", "")
+            # FCMPosition is an SDK object — use attribute access not .get()
+            try:
+                product_id = p.product_id if hasattr(p, "product_id") else p.get("product_id", "")
+                side       = p.side if hasattr(p, "side") else p.get("side", "UNKNOWN")
+                n_cont     = int(float(p.number_of_contracts if hasattr(p, "number_of_contracts") else p.get("number_of_contracts", 0)))
+                avg_entry  = float(p.avg_entry_price if hasattr(p, "avg_entry_price") else p.get("avg_entry_price", 0))
+            except Exception as pe:
+                log(f"  Position parse error: {pe} — skipping")
+                continue
             # Map product_id back to asset name
             asset = None
             for a, cfg in ASSETS.items():
@@ -318,9 +330,6 @@ def sync_open_positions():
             if not asset:
                 log(f"  Unknown position: {product_id} — skipping")
                 continue
-            side     = p.get("side", "UNKNOWN")
-            n_cont   = int(float(p.get("number_of_contracts", 0)))
-            avg_entry= float(p.get("avg_entry_price", 0))
             direction = "LONG" if side == "LONG" else "SHORT"
             cs = ASSETS[asset]["contract"]
             trail_stop = round_price(
