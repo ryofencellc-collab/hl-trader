@@ -363,7 +363,7 @@ def place_market_order(asset, side, contracts):
                 oid = sr["order_id"] if isinstance(sr, dict) else None
                 if not oid: oid = f"CB-{asset}-{int(time.time())}"
                 log(f"✅ CB order: {asset} {side} {size} contracts → {oid}")
-                return oid
+                return oid, attempt  # return actual contracts filled
             else:
                 err = order["error_response"]
                 reason = err.get("preview_failure_reason", "") if isinstance(err, dict) else ""
@@ -375,14 +375,14 @@ def place_market_order(asset, side, contracts):
                     ntfy(f"ORDER REJECTED {asset}",
                          f"{side} {attempt} contracts rejected: {err}",
                          priority="high")
-                    return None
+                    return None, 0
         log(f"❌ {asset} could not place even 1 contract")
-        return None
+        return None, 0
     except Exception as e:
         import traceback
         log(f"❌ Order exception {asset}: {e}")
         log(f"❌ Traceback: {traceback.format_exc()}")
-        return None
+        return None, 0
 
 # ══════════════════════════════════════════════════════════════════
 # MATH
@@ -479,22 +479,24 @@ def enter_position(asset, direction, entry_price, candle):
         entry_price*(1-TRAIL_PCT) if direction=="LONG"
         else entry_price*(1+TRAIL_PCT))
     side = "BUY" if direction=="LONG" else "SELL"
-    oid  = place_market_order(asset, side, contracts)
+    oid, actual_cts = place_market_order(asset, side, contracts)
     if not oid:
         msg = f"{asset} {side} {contracts} contracts rejected by Coinbase"
         log(f"CRITICAL order rejected: {msg}")
         add_audit(asset, "ORDER REJECTED", msg)
         ntfy(f"CRITICAL ORDER REJECTED {asset}", msg, priority="urgent")
         return
+    # Use actual_cts — what Coinbase actually filled after retries
+    actual_size = actual_cts * cs
     positions[asset] = {
         "direction":direction, "entry":entry_price,
-        "contracts":contracts, "size":size,
+        "contracts":actual_cts, "size":actual_size,
         "trail_peak":entry_price, "trail_stop":trail_stop,
         "entry_time":ts(),
     }
     add_audit(asset, f"📊 ENTER {direction}",
-              f"entry=${entry_price:,.4f} | contracts={contracts} | "
-              f"size={size} | trail_stop=${trail_stop:,.4f} | "
+              f"entry=${entry_price:,.4f} | contracts={actual_cts} | "
+              f"size={actual_size} | trail_stop=${trail_stop:,.4f} | "
               f"LIVE",
               candle=candle)
     # ntfy removed for entries — only errors alerted
