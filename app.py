@@ -1,5 +1,5 @@
 """
-CB TRADER v42
+CB TRADER v43
 ═══════════════════════════════════════════════════════════════════
 Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
 Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
@@ -465,11 +465,16 @@ def check_trail(pos, cur_candle, av):
 # ══════════════════════════════════════════════════════════════════
 def enter_position(asset, direction, entry_price, candle):
     cs        = ASSETS[asset]["contract"]
-    # Always 1 contract — minimum size, confirmed working at current balance
-    # Retry logic in place_market_order handles any rejections
-    # Revisit sizing when balance reaches $1,000
-    contracts = 1
-    size      = contracts * cs
+    # Compounding formula — grows with balance automatically
+    # cts_start caps starting point at balance/50 to limit retries
+    # At $1,000 → starts at 20, at $80 → starts at 1
+    # Retry logic in place_market_order reduces until Coinbase accepts
+    with lock: current_bal = state["balance"]
+    cap         = current_bal / len(ASSET_NAMES)
+    cts_formula = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
+    cts_start   = max(1, int(current_bal / 100))  # confirmed: $569 → 5 contracts
+    contracts   = min(cts_formula, cts_start)
+    size        = contracts * cs
     trail_stop = round_price(
         entry_price*(1-TRAIL_PCT) if direction=="LONG"
         else entry_price*(1+TRAIL_PCT))
@@ -539,7 +544,7 @@ def trading_loop():
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v42 started")
+    log("🚀 CB Trader v43 started")
     log("   Mode: 🔴 LIVE")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
