@@ -247,6 +247,10 @@ def fetch_candles(asset, granularity=None, n_candles=None):
         # Calculate start based on timeframe
         if tf == "ONE_HOUR":
             start = end - limit * 3600
+        elif tf == "FIFTEEN_MINUTE":
+            start = end - limit * 900   # 15min = 900 seconds per candle
+        elif tf == "FIVE_MINUTE":
+            start = end - limit * 300
         else:
             start = end - limit * 300
         resp  = client.get_candles(product_id, start=str(start),
