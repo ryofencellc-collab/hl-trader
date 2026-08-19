@@ -85,8 +85,7 @@ sim_lock        = threading.Lock()   # separate lock for sim data file writes
 
 state = {
     "balance": TOTAL_USDC, "buying_power": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
-    "week": None, "cycle": 0, "ws_connected": False,
-    "ws_last_candle": "never", "ntfy_errors": 0,
+    "week": None, "cycle": 0, "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
     "wins": 0, "total_trades": 0,
     # PERP strategy removed in v33
@@ -175,8 +174,8 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
                 "entry":      position.get("entry"),
                 "contracts":  position.get("contracts"),
                 "size":       position.get("size"),
-                "trail_peak": position.get("trail_peak"),
-                "trail_stop": position.get("trail_stop"),
+                "strategy":   position.get("strategy"),
+                "rsi_entry":  position.get("rsi_entry"),
                 "entry_time": position.get("entry_time"),
             } if isinstance(position, dict) else None,
             "pnl": pnl,
@@ -235,7 +234,6 @@ def get_cb_client():
 
 def fetch_candles(asset, granularity=None, n_candles=None):
     """Fetch candles from perp ticker directly.
-    granularity: ONE_HOUR for OpenRange, FIVE_MINUTE for AsianRange
     n_candles: how many candles to fetch
     """
     try:
@@ -343,16 +341,13 @@ def sync_open_positions():
                 continue
             direction = "LONG" if side == "LONG" else "SHORT"
             cs = ASSETS[asset]["contract"]
-            trail_stop = round_price(
-                avg_entry*(1-TRAIL_PCT) if direction=="LONG"
-                else avg_entry*(1+TRAIL_PCT))
             positions[asset] = {
                 "direction": direction,
                 "entry":     avg_entry,
                 "contracts": n_cont,
                 "size":      n_cont * cs,
-                "trail_peak":avg_entry,
-                "trail_stop":trail_stop,
+                "strategy":  "RSI-Mom",
+                "rsi_entry": 0,  # unknown on sync
                 "entry_time":ts(),
             }
             log(f"  ✅ Synced {asset} {direction} @ ${avg_entry:.4f} | {n_cont} contracts")
@@ -411,34 +406,6 @@ def round_price(p, sig=5):
     if p==0: return 0.0
     mag=math.floor(math.log10(abs(p))); return round(p,max(0,sig-1-mag))
 
-def ema(values, period):
-    k=2/(period+1); e=None; out=[]
-    for v in values:
-        e=v if e is None else v*k+e*(1-k); out.append(e)
-    return out
-
-def sma(values, period):
-    out=[None]*(period-1)
-    for i in range(period-1,len(values)):
-        out.append(sum(values[i-period+1:i+1])/period)
-    return out
-
-def atr_calc(highs, lows, closes, period=14):
-    trs=[]
-    for i in range(1,len(closes)):
-        trs.append(max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),
-                       abs(lows[i]-closes[i-1])))
-    if len(trs)<period: return [None]*len(closes)
-    out=[None]*period; avg=sum(trs[:period])/period; out.append(avg)
-    for i in range(period,len(trs)):
-        avg=(avg*(period-1)+trs[i])/period; out.append(avg)
-    while len(out)<len(closes): out.append(out[-1])
-    return out
-
-# ══════════════════════════════════════════════════════════════════
-# SIGNALS — OpenRange 1hour + AsianRange 5min
-# Identical logic to backtest (proof_test_v2.py)
-# ══════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════
 # RSI CALCULATION
 # ══════════════════════════════════════════════════════════════════
@@ -522,125 +489,8 @@ def should_exit(pos, candles):
     return False
 
 
-def evaluate_openrange(candles_1h):
-    """
-    Opening Range Breakout on 1-hour candles.
-    OR = first 3 candles of the UTC day (00:00, 01:00, 02:00).
-    Signal: when current candle breaks above OR high → LONG
-            when current candle breaks below OR low  → SHORT
-    TP = entry ± OR_range × 2  |  Stop = entry ∓ OR_range
-    Returns: (direction, tp, stop, info_dict) or (None, None, None, info)
-    """
-    if not candles_1h or len(candles_1h) < 5:
-        return None, None, None, {"fail": "not enough 1h candles"}
-
-    cur = candles_1h[-1]  # current (possibly forming) candle — use close as entry
-    cur_dt = datetime.fromtimestamp(cur["ts"]/1000, tz=timezone.utc)
-
-    # Find today's first 3 hourly candles (hours 0, 1, 2 UTC)
-    day_start_ts = cur_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
-    day_candles = [c for c in candles_1h if c["ts"] >= day_start_ts and c["ts"] < cur["ts"]]
-
-    if len(day_candles) < 3:
-        return None, None, None, {"fail": f"only {len(day_candles)} day candles so far"}
-
-    first3 = day_candles[:3]
-    or_high = max(c["h"] for c in first3)
-    or_low  = min(c["l"] for c in first3)
-    or_range = or_high - or_low
-
-    if or_range <= 0:
-        return None, None, None, {"fail": "OR range is zero"}
-
-    entry = cur["c"]  # use close as signal price
-
-    if entry > or_high:
-        d = "LONG"
-    elif entry < or_low:
-        d = "SHORT"
-    else:
-        return None, None, None, {"fail": f"price {entry:.4f} inside OR [{or_low:.4f}-{or_high:.4f}]"}
-
-    tp   = round_price(entry + or_range * 2) if d == "LONG" else round_price(entry - or_range * 2)
-    stop = round_price(entry - or_range)     if d == "LONG" else round_price(entry + or_range)
-
-    # Sanity checks
-    if d == "LONG"  and (tp <= entry or stop >= entry): return None, None, None, {"fail": "LONG TP/stop invalid"}
-    if d == "SHORT" and (tp >= entry or stop <= entry): return None, None, None, {"fail": "SHORT TP/stop invalid"}
-
-    return d, tp, stop, {
-        "strategy": "OpenRange",
-        "or_high": round_price(or_high), "or_low": round_price(or_low),
-        "or_range": round_price(or_range), "entry": round_price(entry),
-        "tp": tp, "stop": stop, "rr": "2:1"
-    }
 
 
-def evaluate_asianrange(candles_5m):
-    """
-    Asian Range Breakout on 5-min candles.
-    Asian session = 00:00-08:00 UTC.
-    Signal fires only 08:00-12:00 UTC (London open window).
-    Break of Asian session high → LONG, low → SHORT.
-    TP = entry ± asian_range × 2  |  Stop = entry ∓ asian_range
-    Returns: (direction, tp, stop, info_dict) or (None, None, None, info)
-    """
-    if not candles_5m or len(candles_5m) < 10:
-        return None, None, None, {"fail": "not enough 5m candles"}
-
-    cur = candles_5m[-1]
-    cur_dt = datetime.fromtimestamp(cur["ts"]/1000, tz=timezone.utc)
-    hour = cur_dt.hour
-
-    # Only fire during London open window: 08:00-12:00 UTC
-    if not (8 <= hour <= 12):
-        return None, None, None, {"fail": f"outside London window (hour={hour} UTC)"}
-
-    # Build Asian session candles: 00:00-08:00 UTC today
-    day_start_ts   = cur_dt.replace(hour=0,  minute=0, second=0, microsecond=0).timestamp() * 1000
-    london_open_ts = cur_dt.replace(hour=8,  minute=0, second=0, microsecond=0).timestamp() * 1000
-    asian = [c for c in candles_5m
-             if c["ts"] >= day_start_ts and c["ts"] < london_open_ts]
-
-    if len(asian) < 3:
-        return None, None, None, {"fail": f"only {len(asian)} Asian session candles"}
-
-    as_high  = max(c["h"] for c in asian)
-    as_low   = min(c["l"] for c in asian)
-    as_range = as_high - as_low
-
-    if as_range <= 0:
-        return None, None, None, {"fail": "Asian range is zero"}
-
-    entry = cur["c"]
-
-    if entry > as_high:
-        d = "LONG"
-    elif entry < as_low:
-        d = "SHORT"
-    else:
-        return None, None, None, {"fail": f"price inside Asian range [{as_low:.4f}-{as_high:.4f}]"}
-
-    tp   = round_price(entry + as_range * 2) if d == "LONG" else round_price(entry - as_range * 2)
-    stop = round_price(entry - as_range)     if d == "LONG" else round_price(entry + as_range)
-
-    if d == "LONG"  and (tp <= entry or stop >= entry): return None, None, None, {"fail": "LONG TP/stop invalid"}
-    if d == "SHORT" and (tp >= entry or stop <= entry): return None, None, None, {"fail": "SHORT TP/stop invalid"}
-
-    return d, tp, stop, {
-        "strategy": "AsianRange",
-        "as_high": round_price(as_high), "as_low": round_price(as_low),
-        "as_range": round_price(as_range), "entry": round_price(entry),
-        "tp": tp, "stop": stop, "rr": "2:1", "hour_utc": hour
-    }
-
-# ══════════════════════════════════════════════════════════════════
-# EXIT CHECK — fixed TP and Stop (matches backtest exactly)
-# RSI exit handled by should_exit() function above
-
-# ══════════════════════════════════════════════════════════════════
-# ENTER / EXIT
-# ══════════════════════════════════════════════════════════════════
 def enter_position(asset, direction, entry_price, candle, info=None):
     """
     Enter a perp position — RSI momentum strategy.
@@ -881,50 +731,6 @@ def trading_loop():
 # ══════════════════════════════════════════════════════════════════
 # WEBSOCKET — for trail stop updates between candles
 # ══════════════════════════════════════════════════════════════════
-def start_websocket():
-    try:
-        from coinbase.websocket import WSClient
-        product_ids = [ASSETS[a]["spot"] for a in ASSET_NAMES]
-
-        def on_message(msg):
-            try:
-                import json as _j
-                data = _j.loads(msg) if isinstance(msg,str) else msg
-                if data.get("channel") != "candles": return
-                for event in data.get("events",[]):
-                    if event.get("type") != "update": continue
-                    for c in event.get("candles",[]):
-                        product_id = c.get("product_id","")
-                        asset = next((a for a,cfg in ASSETS.items()
-                                     if cfg["spot"]==product_id), None)
-                        if not asset: continue
-                        with lock: state["ws_last_candle"] = datetime.fromtimestamp(
-                            int(float(c["start"])),tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-                        # Only update trail on open positions between candles
-                        pos = positions.get(asset)
-                        if not pos: continue
-                        cur = {"h":float(c["high"]),"l":float(c["low"]),
-                               "o":float(c["open"]),"c":float(c["close"]),
-                               "dt":datetime.fromtimestamp(int(float(c["start"])),
-                                    tz=timezone.utc).strftime("%Y-%m-%d %H:%M")}
-                        # WebSocket used for trail peak updates only — exits at bucket
-                        av = 0
-                        result = check_trail(pos, cur, av)
-                        if result == "EXIT":
-                            pass  # BUCKET strategy exits at bucket eval, not WebSocket
-            except Exception as e:
-                log(f"WS error: {e}")
-
-        ws = WSClient(api_key=CB_API_KEY, api_secret=CB_API_SEC, on_message=on_message)
-        ws.open()
-        ws.subscribe(product_ids=product_ids, channels=["candles"])
-        log(f"🔌 WebSocket connected — {len(product_ids)} assets")
-        with lock: state["ws_connected"] = True
-        ws.run_forever_with_exception_check()
-    except Exception as e:
-        log(f"WebSocket error: {e}")
-        with lock: state["ws_connected"] = False
-        ntfy("WARNING WebSocket dropped", f"WS error: {str(e)[:100]}", priority="high")
 
 # ══════════════════════════════════════════════════════════════════
 # FLASK DASHBOARD
@@ -953,14 +759,9 @@ def health():
         "total_pnl":  f"${s['total_pnl']:+,.2f}",
         "trades":     s["total_trades"],
         "win_rate":   f"{wr}%",
-        "spot_strategy": {
-            "open_positions": list(positions.keys()),
-            "pending_entries": list(pending_entry.keys()),
-            "total_pnl": f"${state['total_pnl']:+,.2f}",
-            "trades": state['total_trades'],
-            "win_rate": f"{round(state['wins']/state['total_trades']*100,1) if state['total_trades'] else 0}%",
-        },
-        "bucket_strategy": {
+        "strategy": {
+            "name": "RSI(14) Momentum Cross 60/45",
+            "timeframe": "15min",
             "open_positions": list(positions.keys()),
             "pending_entries": list(pending_entry.keys()),
             "total_pnl": f"${state['total_pnl']:+,.2f}",
@@ -971,9 +772,7 @@ def health():
 
         "open_positions": list(positions.keys()),
         "pending_entries": list(pending_entry.keys()),
-        "candle_cache": {a:{"candles":200,"last":state.get("ws_last_candle","?")} for a in ASSET_NAMES},
-        "websocket":  {"last_candle":s["ws_last_candle"],
-                       "status":"✅ Connected" if s["ws_connected"] else "❌ Down"},
+        "candle_cache": {a:{"candles":CANDLE_LIMIT} for a in ASSET_NAMES},
         "skipped_assets": s.get("skipped_assets",[]),
         "skip_streaks": {k:v for k,v in s.get("skip_streak",{}).items() if v>0},
         "trading_loop":{"errors":s.get("loop_errors",0),"last_run":s["loop_last_run"],
@@ -1048,7 +847,8 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     # Positions
     pos_rows = ""
     for asset, p in pos.items():
-        pnl_est = round((p.get("trail_stop",p["entry"])-p["entry"])*p["size"],2) if p["direction"]=="LONG" else round((p["entry"]-p.get("trail_stop",p["entry"]))*p["size"],2)
+        cur_price = float(p.get("entry", 0))  # will update with live price when available
+        pnl_est = 0  # RSI exit — no fixed TP/stop to estimate from
         pnl_color = "#00D68F" if pnl_est>=0 else "#FF4757"
         pos_rows += f"""<div style='background:#0A1628;border:1px solid #1E2D45;border-radius:10px;padding:14px;margin-bottom:10px'>
           <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px'>
@@ -1065,11 +865,11 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
               <div style='color:#4A5878;margin-bottom:2px'>Trail Stop</div>
-              <div style='font-weight:600;color:#FFB800'>${p.get("trail_stop",0):,.4f}</div>
+              <div style='font-weight:600;color:#FFB800'>RSI Exit &lt;45</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
               <div style='color:#4A5878;margin-bottom:2px'>Peak</div>
-              <div style='font-weight:600'>${p.get("trail_peak",0):,.4f}</div>
+              <div style='font-weight:600'>RSI @ Entry: {p.get("rsi_entry",0):.1f}</div>
             </div>
           </div>
           <div style='margin-top:8px;font-size:11px;color:#4A5878'>Since {p.get("entry_time","?")}</div>
@@ -1164,8 +964,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{"#00D68F" if s["ws_connected"] else "#FF4757"}'>
-      {"● WS Live" if s["ws_connected"] else "● WS Down"}
+    <span style='color:#00D68F'>● v45 Live
     </span>
   </div>
 </div>
