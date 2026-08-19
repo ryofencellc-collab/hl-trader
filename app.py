@@ -1,14 +1,18 @@
 """
-CB TRADER v43
+CB TRADER v44
 ═══════════════════════════════════════════════════════════════════
-Strategy: EMA 5/13/50 + sep≥0.002 + vol≥0.3 + 10-bar breakout + 0.2% trail
-Exit:     BUCKET only — exits at 5-min bucket close (matches backtest exactly)
-Exchange: Coinbase CFM Futures (CFTC regulated, legal NYC)
-Candles:  Coinbase spot API (ADA-USD etc)
-Assets:   10 (affordable at $99 capital — scale to 15 at $1,000)
+Strategy: OpenRange 1hour (primary) + AsianRange 5min (secondary)
+  OpenRange:  break first 3 hourly candles high/low → 2:1 TP:Stop
+  AsianRange: break Asian session (00-08 UTC) at London open (08-12 UTC) → 2:1
+Exit:     Fixed TP and Stop — no trailing (matches backtest exactly)
+Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
+  BIP ETH ETP SLP LNP HEP SUP XLP BNB — DEC 2030 perp-style, no rolls
+Fees:     max(notional×0.02%, $0.15) per side — 4x cheaper than dated futures
+Assets:   8 perp contracts — all liquid, all verified via API
 Balance:  Reads from Coinbase on startup + after every exit + every 50 cycles
-Compounding: cap = current_balance / N_ASSETS — grows automatically with account
+Compounding: sizes up automatically as balance grows
 Mode: Always LIVE — real orders on every signal
+Backtest: $1,528/month combined on $566 (Feb-Mar 2026) — all 3 periods green
 """
 
 import time, os, math, json, csv, uuid, threading
@@ -29,36 +33,29 @@ CB_API_SEC  = os.environ.get("CB_API_SECRET", "")
 if not CB_API_KEY or not CB_API_SEC:
     raise RuntimeError("CB_API_KEY and CB_API_SECRET must be set in Railway environment variables")
 
-# Contract expiry dates — auto-roll checks these
-EXPIRY_AUG = "2026-08-28"
-EXPIRY_SEP = "2026-09-25"
-ROLL_DAYS_BEFORE = 5  # roll 5 days before expiry
-
-# Assets selected for $99 test capital — min margin per contract < $10
-# When we scale to $1,000: add back BTC, ETH, BCH, BNB, DOGE
-# 7 assets confirmed affordable at current balance (~$80)
-# XRP/LINK/XLM removed — their 1-contract margin exceeds per-asset cap
-# Add back when balance reaches $1,000
+# Perp-style futures — DEC 2030 expiry, no monthly rolls needed
+# Contract sizes confirmed from Coinbase API: future_product_details.contract_size
+# Intraday margin rate ~10% confirmed from API
 ASSETS = {
-    "ADA":  {"spot":"ADA-USD",  "aug":"ADA-28AUG26-CDE", "sep":"ADA-25SEP26-CDE", "contract":100.0},
-    "SOL":  {"spot":"SOL-USD",  "aug":"SOL-28AUG26-CDE", "sep":"SOL-25SEP26-CDE", "contract":1.0},
-    "DOT":  {"spot":"DOT-USD",  "aug":"DOT-28AUG26-CDE", "sep":"DOT-25SEP26-CDE", "contract":10.0},
-    "LTC":  {"spot":"LTC-USD",  "aug":"LC-28AUG26-CDE",  "sep":"LC-25SEP26-CDE",  "contract":1.0},
-    "SUI":  {"spot":"SUI-USD",  "aug":"SUI-28AUG26-CDE", "sep":"SUI-25SEP26-CDE", "contract":100.0},
-    "AVAX": {"spot":"AVAX-USD", "aug":"AVA-28AUG26-CDE", "sep":"AVA-25SEP26-CDE", "contract":10.0},
-    "HBAR": {"spot":"HBAR-USD", "aug":"HED-28AUG26-CDE", "sep":"HED-25SEP26-CDE", "contract":1000.0},
+    "BTC":  {"perp":"BIP-20DEC30-CDE", "contract":0.01,   "margin_rate":0.10},
+    "ETH":  {"perp":"ETP-20DEC30-CDE", "contract":0.10,   "margin_rate":0.10},
+    "SOL":  {"perp":"SLP-20DEC30-CDE", "contract":5.0,    "margin_rate":0.10},
+    "LINK": {"perp":"LNP-20DEC30-CDE", "contract":50.0,   "margin_rate":0.10},
+    "HBAR": {"perp":"HEP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
+    "SUI":  {"perp":"SUP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "XLM":  {"perp":"XLP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
+    "BNB":  {"perp":"BNB-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
 }
+ASSET_NAMES = list(ASSETS.keys())
+
+# Fee structure — perp: max(notional * 0.02%, $0.15) per side
+FEE_PCT_PERP = 0.00020
+FEE_MIN_PERP = 0.15
+MAX_CONTRACTS = 5  # Coinbase intraday position limit per asset
 
 def get_active_ticker(asset):
-    """Returns the active futures ticker — auto-rolls 5 days before expiry"""
-    from datetime import date
-    today = date.today()
-    expiry = date(2026, 8, 28)
-    days_to_expiry = (expiry - today).days
-    if days_to_expiry <= ROLL_DAYS_BEFORE:
-        return ASSETS[asset]["sep"]
-    return ASSETS[asset]["aug"]
-ASSET_NAMES = list(ASSETS.keys())
+    """Returns perp ticker — no rolling needed, DEC 2030 expiry"""
+    return ASSETS[asset]["perp"]
 
 EMA_FAST    = 5
 EMA_MID     = 13
@@ -239,14 +236,24 @@ def get_cb_client():
                 _cb_client = RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
     return _cb_client
 
-def fetch_candles(asset, use_perp=False):
+def fetch_candles(asset, granularity=None, n_candles=None):
+    """Fetch candles from perp ticker directly.
+    granularity: ONE_HOUR for OpenRange, FIVE_MINUTE for AsianRange
+    n_candles: how many candles to fetch
+    """
     try:
         client = get_cb_client()
-        product_id = get_active_ticker(asset) if use_perp else ASSETS[asset]["spot"]
+        product_id = get_active_ticker(asset)
+        tf = granularity or CANDLE_TF
+        limit = n_candles or CANDLE_LIMIT
         end   = int(time.time())
-        start = end - 300 * 5 * 60
+        # Calculate start based on timeframe
+        if tf == "ONE_HOUR":
+            start = end - limit * 3600
+        else:
+            start = end - limit * 300
         resp  = client.get_candles(product_id, start=str(start),
-                                   end=str(end), granularity=CANDLE_TF)
+                                   end=str(end), granularity=tf)
         if not resp.candles:
             log(f"WARNING {asset}: API returned 0 candles")
             return None
@@ -255,7 +262,7 @@ def fetch_candles(asset, use_perp=False):
             "dt": datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             "o":float(c.open),"h":float(c.high),
             "l":float(c.low),"c":float(c.close),"v":float(c.volume),
-        } for c in resp.candles], key=lambda x:x["ts"])[-CANDLE_LIMIT:]
+        } for c in resp.candles], key=lambda x:x["ts"])[-limit:]
         if candles and candles[-1]["c"] == 0:
             log(f"WARNING {asset}: last candle close=0 dead feed")
             return None
@@ -328,7 +335,7 @@ def sync_open_positions():
             # Map product_id back to asset name
             asset = None
             for a, cfg in ASSETS.items():
-                if cfg.get("spot") == product_id or product_id.startswith(a):
+                if cfg.get("perp") == product_id or product_id.startswith(cfg.get("perp","")[:3]):
                     asset = a; break
             if not asset:
                 log(f"  Unknown position: {product_id} — skipping")
@@ -428,73 +435,168 @@ def atr_calc(highs, lows, closes, period=14):
     return out
 
 # ══════════════════════════════════════════════════════════════════
-# SIGNAL — identical to backtest
+# SIGNALS — OpenRange 1hour + AsianRange 5min
+# Identical logic to backtest (proof_test_v2.py)
 # ══════════════════════════════════════════════════════════════════
-def evaluate_signal(candles):
-    complete = candles[:-1]   # exclude forming candle
-    if len(complete) < 200: return None, None, {"fail":"not enough candles"}
-    cl=[c["c"] for c in complete]; hi=[c["h"] for c in complete]
-    lo=[c["l"] for c in complete]; vo=[c["v"] for c in complete]
-    ef=ema(cl,EMA_FAST); em_=ema(cl,EMA_MID); es=ema(cl,EMA_SLOW)
-    vs=sma(vo,20); i=-2
-    sig_candle=complete[i]
-    if not (ef[i] and em_[i] and es[i]):
-        return None, sig_candle, {"fail":"EMA not ready"}
-    if   ef[i]>em_[i]>es[i]: d="LONG"
-    elif ef[i]<em_[i]<es[i]: d="SHORT"
-    else: return None, sig_candle, {"fail":"no stack"}
-    sep=abs(ef[i]-es[i])/es[i] if es[i] else 0
-    if sep<SEP_FILTER: return None, sig_candle, {"fail":f"sep={sep:.5f}"}
-    vr=vo[i]/vs[i] if vs[i] else 0
-    if vr<VOL_FILTER: return None, sig_candle, {"fail":f"vol={vr:.2f}x"}
-    if d=="LONG"  and cl[i]<=max(hi[i-BRK_BARS:i]):
-        return None, sig_candle, {"fail":"no breakout"}
-    if d=="SHORT" and cl[i]>=min(lo[i-BRK_BARS:i]):
-        return None, sig_candle, {"fail":"no breakout"}
-    return d, sig_candle, {"sep":round(sep,5),"vol":round(vr,2),"pass":True}
+def evaluate_openrange(candles_1h):
+    """
+    Opening Range Breakout on 1-hour candles.
+    OR = first 3 candles of the UTC day (00:00, 01:00, 02:00).
+    Signal: when current candle breaks above OR high → LONG
+            when current candle breaks below OR low  → SHORT
+    TP = entry ± OR_range × 2  |  Stop = entry ∓ OR_range
+    Returns: (direction, tp, stop, info_dict) or (None, None, None, info)
+    """
+    if not candles_1h or len(candles_1h) < 5:
+        return None, None, None, {"fail": "not enough 1h candles"}
+
+    cur = candles_1h[-1]  # current (possibly forming) candle — use close as entry
+    cur_dt = datetime.fromtimestamp(cur["ts"]/1000, tz=timezone.utc)
+
+    # Find today's first 3 hourly candles (hours 0, 1, 2 UTC)
+    day_start_ts = cur_dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
+    day_candles = [c for c in candles_1h if c["ts"] >= day_start_ts and c["ts"] < cur["ts"]]
+
+    if len(day_candles) < 3:
+        return None, None, None, {"fail": f"only {len(day_candles)} day candles so far"}
+
+    first3 = day_candles[:3]
+    or_high = max(c["h"] for c in first3)
+    or_low  = min(c["l"] for c in first3)
+    or_range = or_high - or_low
+
+    if or_range <= 0:
+        return None, None, None, {"fail": "OR range is zero"}
+
+    entry = cur["c"]  # use close as signal price
+
+    if entry > or_high:
+        d = "LONG"
+    elif entry < or_low:
+        d = "SHORT"
+    else:
+        return None, None, None, {"fail": f"price {entry:.4f} inside OR [{or_low:.4f}-{or_high:.4f}]"}
+
+    tp   = round_price(entry + or_range * 2) if d == "LONG" else round_price(entry - or_range * 2)
+    stop = round_price(entry - or_range)     if d == "LONG" else round_price(entry + or_range)
+
+    # Sanity checks
+    if d == "LONG"  and (tp <= entry or stop >= entry): return None, None, None, {"fail": "LONG TP/stop invalid"}
+    if d == "SHORT" and (tp >= entry or stop <= entry): return None, None, None, {"fail": "SHORT TP/stop invalid"}
+
+    return d, tp, stop, {
+        "strategy": "OpenRange",
+        "or_high": round_price(or_high), "or_low": round_price(or_low),
+        "or_range": round_price(or_range), "entry": round_price(entry),
+        "tp": tp, "stop": stop, "rr": "2:1"
+    }
+
+
+def evaluate_asianrange(candles_5m):
+    """
+    Asian Range Breakout on 5-min candles.
+    Asian session = 00:00-08:00 UTC.
+    Signal fires only 08:00-12:00 UTC (London open window).
+    Break of Asian session high → LONG, low → SHORT.
+    TP = entry ± asian_range × 2  |  Stop = entry ∓ asian_range
+    Returns: (direction, tp, stop, info_dict) or (None, None, None, info)
+    """
+    if not candles_5m or len(candles_5m) < 10:
+        return None, None, None, {"fail": "not enough 5m candles"}
+
+    cur = candles_5m[-1]
+    cur_dt = datetime.fromtimestamp(cur["ts"]/1000, tz=timezone.utc)
+    hour = cur_dt.hour
+
+    # Only fire during London open window: 08:00-12:00 UTC
+    if not (8 <= hour <= 12):
+        return None, None, None, {"fail": f"outside London window (hour={hour} UTC)"}
+
+    # Build Asian session candles: 00:00-08:00 UTC today
+    day_start_ts   = cur_dt.replace(hour=0,  minute=0, second=0, microsecond=0).timestamp() * 1000
+    london_open_ts = cur_dt.replace(hour=8,  minute=0, second=0, microsecond=0).timestamp() * 1000
+    asian = [c for c in candles_5m
+             if c["ts"] >= day_start_ts and c["ts"] < london_open_ts]
+
+    if len(asian) < 3:
+        return None, None, None, {"fail": f"only {len(asian)} Asian session candles"}
+
+    as_high  = max(c["h"] for c in asian)
+    as_low   = min(c["l"] for c in asian)
+    as_range = as_high - as_low
+
+    if as_range <= 0:
+        return None, None, None, {"fail": "Asian range is zero"}
+
+    entry = cur["c"]
+
+    if entry > as_high:
+        d = "LONG"
+    elif entry < as_low:
+        d = "SHORT"
+    else:
+        return None, None, None, {"fail": f"price inside Asian range [{as_low:.4f}-{as_high:.4f}]"}
+
+    tp   = round_price(entry + as_range * 2) if d == "LONG" else round_price(entry - as_range * 2)
+    stop = round_price(entry - as_range)     if d == "LONG" else round_price(entry + as_range)
+
+    if d == "LONG"  and (tp <= entry or stop >= entry): return None, None, None, {"fail": "LONG TP/stop invalid"}
+    if d == "SHORT" and (tp >= entry or stop <= entry): return None, None, None, {"fail": "SHORT TP/stop invalid"}
+
+    return d, tp, stop, {
+        "strategy": "AsianRange",
+        "as_high": round_price(as_high), "as_low": round_price(as_low),
+        "as_range": round_price(as_range), "entry": round_price(entry),
+        "tp": tp, "stop": stop, "rr": "2:1", "hour_utc": hour
+    }
 
 # ══════════════════════════════════════════════════════════════════
-# TRAIL CHECK — identical to backtest
+# EXIT CHECK — fixed TP and Stop (matches backtest exactly)
+# No trailing — OpenRange/AsianRange use fixed 2:1 targets
 # ══════════════════════════════════════════════════════════════════
-def check_trail(pos, cur_candle, av):
-    h=float(cur_candle["h"]); l=float(cur_candle["l"])
-    if pos["direction"]=="LONG":
-        if h>pos["trail_peak"] and (av==0 or h-pos["trail_peak"]>av*ATR_BUFFER):
-            pos["trail_peak"]=h
-            pos["trail_stop"]=round_price(h*(1-TRAIL_PCT))
-        thresh=pos["trail_stop"]-(av*ATR_BUFFER if av else 0)
-        if l<=thresh: return "EXIT"
+def check_exit(pos, cur_candle):
+    """Check if fixed TP or Stop was hit on current candle."""
+    h = float(cur_candle["h"])
+    l = float(cur_candle["l"])
+    tp   = pos["tp"]
+    stop = pos["stop"]
+
+    if pos["direction"] == "LONG":
+        if h >= tp:   return "TP"    # take profit hit
+        if l <= stop: return "STOP"  # stop loss hit
     else:
-        if l<pos["trail_peak"] and (av==0 or pos["trail_peak"]-l>av*ATR_BUFFER):
-            pos["trail_peak"]=l
-            pos["trail_stop"]=round_price(l*(1+TRAIL_PCT))
-        thresh=pos["trail_stop"]+(av*ATR_BUFFER if av else 0)
-        if h>=thresh: return "EXIT"
+        if l <= tp:   return "TP"
+        if h >= stop: return "STOP"
     return "HOLD"
 
 # ══════════════════════════════════════════════════════════════════
 # ENTER / EXIT
 # ══════════════════════════════════════════════════════════════════
-def enter_position(asset, direction, entry_price, candle):
-    cs        = ASSETS[asset]["contract"]
-    # Compounding formula — grows with balance automatically
-    # cts_start caps starting point at balance/50 to limit retries
-    # At $1,000 → starts at 20, at $80 → starts at 1
-    # Retry logic in place_market_order reduces until Coinbase accepts
+def enter_position(asset, direction, entry_price, tp, stop, candle, strategy=""):
+    """
+    Enter a perp position with fixed TP and Stop.
+    Contract sizing: max affordable within 70% of available balance,
+    capped at MAX_CONTRACTS (5) per Coinbase intraday limits.
+    """
+    cs = ASSETS[asset]["contract"]
+    mr = ASSETS[asset]["margin_rate"]
+
     with lock:
         current_bal  = state["balance"]
         buying_power = state.get("buying_power", current_bal)
-    cap         = current_bal / len(ASSET_NAMES)
-    cts_formula = max(1, int((cap * LEVERAGE) / (entry_price * cs)))
-    # Use buying_power for start cap — this is what Coinbase actually checks
-    # Scale down as more positions open to avoid margin exhaustion
-    cts_start   = max(1, int(buying_power / 100 / (len(positions) + 1)))
-    contracts   = min(cts_formula, cts_start)
-    size        = contracts * cs
-    trail_stop = round_price(
-        entry_price*(1-TRAIL_PCT) if direction=="LONG"
-        else entry_price*(1+TRAIL_PCT))
-    side = "BUY" if direction=="LONG" else "SELL"
+
+    # Per-asset margin budget: 70% of balance split equally across assets
+    avail      = current_bal * 0.70
+    per_slot   = avail / len(ASSET_NAMES)
+    margin_per = entry_price * cs * mr
+    contracts  = min(MAX_CONTRACTS, max(1, int(per_slot / margin_per)))
+
+    # Also cap by buying_power to avoid margin rejection
+    bp_contracts = max(1, int(buying_power / 100 / max(1, len(positions) + 1)))
+    contracts = min(contracts, bp_contracts, MAX_CONTRACTS)
+
+    size = contracts * cs
+    side = "BUY" if direction == "LONG" else "SELL"
     oid, actual_cts = place_market_order(asset, side, contracts)
     if not oid:
         msg = f"{asset} {side} {contracts} contracts rejected by Coinbase"
@@ -502,44 +604,52 @@ def enter_position(asset, direction, entry_price, candle):
         add_audit(asset, "ORDER REJECTED", msg)
         ntfy(f"CRITICAL ORDER REJECTED {asset}", msg, priority="urgent")
         return
-    # Use actual_cts — what Coinbase actually filled after retries
     actual_size = actual_cts * cs
     positions[asset] = {
-        "direction":direction, "entry":entry_price,
-        "contracts":actual_cts, "size":actual_size,
-        "trail_peak":entry_price, "trail_stop":trail_stop,
-        "entry_time":ts(),
+        "direction": direction, "entry": entry_price,
+        "contracts": actual_cts, "size": actual_size,
+        "tp": tp, "stop": stop,
+        "strategy": strategy, "entry_time": ts(),
     }
     add_audit(asset, f"📊 ENTER {direction}",
-              f"entry=${entry_price:,.4f} | contracts={actual_cts} | "
-              f"size={actual_size} | trail_stop=${trail_stop:,.4f} | "
-              f"LIVE",
+              f"strategy={strategy} | entry=${entry_price:,.4f} | "
+              f"tp=${tp:,.4f} | stop=${stop:,.4f} | "
+              f"contracts={actual_cts} | size={actual_size} | LIVE",
               candle=candle)
-    # ntfy removed for entries — only errors alerted
+    ntfy(f"ENTER {direction} {asset}",
+         f"{strategy} | entry=${entry_price:,.4f} | tp=${tp:,.4f} | stop=${stop:,.4f} | {actual_cts}ct",
+         priority="default")
 
-def exit_position(asset, exit_price, candle):
+def exit_position(asset, exit_price, exit_reason, candle):
+    """
+    Exit a position at TP or Stop price.
+    exit_reason: "TP" or "STOP"
+    """
     pos = positions.get(asset)
     if not pos: return
     pnl = round(
-        (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
-        else (pos["entry"]-exit_price)*pos["size"], 4)
-    side = "SELL" if pos["direction"]=="LONG" else "BUY"
+        (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
+        else (pos["entry"] - exit_price) * pos["size"], 4)
+    side = "SELL" if pos["direction"] == "LONG" else "BUY"
     place_market_order(asset, side, pos["contracts"])
     record_tax(asset, pos["direction"], pos["entry"], exit_price,
                pos["size"], pnl, pos["entry_time"])
     with lock:
-        state["total_pnl"]  = round(state["total_pnl"]+pnl, 4)
-        state["weekly_pnl"] = round(state["weekly_pnl"]+pnl, 4)
-        state["balance"]    = round(TOTAL_USDC+state["total_pnl"], 4)  # updated below with real CB balance
+        state["total_pnl"]    = round(state["total_pnl"] + pnl, 4)
+        state["weekly_pnl"]   = round(state["weekly_pnl"] + pnl, 4)
+        state["balance"]      = round(TOTAL_USDC + state["total_pnl"], 4)
         state["total_trades"] += 1
-        if pnl>=0: state["wins"]+=1
+        if pnl >= 0: state["wins"] += 1
     del positions[asset]
-    emoji = "✅" if pnl>=0 else "❌"
-    add_audit(asset, f"{emoji} EXIT TRAIL",
+    emoji = "✅" if pnl >= 0 else "❌"
+    add_audit(asset, f"{emoji} EXIT {exit_reason}",
               f"{pos['direction']} ${pos['entry']:,.4f} → ${exit_price:,.4f} | "
-              f"P&L=${pnl:+,.4f}", candle=candle)
-    # Always read real Coinbase balance after exit — captures fees automatically
-    # This keeps app 1:1 with Coinbase regardless of fees or spread
+              f"P&L=${pnl:+,.4f} | strategy={pos.get('strategy','')}",
+              candle=candle)
+    ntfy(f"{emoji} EXIT {exit_reason} {asset}",
+         f"{pos['direction']} | entry=${pos['entry']:,.4f} → exit=${exit_price:,.4f} | P&L=${pnl:+,.2f}",
+         priority="default" if pnl >= 0 else "high")
+    # Refresh real balance from Coinbase after exit
     try:
         live_bal = get_live_balance()
         if live_bal > 0:
@@ -550,23 +660,25 @@ def exit_position(asset, exit_price, candle):
         log(f"Balance refresh error after exit: {e}")
 
 # ══════════════════════════════════════════════════════════════════
-# TRADING LOOP — SEQUENTIAL, no threads, no processing guard
-# Mirrors backtest exactly: one asset at a time per bucket
+# TRADING LOOP — Dual strategy: OpenRange 1hr + AsianRange 5min
+# OpenRange:  runs every 5-min bucket, uses 1-hour candles
+# AsianRange: runs every 5-min bucket 08:00-12:00 UTC, uses 5-min candles
+# Exit: fixed TP and Stop checked every 5-min bucket
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
     global TOTAL_USDC
-    # Always read real balance from Coinbase — paper mode only stops real orders
     live_bal = get_live_balance()
     if live_bal > 0:
         TOTAL_USDC = live_bal
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v43 started")
+    log("🚀 CB Trader v44 started")
     log("   Mode: 🔴 LIVE")
+    log("   Strategy: OpenRange 1hour + AsianRange 5min")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Trail: {TRAIL_PCT*100}% | ATR: {ATR_BUFFER}x | Sep: {SEP_FILTER} | Vol: {VOL_FILTER}x")
-    log(f"   Capital: ${TOTAL_USDC:,.2f} | Leverage: {LEVERAGE}x")
+    log(f"   Perp fees: max(notional×0.02%, $0.15) per side")
+    log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
 
     last_bucket = (int(time.time()) // 300) * 300
 
@@ -575,154 +687,152 @@ def trading_loop():
             current_bucket = (int(time.time()) // 300) * 300
             with lock:
                 state["loop_last_run"] = ts()
-                state["cycle"] = state.get("cycle",0) + 1
+                state["cycle"] = state.get("cycle", 0) + 1
 
             check_weekly_reset()
 
             if current_bucket != last_bucket:
                 last_bucket = current_bucket
-                bucket_dt = datetime.fromtimestamp(current_bucket,
-                            tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-                log(f"🕐 New candle: {bucket_dt} UTC — evaluating {len(ASSET_NAMES)} assets | "
-                    f"open={len(positions)} positions | pending={list(pending_entry.keys())}")
+                bucket_dt     = datetime.fromtimestamp(current_bucket, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                bucket_dt_obj = datetime.fromtimestamp(current_bucket, tz=timezone.utc)
+                hour_utc      = bucket_dt_obj.hour
+                log(f"🕐 {bucket_dt} UTC | open={len(positions)} | "
+                    f"pending={list(pending_entry.keys())} | bal=${state['balance']:,.2f}")
 
-                # ── BUCKET STRATEGY: bucket-only exits, matches backtest ─
                 skipped_assets = []
                 for asset in ASSET_NAMES:
                     try:
-                        candles = fetch_candles(asset)
-                        if not candles or len(candles) < 200: continue
+                        # ── Fetch both timeframes ──────────────────────
+                        candles_5m = fetch_candles(asset, granularity="FIVE_MINUTE", n_candles=201)
+                        candles_1h = fetch_candles(asset, granularity="ONE_HOUR",    n_candles=48)
+                        if not candles_5m or len(candles_5m) < 20:
+                            skipped_assets.append(asset); continue
+                        if not candles_1h or len(candles_1h) < 5:
+                            skipped_assets.append(asset); continue
 
-                        cur = candles[-1]
-                        at  = atr_calc([c["h"] for c in candles],
-                                       [c["l"] for c in candles],
-                                       [c["c"] for c in candles])
-                        av  = at[-1] or 0
+                        cur_5m = candles_5m[-1]
+                        cur_1h = candles_1h[-1]
 
-                        # Skip check
+                        # ── Skip cooldown after exit ───────────────────
                         if skip_entry.get(asset, 0) > 0:
                             skip_entry[asset] -= 1
-                            save_sim_data(asset, current_bucket*1000, candles, {},
-                                         f"SKIP_REENTRY({skip_entry[asset]+1} left)",
-                                         )
                             continue
 
-                        # Trail check — BUCKET ONLY, no WebSocket
+                        # ── Exit check — fixed TP / Stop ──────────────
                         pos = positions.get(asset)
                         if pos:
-                            result = check_trail(pos, cur, av)
-                            if result == "EXIT":
-                                exit_price = pos["trail_stop"]
+                            result = check_exit(pos, cur_5m)
+                            if result in ("TP", "STOP"):
+                                exit_price = pos["tp"] if result == "TP" else pos["stop"]
                                 pnl_est = round(
-                                    (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
-                                    else (pos["entry"]-exit_price)*pos["size"], 4)
-                                save_sim_data(asset, current_bucket*1000, candles, {},
-                                             "EXIT_TRAIL", position=dict(pos), pnl=pnl_est,
-                                             )
-                                # Exit — call exit_position which places real SELL/BUY on Coinbase
-                                exit_position(asset, exit_price, cur)
-                                skip_entry[asset] = 1
+                                    (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
+                                    else (pos["entry"] - exit_price) * pos["size"], 4)
+                                save_sim_data(asset, current_bucket*1000, candles_5m, {},
+                                              f"EXIT_{result}", position=dict(pos), pnl=pnl_est)
+                                exit_position(asset, exit_price, result, cur_5m)
+                                skip_entry[asset] = 2  # skip 2 buckets after exit
                             else:
-                                save_sim_data(asset, current_bucket*1000, candles, {},
-                                             "HOLD", position=dict(pos),
-                                             )
+                                save_sim_data(asset, current_bucket*1000, candles_5m, {},
+                                              "HOLD", position=dict(pos))
                             continue
 
-                        # Pending entry — call enter_position which places real order
+                        # ── Pending entry ──────────────────────────────
                         pend = pending_entry.get(asset)
                         if pend:
-                            entry_price = float(cur["o"])
-                            direction   = pend["direction"]
+                            entry_price = float(cur_5m["o"])
+                            tp   = pend["tp"]
+                            stop = pend["stop"]
+                            strat = pend["strategy"]
                             del pending_entry[asset]
-                            # enter_position places real order on Coinbase then tracks position
-                            enter_position(asset, direction, entry_price, cur)
-                            # Save sim data for monitor comparison
+                            enter_position(asset, pend["direction"], entry_price, tp, stop, cur_5m, strat)
                             if positions.get(asset):
-                                save_sim_data(asset, current_bucket*1000, candles, {},
-                                             f"ENTER_{direction}", position=dict(positions[asset]))
+                                save_sim_data(asset, current_bucket*1000, candles_5m, {},
+                                              f"ENTER_{pend['direction']}", position=dict(positions[asset]))
                             continue
 
-                        # Signal evaluation — shared with WS strategy
-                        direction, sig_candle, indic = evaluate_signal(candles)
-                        save_sim_data(asset, current_bucket*1000, candles, indic,
-                                     f"SIGNAL_{direction}" if direction else f"NO_SIGNAL:{indic.get('fail','?')}",
-                                     position=positions.get(asset),
-                                     )
-                        if direction:
-                            pending_entry[asset] = {
-                                "direction": direction,
-                                "signal_ts": candles[-2]["ts"]
-                            }
-                            add_audit(asset, f"🚨 🚨 SIGNAL {direction}",
-                                     f"signal_candle={sig_candle['dt']} | sep={indic.get('sep')} | vol={indic.get('vol')}x",
-                                     candle=sig_candle, indicators=indic)
+                        # ── STRATEGY 1: OpenRange 1hour ────────────────
+                        # Fire every bucket — uses 1hr candles
+                        d1, tp1, stop1, info1 = evaluate_openrange(candles_1h)
+                        if d1:
+                            pending_entry[asset] = {"direction":d1,"tp":tp1,"stop":stop1,
+                                                    "strategy":"OpenRange","signal_ts":cur_1h["ts"]}
+                            add_audit(asset, f"🚨 OpenRange {d1}",
+                                      f"tp=${tp1:,.4f} | stop=${stop1:,.4f} | {info1}",
+                                      candle=cur_1h, indicators=info1)
+                            save_sim_data(asset, current_bucket*1000, candles_5m, info1,
+                                          f"SIGNAL_OR_{d1}")
+                            continue  # don't check AsianRange if OpenRange fired
+
+                        # ── STRATEGY 2: AsianRange 5min ───────────────
+                        # Only fires 08:00-12:00 UTC (London open window)
+                        d2, tp2, stop2, info2 = evaluate_asianrange(candles_5m)
+                        if d2:
+                            pending_entry[asset] = {"direction":d2,"tp":tp2,"stop":stop2,
+                                                    "strategy":"AsianRange","signal_ts":cur_5m["ts"]}
+                            add_audit(asset, f"🚨 AsianRange {d2}",
+                                      f"tp=${tp2:,.4f} | stop=${stop2:,.4f} | {info2}",
+                                      candle=cur_5m, indicators=info2)
+                            save_sim_data(asset, current_bucket*1000, candles_5m, info2,
+                                          f"SIGNAL_AR_{d2}")
+                            continue
+
+                        # No signal
+                        save_sim_data(asset, current_bucket*1000, candles_5m,
+                                      {"OR":info1.get("fail","?"), "AR":info2.get("fail","?")},
+                                      f"NO_SIGNAL")
 
                     except Exception as e:
+                        import traceback
                         log(f"Asset error {asset}: {e}")
+                        log(traceback.format_exc())
 
-                # ── Heartbeat after all assets processed ─────────────
+                # ── Heartbeat ──────────────────────────────────────────
+                with lock:
+                    state["skipped_assets"] = skipped_assets
+                    cycle_num = state.get("cycle", 0)
                 if skipped_assets:
-                    log(f"⚠️ Skipped assets (insufficient candles): {skipped_assets}")
-                    with lock:
-                        state["skipped_assets"] = skipped_assets
-                else:
-                    with lock:
-                        state["skipped_assets"] = []
-                # Refresh live balance every 50 cycles (always — paper or live)
-                with lock: cycle_num = state.get("cycle", 0) + 1; state["cycle"] = cycle_num
+                    log(f"⚠️ Skipped: {skipped_assets}")
+
+                # Refresh balance every 50 cycles
                 if cycle_num % 50 == 0:
                     try:
                         live_bal = get_live_balance()
                         if live_bal > 0:
                             with lock: state["balance"] = live_bal
                     except: pass
+
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
                           f"pending={list(pending_entry.keys())} | "
-                          f"skipped={skipped_assets} | "
                           f"balance=${state['balance']:,.2f} | trades={state['total_trades']}")
 
-                # ── Weekly P&L report — every Monday at 9am UTC ──────────
-                bucket_dt_obj = datetime.fromtimestamp(current_bucket, tz=timezone.utc)
-                if bucket_dt_obj.weekday() == 0 and bucket_dt_obj.hour == 9 and bucket_dt_obj.minute < 5:
+                # ── Weekly P&L report ──────────────────────────────────
+                if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 5:
                     with lock:
-                        wpnl = state["weekly_pnl"]
-                        bal  = state["balance"]
+                        wpnl = state["weekly_pnl"]; bal = state["balance"]
                         trd  = state["total_trades"]
                         wr   = round(state["wins"]/trd*100,1) if trd else 0
-                    week_str = bucket_dt_obj.strftime("%Y-%m-%d")
                     ntfy("Weekly P&L Report",
-                         f"Week: {week_str} | P&L: ${wpnl:+,.2f} | Bal: ${bal:,.2f} | Trades: {trd} | WR: {wr}%",
-                         priority="default")
+                         f"Week: {bucket_dt_obj.strftime('%Y-%m-%d')} | P&L: ${wpnl:+,.2f} | "
+                         f"Bal: ${bal:,.2f} | Trades: {trd} | WR: {wr}%")
                     with lock: state["weekly_pnl"] = 0.0
 
-                # ── Emergency stop — balance below 50% ───────────────────
-                with lock:
-                    bal      = state["balance"]
-                    starting = TOTAL_USDC
-                if bal < starting * 0.5 and len(positions) == 0:
+                # ── Emergency stop ─────────────────────────────────────
+                with lock: bal = state["balance"]
+                if bal < TOTAL_USDC * 0.5 and len(positions) == 0:
                     ntfy("EMERGENCY Balance Alert",
-                         f"Balance ${bal:,.2f} below 50% of ${starting:,.2f} — review immediately",
+                         f"Balance ${bal:,.2f} below 50% of ${TOTAL_USDC:,.2f} — review immediately",
                          priority="urgent")
-
-                # ── Auto-roll check — 5 days before Aug 28 expiry ────────
-                from datetime import date as ddate
-                today      = ddate.today()
-                expiry_aug = ddate(2026, 8, 28)
-                days_left  = (expiry_aug - today).days
-                if days_left == ROLL_DAYS_BEFORE and bucket_dt_obj.hour == 9 and bucket_dt_obj.minute < 5:
-                    ntfy("Contract Roll Starting",
-                         f"Aug 28 expires in {days_left} days — auto-rolling to Sep 25 tickers",
-                         priority="high")
 
         except Exception as e:
             with lock:
-                state["loop_errors"] = state.get("loop_errors",0)+1
+                state["loop_errors"] = state.get("loop_errors", 0) + 1
                 errs = state["loop_errors"]
             log(f"Loop error {errs}: {e}")
             if errs in (3, 10, 25):
-                pri = "urgent" if errs >= 10 else "high"
-                ntfy(f"CRITICAL loop errors: {errs}", f"Loop error #{errs}: {str(e)[:100]}", priority=pri)
+                ntfy(f"CRITICAL loop errors: {errs}",
+                     f"Loop error #{errs}: {str(e)[:100]}",
+                     priority="urgent" if errs >= 10 else "high")
 
         time.sleep(30)
 
@@ -891,7 +1001,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     days_left   = (active_exp - today_d).days
     active_label= "AUG 28" if days_to_aug > 0 else "SEP 25"
     roll_color  = "#00D68F" if days_left > 10 else "#FFB800" if days_left > 5 else "#FF4757"
-    roll_status = "Trading normally" if days_left > ROLL_DAYS_BEFORE else f"AUTO-ROLLING to {'SEP 25' if days_to_aug <= 0 else 'SEP 25'} ✅" if days_left <= 0 else f"Rolling in {days_left} days"
+    roll_status = "No roll needed — DEC 2030 expiry"
 
     # Positions
     pos_rows = ""
@@ -970,7 +1080,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v30</title>
+<title>CB Trader v44</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1056,8 +1166,8 @@ function show(id,el){{
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
-    EMA 5/13/50 · Sep ≥0.2% · Vol ≥0.3x · 10-bar breakout<br>
-    Trail 0.2% · ATR 2.0x · 5-min candles · Bucket exits only<br>
+    OpenRange 1hour + AsianRange 5min · Fixed 2:1 TP:Stop<br>
+    8 perp contracts · No rolls · DEC 2030 expiry<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
 <div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
 <div class=kpis>
@@ -1074,11 +1184,11 @@ function show(id,el){{
     10x leverage · {len(ASSET_NAMES)} assets · Contract roll Aug 28<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Contract Status</b><br>
-    Active: {active_label} contracts · <span style='color:{roll_color}'>{days_left} days left</span><br>
-    Status: <span style='color:{roll_color}'>{roll_status}</span><br>
+    Perp-style futures · DEC 2030 expiry · No monthly rolls<br>
+    Fees: max(notional×0.02%, $0.15) per side<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>2026 Q1 Backtest</b><br>
-    Fixed $1k · $33k gross · 56.3% WR · 14/14 green weeks<br>
+    $566 account · $1,528/month combined · All 3 periods green<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Links</b><br>
     <a href='/health'>Health</a> &nbsp;·&nbsp;
@@ -1094,11 +1204,12 @@ function show(id,el){{
 # ══════════════════════════════════════════════════════════════════
 log("📡 Pre-loading candles via REST...")
 for a in ASSET_NAMES:
-    c = fetch_candles(a)
-    log(f"  {a}: {len(c) if c else 0} candles loaded")
-    time.sleep(0.3)  # avoid 429 rate limit on startup
+    c5 = fetch_candles(a, granularity="FIVE_MINUTE", n_candles=201)
+    c1 = fetch_candles(a, granularity="ONE_HOUR",    n_candles=48)
+    log(f"  {a}: {len(c5) if c5 else 0} 5m candles | {len(c1) if c1 else 0} 1h candles")
+    time.sleep(0.5)  # avoid 429 rate limit on startup
 log("✅ All candles pre-loaded")
 
 check_weekly_reset()
-threading.Thread(target=start_websocket, daemon=True).start()
-threading.Thread(target=trading_loop,    daemon=True).start()
+# No WebSocket needed — fixed TP/stop exits checked at each 5-min bucket
+threading.Thread(target=trading_loop, daemon=True).start()
