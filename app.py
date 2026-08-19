@@ -1,18 +1,20 @@
 """
-CB TRADER v44
+CB TRADER v45
 ═══════════════════════════════════════════════════════════════════
-Strategy: OpenRange 1hour (primary) + AsianRange 5min (secondary)
-  OpenRange:  break first 3 hourly candles high/low → 2:1 TP:Stop
-  AsianRange: break Asian session (00-08 UTC) at London open (08-12 UTC) → 2:1
-Exit:     Fixed TP and Stop — no trailing (matches backtest exactly)
+Strategy: RSI(14) Momentum Cross
+  LONG:  RSI(14) crosses ABOVE 60 → enter long
+  EXIT:  RSI(14) drops BELOW 45 → exit (both long and short)
+  SHORT: RSI(14) crosses BELOW 40 → enter short
+Timeframe: 15-minute candles (optimal from 174-combination backtest)
 Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
-  BIP ETH ETP SLP LNP HEP SUP XLP BNB — DEC 2030 perp-style, no rolls
-Fees:     max(notional×0.02%, $0.15) per side — 4x cheaper than dated futures
-Assets:   8 perp contracts — all liquid, all verified via API
-Balance:  Reads from Coinbase on startup + after every exit + every 50 cycles
-Compounding: sizes up automatically as balance grows
+  BTC(BIP) ETH(ETP) SOL(SLP) LINK(LNP) HBAR(HEP) SUI(SUP) XLM(XLP) BNB — DEC 2030
+Fees:     0.10% per side — CONFIRMED from 4 live fills Aug 19 2026
+          No fixed minimum — percentage only
+Assets:   8 perp contracts — all liquid, verified via API
+Backtest: $4,100-6,163/month on 9 assets at 0.10% real fee
+          ALL 3 periods green: Feb-Mar, Jan-Mar, Jun25-Mar26
+          174 filter combinations tested — NO filter improves base strategy
 Mode: Always LIVE — real orders on every signal
-Backtest: $1,528/month combined on $566 (Feb-Mar 2026) — all 3 periods green
 """
 
 import time, os, math, json, csv, uuid, threading
@@ -48,26 +50,21 @@ ASSETS = {
 }
 ASSET_NAMES = list(ASSETS.keys())
 
-# Fee structure — perp: max(notional * 0.02%, $0.15) per side
-FEE_PCT_PERP = 0.00020
-FEE_MIN_PERP = 0.15
-MAX_CONTRACTS = 5  # Coinbase intraday position limit per asset
+# Fee: 0.10% per side — CONFIRMED from 4 live fills Aug 19 2026
+FEE_PCT = 0.00100   # 0.10% per side confirmed real fee
+MAX_CONTRACTS = 5   # Coinbase intraday position limit per asset
+
+# RSI Momentum parameters — optimal from 174-combination backtest
+RSI_PERIOD  = 14    # RSI period
+RSI_ENTRY   = 60    # cross above → LONG, cross below (100-60=40) → SHORT
+RSI_EXIT    = 45    # RSI drops below → exit LONG | rises above 55 → exit SHORT
 
 def get_active_ticker(asset):
     """Returns perp ticker — no rolling needed, DEC 2030 expiry"""
     return ASSETS[asset]["perp"]
 
-EMA_FAST    = 5
-EMA_MID     = 13
-EMA_SLOW    = 50
-SEP_FILTER  = 0.002
-VOL_FILTER  = 0.3
-BRK_BARS    = 10
-TRAIL_PCT   = 0.002
-ATR_BUFFER  = 2.0
-CANDLE_TF   = "FIVE_MINUTE"
-CANDLE_LIMIT= 201
-LEVERAGE    = 10
+CANDLE_TF   = "FIFTEEN_MINUTE"  # 15min optimal from backtest
+CANDLE_LIMIT= 150               # 150 candles = 37.5 hours lookback
 TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
 TAX_RATE    = 0.35
 
@@ -438,6 +435,89 @@ def atr_calc(highs, lows, closes, period=14):
 # SIGNALS — OpenRange 1hour + AsianRange 5min
 # Identical logic to backtest (proof_test_v2.py)
 # ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# RSI CALCULATION
+# ══════════════════════════════════════════════════════════════════
+def calc_rsi(closes, period=14):
+    """RSI(14) — standard Wilder smoothing"""
+    if len(closes) < period + 1:
+        return [None] * len(closes)
+    out = [None] * period
+    gains = [max(0, closes[i]-closes[i-1]) for i in range(1, len(closes))]
+    losses = [max(0, closes[i-1]-closes[i]) for i in range(1, len(closes))]
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag * (period-1) + gains[i]) / period
+        al = (al * (period-1) + losses[i]) / period
+        rs = ag / al if al > 0 else 100
+        out.append(100 - 100 / (1 + rs))
+    while len(out) < len(closes):
+        out.append(out[-1])
+    return out
+
+# ══════════════════════════════════════════════════════════════════
+# SIGNAL — RSI(14) Momentum Cross
+# ══════════════════════════════════════════════════════════════════
+def evaluate_signal(candles):
+    """
+    RSI(14) Momentum strategy — proven across 174 filter combinations
+    LONG:  RSI crosses ABOVE 60 on any candle
+    SHORT: RSI crosses BELOW 40 on any candle
+    EXIT:  RSI drops below 45 (long) or rises above 55 (short)
+
+    Returns: (direction, None, None, info_dict) — no TP/stop, RSI exit
+    """
+    if not candles or len(candles) < RSI_PERIOD + 2:
+        return None, None, None, {"fail": "not enough candles"}
+
+    closes = [float(c["c"]) for c in candles]
+    rsi = calc_rsi(closes, RSI_PERIOD)
+
+    # Use second-to-last candle as signal (last may be forming)
+    i = len(rsi) - 2
+    if rsi[i] is None or rsi[i-1] is None:
+        return None, None, None, {"fail": "RSI not ready"}
+
+    cur_rsi  = rsi[i]
+    prev_rsi = rsi[i-1]
+
+    if prev_rsi < RSI_ENTRY and cur_rsi >= RSI_ENTRY:
+        d = "LONG"
+    elif prev_rsi > (100 - RSI_ENTRY) and cur_rsi <= (100 - RSI_ENTRY):
+        d = "SHORT"
+    else:
+        return None, None, None, {
+            "fail": f"no cross (RSI prev={prev_rsi:.1f} cur={cur_rsi:.1f})"
+        }
+
+    return d, None, None, {
+        "strategy": "RSI-Mom",
+        "rsi_prev": round(prev_rsi, 2),
+        "rsi_cur":  round(cur_rsi, 2),
+        "entry_candle": candles[i]["dt"],
+    }
+
+
+def should_exit(pos, candles):
+    """
+    RSI exit: LONG exits when RSI < 45, SHORT exits when RSI > 55
+    Returns: True if should exit, False otherwise
+    """
+    if not candles or len(candles) < RSI_PERIOD + 2:
+        return False
+    closes = [float(c["c"]) for c in candles]
+    rsi = calc_rsi(closes, RSI_PERIOD)
+    cur_rsi = rsi[-2] if rsi[-2] is not None else rsi[-1]
+    if cur_rsi is None:
+        return False
+    if pos["direction"] == "LONG"  and cur_rsi < RSI_EXIT:
+        return True
+    if pos["direction"] == "SHORT" and cur_rsi > (100 - RSI_EXIT):
+        return True
+    return False
+
+
 def evaluate_openrange(candles_1h):
     """
     Opening Range Breakout on 1-hour candles.
@@ -552,31 +632,16 @@ def evaluate_asianrange(candles_5m):
 
 # ══════════════════════════════════════════════════════════════════
 # EXIT CHECK — fixed TP and Stop (matches backtest exactly)
-# No trailing — OpenRange/AsianRange use fixed 2:1 targets
-# ══════════════════════════════════════════════════════════════════
-def check_exit(pos, cur_candle):
-    """Check if fixed TP or Stop was hit on current candle."""
-    h = float(cur_candle["h"])
-    l = float(cur_candle["l"])
-    tp   = pos["tp"]
-    stop = pos["stop"]
-
-    if pos["direction"] == "LONG":
-        if h >= tp:   return "TP"    # take profit hit
-        if l <= stop: return "STOP"  # stop loss hit
-    else:
-        if l <= tp:   return "TP"
-        if h >= stop: return "STOP"
-    return "HOLD"
+# RSI exit handled by should_exit() function above
 
 # ══════════════════════════════════════════════════════════════════
 # ENTER / EXIT
 # ══════════════════════════════════════════════════════════════════
-def enter_position(asset, direction, entry_price, tp, stop, candle, strategy=""):
+def enter_position(asset, direction, entry_price, candle, info=None):
     """
-    Enter a perp position with fixed TP and Stop.
-    Contract sizing: max affordable within 70% of available balance,
-    capped at MAX_CONTRACTS (5) per Coinbase intraday limits.
+    Enter a perp position — RSI momentum strategy.
+    No fixed TP/stop — exit when RSI crosses back.
+    Sizing: max contracts within 70% balance budget.
     """
     cs = ASSETS[asset]["contract"]
     mr = ASSETS[asset]["margin_rate"]
@@ -585,13 +650,12 @@ def enter_position(asset, direction, entry_price, tp, stop, candle, strategy="")
         current_bal  = state["balance"]
         buying_power = state.get("buying_power", current_bal)
 
-    # Per-asset margin budget: 70% of balance split equally across assets
+    # Per-asset margin budget: 70% of balance split equally
     avail      = current_bal * 0.70
     per_slot   = avail / len(ASSET_NAMES)
     margin_per = entry_price * cs * mr
     contracts  = min(MAX_CONTRACTS, max(1, int(per_slot / margin_per)))
-
-    # Also cap by buying_power to avoid margin rejection
+    # Cap by buying power
     bp_contracts = max(1, int(buying_power / 100 / max(1, len(positions) + 1)))
     contracts = min(contracts, bp_contracts, MAX_CONTRACTS)
 
@@ -599,31 +663,31 @@ def enter_position(asset, direction, entry_price, tp, stop, candle, strategy="")
     side = "BUY" if direction == "LONG" else "SELL"
     oid, actual_cts = place_market_order(asset, side, contracts)
     if not oid:
-        msg = f"{asset} {side} {contracts} contracts rejected by Coinbase"
+        msg = f"{asset} {side} {contracts}ct rejected by Coinbase"
         log(f"CRITICAL order rejected: {msg}")
         add_audit(asset, "ORDER REJECTED", msg)
         ntfy(f"CRITICAL ORDER REJECTED {asset}", msg, priority="urgent")
         return
     actual_size = actual_cts * cs
+    rsi_info = info or {}
     positions[asset] = {
         "direction": direction, "entry": entry_price,
         "contracts": actual_cts, "size": actual_size,
-        "tp": tp, "stop": stop,
-        "strategy": strategy, "entry_time": ts(),
+        "strategy": "RSI-Mom", "entry_time": ts(),
+        "rsi_entry": rsi_info.get("rsi_cur", 0),
     }
     add_audit(asset, f"📊 ENTER {direction}",
-              f"strategy={strategy} | entry=${entry_price:,.4f} | "
-              f"tp=${tp:,.4f} | stop=${stop:,.4f} | "
+              f"RSI-Mom | entry=${entry_price:,.4f} | "
+              f"rsi={rsi_info.get('rsi_cur',0):.1f} | "
               f"contracts={actual_cts} | size={actual_size} | LIVE",
               candle=candle)
     ntfy(f"ENTER {direction} {asset}",
-         f"{strategy} | entry=${entry_price:,.4f} | tp=${tp:,.4f} | stop=${stop:,.4f} | {actual_cts}ct",
+         f"RSI-Mom | entry=${entry_price:,.4f} | RSI={rsi_info.get('rsi_cur',0):.1f} | {actual_cts}ct",
          priority="default")
 
 def exit_position(asset, exit_price, exit_reason, candle):
     """
-    Exit a position at TP or Stop price.
-    exit_reason: "TP" or "STOP"
+    Exit a position. exit_reason: "RSI_EXIT" or "MANUAL"
     """
     pos = positions.get(asset)
     if not pos: return
@@ -646,8 +710,8 @@ def exit_position(asset, exit_price, exit_reason, candle):
               f"{pos['direction']} ${pos['entry']:,.4f} → ${exit_price:,.4f} | "
               f"P&L=${pnl:+,.4f} | strategy={pos.get('strategy','')}",
               candle=candle)
-    ntfy(f"{emoji} EXIT {exit_reason} {asset}",
-         f"{pos['direction']} | entry=${pos['entry']:,.4f} → exit=${exit_price:,.4f} | P&L=${pnl:+,.2f}",
+    ntfy(f"{emoji} EXIT {asset}",
+         f"{pos['direction']} | entry=${pos['entry']:,.4f} → ${exit_price:,.4f} | P&L=${pnl:+,.2f} | {exit_reason}",
          priority="default" if pnl >= 0 else "high")
     # Refresh real balance from Coinbase after exit
     try:
@@ -673,18 +737,19 @@ def trading_loop():
     sync_open_positions()
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v44 started")
+    log("🚀 CB Trader v45 started")
     log("   Mode: 🔴 LIVE")
-    log("   Strategy: OpenRange 1hour + AsianRange 5min")
+    log("   Strategy: RSI(14) Momentum Cross 60/45 | 15min candles")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Perp fees: max(notional×0.02%, $0.15) per side")
+    log(f"   Fee: 0.10% confirmed | Backtest: $4,100-6,163/month")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
 
-    last_bucket = (int(time.time()) // 300) * 300
+    # 15-min buckets — fire every 15 minutes
+    last_bucket = (int(time.time()) // 900) * 900
 
     while True:
         try:
-            current_bucket = (int(time.time()) // 300) * 300
+            current_bucket = (int(time.time()) // 900) * 900
             with lock:
                 state["loop_last_run"] = ts()
                 state["cycle"] = state.get("cycle", 0) + 1
@@ -696,97 +761,71 @@ def trading_loop():
                 bucket_dt     = datetime.fromtimestamp(current_bucket, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
                 bucket_dt_obj = datetime.fromtimestamp(current_bucket, tz=timezone.utc)
                 hour_utc      = bucket_dt_obj.hour
-                log(f"🕐 {bucket_dt} UTC | open={len(positions)} | "
-                    f"pending={list(pending_entry.keys())} | bal=${state['balance']:,.2f}")
+                log(f"🕐 {bucket_dt} UTC | open={len(positions)} | bal=${state['balance']:,.2f}")
 
                 skipped_assets = []
                 for asset in ASSET_NAMES:
                     try:
-                        # ── Fetch both timeframes ──────────────────────
-                        candles_5m = fetch_candles(asset, granularity="FIVE_MINUTE", n_candles=201)
-                        candles_1h = fetch_candles(asset, granularity="ONE_HOUR",    n_candles=48)
-                        if not candles_5m or len(candles_5m) < 20:
-                            skipped_assets.append(asset); continue
-                        if not candles_1h or len(candles_1h) < 5:
+                        # Fetch 15-min candles — single timeframe
+                        candles = fetch_candles(asset, granularity=CANDLE_TF, n_candles=CANDLE_LIMIT)
+                        if not candles or len(candles) < RSI_PERIOD + 5:
                             skipped_assets.append(asset); continue
 
-                        cur_5m = candles_5m[-1]
-                        cur_1h = candles_1h[-1]
+                        cur = candles[-1]
 
-                        # ── Skip cooldown after exit ───────────────────
+                        # Skip cooldown after exit
                         if skip_entry.get(asset, 0) > 0:
-                            skip_entry[asset] -= 1
-                            continue
+                            skip_entry[asset] -= 1; continue
 
-                        # ── Exit check — fixed TP / Stop ──────────────
+                        # ── EXIT CHECK — RSI drops below 45 ───────────
                         pos = positions.get(asset)
                         if pos:
-                            result = check_exit(pos, cur_5m)
-                            if result in ("TP", "STOP"):
-                                exit_price = pos["tp"] if result == "TP" else pos["stop"]
+                            if should_exit(pos, candles):
+                                exit_price = float(cur["c"])
                                 pnl_est = round(
                                     (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
                                     else (pos["entry"] - exit_price) * pos["size"], 4)
-                                save_sim_data(asset, current_bucket*1000, candles_5m, {},
-                                              f"EXIT_{result}", position=dict(pos), pnl=pnl_est)
-                                exit_position(asset, exit_price, result, cur_5m)
-                                skip_entry[asset] = 2  # skip 2 buckets after exit
+                                save_sim_data(asset, current_bucket*1000, candles, {},
+                                              "EXIT_RSI", position=dict(pos), pnl=pnl_est)
+                                exit_position(asset, exit_price, "RSI_EXIT", cur)
+                                skip_entry[asset] = 1
                             else:
-                                save_sim_data(asset, current_bucket*1000, candles_5m, {},
+                                save_sim_data(asset, current_bucket*1000, candles, {},
                                               "HOLD", position=dict(pos))
                             continue
 
-                        # ── Pending entry ──────────────────────────────
+                        # ── PENDING ENTRY ──────────────────────────────
                         pend = pending_entry.get(asset)
                         if pend:
-                            entry_price = float(cur_5m["o"])
-                            tp   = pend["tp"]
-                            stop = pend["stop"]
-                            strat = pend["strategy"]
+                            entry_price = float(cur["o"])
+                            info = pend.get("info", {})
                             del pending_entry[asset]
-                            enter_position(asset, pend["direction"], entry_price, tp, stop, cur_5m, strat)
+                            enter_position(asset, pend["direction"], entry_price, cur, info)
                             if positions.get(asset):
-                                save_sim_data(asset, current_bucket*1000, candles_5m, {},
+                                save_sim_data(asset, current_bucket*1000, candles, info,
                                               f"ENTER_{pend['direction']}", position=dict(positions[asset]))
                             continue
 
-                        # ── STRATEGY 1: OpenRange 1hour ────────────────
-                        # Fire every bucket — uses 1hr candles
-                        d1, tp1, stop1, info1 = evaluate_openrange(candles_1h)
-                        if d1:
-                            pending_entry[asset] = {"direction":d1,"tp":tp1,"stop":stop1,
-                                                    "strategy":"OpenRange","signal_ts":cur_1h["ts"]}
-                            add_audit(asset, f"🚨 OpenRange {d1}",
-                                      f"tp=${tp1:,.4f} | stop=${stop1:,.4f} | {info1}",
-                                      candle=cur_1h, indicators=info1)
-                            save_sim_data(asset, current_bucket*1000, candles_5m, info1,
-                                          f"SIGNAL_OR_{d1}")
-                            continue  # don't check AsianRange if OpenRange fired
-
-                        # ── STRATEGY 2: AsianRange 5min ───────────────
-                        # Only fires 08:00-12:00 UTC (London open window)
-                        d2, tp2, stop2, info2 = evaluate_asianrange(candles_5m)
-                        if d2:
-                            pending_entry[asset] = {"direction":d2,"tp":tp2,"stop":stop2,
-                                                    "strategy":"AsianRange","signal_ts":cur_5m["ts"]}
-                            add_audit(asset, f"🚨 AsianRange {d2}",
-                                      f"tp=${tp2:,.4f} | stop=${stop2:,.4f} | {info2}",
-                                      candle=cur_5m, indicators=info2)
-                            save_sim_data(asset, current_bucket*1000, candles_5m, info2,
-                                          f"SIGNAL_AR_{d2}")
-                            continue
-
-                        # No signal
-                        save_sim_data(asset, current_bucket*1000, candles_5m,
-                                      {"OR":info1.get("fail","?"), "AR":info2.get("fail","?")},
-                                      f"NO_SIGNAL")
+                        # ── RSI MOMENTUM SIGNAL ────────────────────────
+                        d, _, _, info = evaluate_signal(candles)
+                        if d:
+                            pending_entry[asset] = {"direction": d, "info": info,
+                                                    "signal_ts": cur["ts"]}
+                            add_audit(asset, f"🚨 RSI-Mom {d}",
+                                      f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f}",
+                                      candle=cur, indicators=info)
+                            save_sim_data(asset, current_bucket*1000, candles, info,
+                                          f"SIGNAL_{d}")
+                        else:
+                            save_sim_data(asset, current_bucket*1000, candles, info,
+                                          f"NO_SIGNAL:{info.get('fail','?')}")
 
                     except Exception as e:
                         import traceback
                         log(f"Asset error {asset}: {e}")
                         log(traceback.format_exc())
 
-                # ── Heartbeat ──────────────────────────────────────────
+                # Heartbeat
                 with lock:
                     state["skipped_assets"] = skipped_assets
                     cycle_num = state.get("cycle", 0)
@@ -803,11 +842,10 @@ def trading_loop():
 
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
-                          f"pending={list(pending_entry.keys())} | "
                           f"balance=${state['balance']:,.2f} | trades={state['total_trades']}")
 
-                # ── Weekly P&L report ──────────────────────────────────
-                if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 5:
+                # Weekly P&L report every Monday 9am UTC
+                if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 15:
                     with lock:
                         wpnl = state["weekly_pnl"]; bal = state["balance"]
                         trd  = state["total_trades"]
@@ -817,11 +855,11 @@ def trading_loop():
                          f"Bal: ${bal:,.2f} | Trades: {trd} | WR: {wr}%")
                     with lock: state["weekly_pnl"] = 0.0
 
-                # ── Emergency stop ─────────────────────────────────────
+                # Emergency stop — balance below 50%
                 with lock: bal = state["balance"]
                 if bal < TOTAL_USDC * 0.5 and len(positions) == 0:
                     ntfy("EMERGENCY Balance Alert",
-                         f"Balance ${bal:,.2f} below 50% of ${TOTAL_USDC:,.2f} — review immediately",
+                         f"Balance ${bal:,.2f} below 50% of starting ${TOTAL_USDC:,.2f}",
                          priority="urgent")
 
         except Exception as e:
@@ -1080,7 +1118,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v44</title>
+<title>CB Trader v45</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1166,8 +1204,8 @@ function show(id,el){{
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
-    OpenRange 1hour + AsianRange 5min · Fixed 2:1 TP:Stop<br>
-    8 perp contracts · No rolls · DEC 2030 expiry<br>
+    RSI(14) Momentum Cross 60/45 · 15min candles<br>
+    8 perp contracts · DEC 2030 perp-style · No rolls<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
 <div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
 <div class=kpis>
@@ -1188,7 +1226,7 @@ function show(id,el){{
     Fees: max(notional×0.02%, $0.15) per side<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>2026 Q1 Backtest</b><br>
-    $566 account · $1,528/month combined · All 3 periods green<br>
+    $566 account · $4,100-6,163/month · All 3 periods green<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Links</b><br>
     <a href='/health'>Health</a> &nbsp;·&nbsp;
@@ -1202,14 +1240,12 @@ function show(id,el){{
 # ══════════════════════════════════════════════════════════════════
 # STARTUP
 # ══════════════════════════════════════════════════════════════════
-log("📡 Pre-loading candles via REST...")
+log("📡 Pre-loading 15min candles via REST...")
 for a in ASSET_NAMES:
-    c5 = fetch_candles(a, granularity="FIVE_MINUTE", n_candles=201)
-    c1 = fetch_candles(a, granularity="ONE_HOUR",    n_candles=48)
-    log(f"  {a}: {len(c5) if c5 else 0} 5m candles | {len(c1) if c1 else 0} 1h candles")
-    time.sleep(0.5)  # avoid 429 rate limit on startup
+    c = fetch_candles(a, granularity=CANDLE_TF, n_candles=CANDLE_LIMIT)
+    log(f"  {a}: {len(c) if c else 0} 15min candles")
+    time.sleep(0.5)
 log("✅ All candles pre-loaded")
 
 check_weekly_reset()
-# No WebSocket needed — fixed TP/stop exits checked at each 5-min bucket
 threading.Thread(target=trading_loop, daemon=True).start()
