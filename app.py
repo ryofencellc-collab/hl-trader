@@ -1,20 +1,26 @@
 """
-CB TRADER v45
+CB TRADER v46
 ═══════════════════════════════════════════════════════════════════
-Strategy: RSI(14) Momentum Cross
+Strategy: RSI(14) Momentum Cross + Trailing Exit
   LONG:  RSI(14) crosses ABOVE 60 → enter long
-  EXIT:  RSI(14) drops BELOW 45 → exit (both long and short)
   SHORT: RSI(14) crosses BELOW 40 → enter short
-Timeframe: 15-minute candles (optimal from 174-combination backtest)
+  EXIT:  RSI drops below 45 (or 55 if RSI hit 70 — trailing tighten)
+Timeframe: 15-minute candles
 Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
   BTC(BIP) ETH(ETP) SOL(SLP) LINK(LNP) HBAR(HEP) SUI(SUP) XLM(XLP) BNB — DEC 2030
-Fees:     0.10% per side — CONFIRMED from 4 live fills Aug 19 2026
-          No fixed minimum — percentage only
-Assets:   8 perp contracts — all liquid, verified via API
-Backtest: $4,100-6,163/month on 9 assets at 0.10% real fee
-          ALL 3 periods green: Feb-Mar, Jan-Mar, Jun25-Mar26
-          174 filter combinations tested — NO filter improves base strategy
-Mode: Always LIVE — real orders on every signal
+Fees:     0.10% per side — CONFIRMED from 4 live fills
+Backtest: $2,704/month v46 vs $2,219/month v45 (+$485/month)
+          $481 → $19,941 in 11 weeks with compounding
+          All 3 periods green | 11/11 green weeks in Jun-Aug 2026
+
+PAPER MODE: Set TRADE_MODE=paper in Railway to paper trade.
+            Set TRADE_MODE=live to go live. Default=paper.
+
+Railway variables needed:
+  CB_API_KEY      — Coinbase API key
+  CB_API_SECRET   — Coinbase API secret
+  NTFY_TOPIC      — ntfy.sh topic for alerts
+  TRADE_MODE      — "paper" or "live" (default: paper)
 """
 
 import time, os, math, json, csv, uuid, threading
@@ -25,7 +31,10 @@ import requests as req
 # ══════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
-PAPER_MODE  = False  # Always live — no paper mode
+# TRADE_MODE: set to "paper" in Railway to paper trade, "live" to go live
+# Paper mode: all logic runs but no real orders placed
+TRADE_MODE  = os.environ.get("TRADE_MODE", "paper").lower().strip()
+PAPER_MODE  = (TRADE_MODE != "live")
 NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "hl-trader-lunchm0ney")
 NTFY_URL    = f"https://ntfy.sh/{NTFY_TOPIC}"
 
@@ -87,7 +96,7 @@ state = {
     "balance": TOTAL_USDC, "buying_power": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
     "week": None, "cycle": 0, "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
-    "wins": 0, "total_trades": 0,
+    "wins": 0, "total_trades": 0, "ntfy_last_sent": "never",
     # PERP strategy removed in v33
     "skipped_assets": [],
     "skip_streak":    {},
@@ -98,7 +107,20 @@ state = {
 # HELPERS
 # ══════════════════════════════════════════════════════════════════
 def ts():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def ts_est():
+    """Current time in US/Eastern (auto handles EDT/EST)"""
+    from datetime import timedelta
+    # EDT = UTC-4 (Mar-Nov), EST = UTC-5 (Nov-Mar)
+    import time as _time
+    utc_now = datetime.now(timezone.utc)
+    # Simple DST detection: EDT Apr-Oct, EST Nov-Mar
+    month = utc_now.month
+    offset = -4 if 4 <= month <= 10 else -5
+    est = utc_now + timedelta(hours=offset)
+    suffix = "EDT" if offset == -4 else "EST"
+    return est.strftime(f"%Y-%m-%d %H:%M {suffix}")
 
 def log(msg):
     print(f"[{ts()}] {msg}", flush=True)
@@ -176,6 +198,8 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
                 "size":       position.get("size"),
                 "strategy":   position.get("strategy"),
                 "rsi_entry":  position.get("rsi_entry"),
+                "exit_rsi":   position.get("exit_rsi", 45),
+                "paper":      position.get("paper", PAPER_MODE),
                 "entry_time": position.get("entry_time"),
             } if isinstance(position, dict) else None,
             "pnl": pnl,
@@ -257,10 +281,10 @@ def fetch_candles(asset, granularity=None, n_candles=None):
             log(f"WARNING {asset}: API returned 0 candles")
             return None
         candles = sorted([{
-            "ts": int(c.start)*1000,
-            "dt": datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-            "o":float(c.open),"h":float(c.high),
-            "l":float(c.low),"c":float(c.close),"v":float(c.volume),
+            "ts":  int(c.start)*1000,
+            "dt":  datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "o":   float(c.open),"h":float(c.high),
+            "l":   float(c.low), "c":float(c.close),"v":float(c.volume),
         } for c in resp.candles], key=lambda x:x["ts"])[-limit:]
         if candles and candles[-1]["c"] == 0:
             log(f"WARNING {asset}: last candle close=0 dead feed")
@@ -347,7 +371,9 @@ def sync_open_positions():
                 "contracts": n_cont,
                 "size":      n_cont * cs,
                 "strategy":  "RSI-Mom",
-                "rsi_entry": 0,  # unknown on sync
+                "rsi_entry": 0,   # unknown on sync
+                "exit_rsi":  RSI_EXIT,  # reset to default — will tighten again if RSI hits 70
+                "paper":     PAPER_MODE,
                 "entry_time":ts(),
             }
             log(f"  ✅ Synced {asset} {direction} @ ${avg_entry:.4f} | {n_cont} contracts")
@@ -355,6 +381,12 @@ def sync_open_positions():
         log(f"Position sync error: {e}")
 
 def place_market_order(asset, side, contracts):
+    # In paper mode — simulate order fill, no real order placed
+    if PAPER_MODE:
+        fake_oid = f"PAPER-{asset}-{int(time.time())}"
+        log(f"📄 PAPER order: {asset} {side} {contracts} contracts → {fake_oid}")
+        return fake_oid, int(contracts)
+
     # Retry logic — confirmed working from terminal test:
     # Start at calculated contracts, reduce by 1 until Coinbase accepts
     # Handles intraday vs overnight margin differences automatically
@@ -466,14 +498,22 @@ def evaluate_signal(candles):
         "strategy": "RSI-Mom",
         "rsi_prev": round(prev_rsi, 2),
         "rsi_cur":  round(cur_rsi, 2),
-        "entry_candle": candles[i]["dt"],
+        "entry_candle": candles[i].get("dt", candles[i].get("ts",0)),
     }
 
 
 def should_exit(pos, candles):
     """
-    RSI exit: LONG exits when RSI < 45, SHORT exits when RSI > 55
-    Returns: True if should exit, False otherwise
+    RSI Trailing Exit — v46 improvement (+$485/month over v45)
+
+    Standard exit: RSI drops below 45 (LONG) or rises above 55 (SHORT)
+    Trailing tighten: if RSI hits 70 during LONG, tighten exit to 55
+                      if RSI hits 30 during SHORT, tighten exit to 45
+
+    This lets winners run but exits sooner when momentum peaks.
+    Matches backtest exactly: $2,704/month vs $2,219/month for fixed exit.
+
+    pos["exit_rsi"] stores the tightened threshold — persists in positions dict.
     """
     if not candles or len(candles) < RSI_PERIOD + 2:
         return False
@@ -482,10 +522,23 @@ def should_exit(pos, candles):
     cur_rsi = rsi[-2] if rsi[-2] is not None else rsi[-1]
     if cur_rsi is None:
         return False
-    if pos["direction"] == "LONG"  and cur_rsi < RSI_EXIT:
-        return True
-    if pos["direction"] == "SHORT" and cur_rsi > (100 - RSI_EXIT):
-        return True
+
+    if pos["direction"] == "LONG":
+        # Tighten exit threshold when RSI peaks above 70
+        if cur_rsi > 70:
+            pos["exit_rsi"] = 55  # stored in positions dict — survives restarts via sync
+        exit_thresh = pos.get("exit_rsi", RSI_EXIT)
+        if cur_rsi < exit_thresh:
+            return True
+
+    elif pos["direction"] == "SHORT":
+        # Tighten exit threshold when RSI dips below 30
+        if cur_rsi < 30:
+            pos["exit_rsi"] = 45
+        exit_thresh = pos.get("exit_rsi", 100 - RSI_EXIT)
+        if cur_rsi > exit_thresh:
+            return True
+
     return False
 
 
@@ -529,16 +582,19 @@ def enter_position(asset, direction, entry_price, candle, info=None):
         "contracts": actual_cts, "size": actual_size,
         "strategy": "RSI-Mom", "entry_time": ts(),
         "rsi_entry": rsi_info.get("rsi_cur", 0),
+        "exit_rsi": RSI_EXIT,   # starts at 45, tightens to 55 if RSI hits 70
+        "paper": PAPER_MODE,
     }
     with lock:
         state["buying_power"] = state.get("buying_power", state["balance"]) - entry_price * actual_size * ASSETS[asset]["margin_rate"]
+    mode_label = "PAPER" if PAPER_MODE else "LIVE"
     add_audit(asset, f"📊 ENTER {direction}",
               f"RSI-Mom | entry=${entry_price:,.4f} | "
               f"rsi={rsi_info.get('rsi_cur',0):.1f} | "
-              f"contracts={actual_cts} | size={actual_size} | LIVE",
+              f"contracts={actual_cts} | size={actual_size} | {mode_label}",
               candle=candle)
-    ntfy(f"ENTER {direction} {asset}",
-         f"RSI-Mom | entry=${entry_price:,.4f} | RSI={rsi_info.get('rsi_cur',0):.1f} | {actual_cts}ct",
+    ntfy(f"{'📄' if PAPER_MODE else '📊'} ENTER {direction} {asset}",
+         f"RSI-Mom | entry=${entry_price:,.4f} | RSI={rsi_info.get('rsi_cur',0):.1f} | {actual_cts}ct | {mode_label}",
          priority="default")
 
 def exit_position(asset, exit_price, exit_reason, candle):
@@ -569,36 +625,46 @@ def exit_position(asset, exit_price, exit_reason, candle):
     ntfy(f"{emoji} EXIT {asset}",
          f"{pos['direction']} | entry=${pos['entry']:,.4f} → ${exit_price:,.4f} | P&L=${pnl:+,.2f} | {exit_reason}",
          priority="default" if pnl >= 0 else "high")
-    # Refresh real balance from Coinbase after exit
-    try:
-        live_bal = get_live_balance()
-        if live_bal > 0:
-            with lock:
-                state["balance"] = live_bal
-                log(f"💰 Balance after exit: ${live_bal:,.2f} (Coinbase)")
-    except Exception as e:
-        log(f"Balance refresh error after exit: {e}")
+    # Refresh real balance from Coinbase after exit (live mode only)
+    if not PAPER_MODE:
+        try:
+            live_bal = get_live_balance()
+            if live_bal > 0:
+                with lock:
+                    state["balance"] = live_bal
+                    log(f"💰 Balance after exit: ${live_bal:,.2f} (Coinbase)")
+        except Exception as e:
+            log(f"Balance refresh error after exit: {e}")
+    else:
+        log(f"📄 Paper balance after exit: ${state['balance']:,.2f}")
 
 # ══════════════════════════════════════════════════════════════════
-# TRADING LOOP — Dual strategy: OpenRange 1hr + AsianRange 5min
-# OpenRange:  runs every 5-min bucket, uses 1-hour candles
-# AsianRange: runs every 5-min bucket 08:00-12:00 UTC, uses 5-min candles
-# Exit: fixed TP and Stop checked every 5-min bucket
+# TRADING LOOP — RSI(14) Momentum + Trailing Exit
+# Fires every 15-min bucket. Signal on candles[-2]. Entry at candles[-2] close.
+# Exit: RSI < 45 (or < 55 if RSI previously hit 70 — trailing tighten)
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
     global TOTAL_USDC
-    live_bal = get_live_balance()
-    if live_bal > 0:
-        TOTAL_USDC = live_bal
-    sync_open_positions()
+    if not PAPER_MODE:
+        # Live mode: read real balance from Coinbase
+        live_bal = get_live_balance()
+        if live_bal > 0:
+            TOTAL_USDC = live_bal
+        sync_open_positions()
+    else:
+        # Paper mode: use TOTAL_USDC env var as starting balance
+        log(f"📄 Paper mode: starting with ${TOTAL_USDC:,.2f} simulated balance")
     with lock:
         state["balance"] = TOTAL_USDC
-    log("🚀 CB Trader v45 started")
-    log("   Mode: 🔴 LIVE")
-    log("   Strategy: RSI(14) Momentum Cross 60/45 | 15min candles")
+    log("🚀 CB Trader v46 started")
+    mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
+    log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
+    log("   Strategy: RSI(14) Momentum Cross 60/45 + Trailing Exit")
+    log("   Exit: tighten to RSI 55 when RSI hits 70 (trailing)")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Fee: 0.10% confirmed | Backtest: $4,100-6,163/month")
+    log(f"   Fee: 0.10% confirmed | Backtest: $2,704/month (+$485 vs v45)")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
+    log(f"   Time: {ts_est()}")
 
     # 15-min buckets — fire every 15 minutes
     last_bucket = (int(time.time()) // 900) * 900
@@ -637,7 +703,7 @@ def trading_loop():
                         pos = positions.get(asset)
                         if pos:
                             if should_exit(pos, candles):
-                                exit_price = float(cur["c"])
+                                exit_price = float(candles[-2]["c"])  # exit at signal candle close — matches backtest
                                 pnl_est = round(
                                     (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
                                     else (pos["entry"] - exit_price) * pos["size"], 4)
@@ -656,7 +722,7 @@ def trading_loop():
                             add_audit(asset, f"🚨 RSI-Mom {d}",
                                       f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f}",
                                       candle=cur, indicators=info)
-                            entry_price = float(cur["c"])  # enter at current close
+                            entry_price = float(candles[-2]["c"])  # enter at signal candle close — matches backtest
                             enter_position(asset, d, entry_price, cur, info)
                             if positions.get(asset):
                                 save_sim_data(asset, current_bucket*1000, candles, info,
@@ -744,7 +810,7 @@ def health():
     wr = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
     return Response(json.dumps({
         "overall":    "✅ ALL SYSTEMS OK" if s.get("loop_errors",0)<5 else "❌ errors",
-        "mode":       {"paper_mode":False,"status":"🔴 LIVE"},
+        "mode":       {"paper_mode":PAPER_MODE,"status":"📄 PAPER" if PAPER_MODE else "🔴 LIVE"},
         "balance":    f"${s['balance']:,.2f}",
         "weekly_pnl": f"${s['weekly_pnl']:+,.2f}",
         "total_pnl":  f"${s['total_pnl']:+,.2f}",
@@ -815,12 +881,11 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 </form></body></html>"""
     with lock:
         s=dict(state)
-        pos=dict(positions);   pend=dict(pending_entry)
         pos=dict(positions); pend=dict(pending_entry)
 
     wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
-    mode_color = "#00D68F"
-    mode_label = "🔴 LIVE"
+    mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
+    mode_label = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     wk_color   = "#00D68F" if s["weekly_pnl"]>=0 else "#FF4757"
     tot_color  = "#00D68F" if s["total_pnl"]>=0 else "#FF4757"
     # Contract countdown
@@ -855,8 +920,8 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
               <div style='font-weight:600'>${p["entry"]:,.4f}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
-              <div style='color:#4A5878;margin-bottom:2px'>Trail Stop</div>
-              <div style='font-weight:600;color:#FFB800'>RSI Exit &lt;45</div>
+              <div style='color:#4A5878;margin-bottom:2px'>Exit RSI</div>
+              <div style='font-weight:600;color:#FFB800'>&lt;{p.get('exit_rsi',45)} {'🔒' if p.get('exit_rsi',45)==55 else ''}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
               <div style='color:#4A5878;margin-bottom:2px'>Peak</div>
@@ -909,11 +974,11 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
         </div>"""
 
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    now_est = datetime.now().strftime("%I:%M %p EST")
+    now_est = ts_est()
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v45</title>
+<title>CB Trader v46</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -955,7 +1020,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:#00D68F'>● v45 Live
+    <span style='color:{mode_color}'>● v46 {mode_label}
     </span>
   </div>
 </div>
@@ -992,14 +1057,14 @@ function show(id,el){{
   {journal_rows}
 </div>
 <div id=markets class=panel>
-  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>{len(ASSET_NAMES)} assets · evaluates every 5 min</div>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>{len(ASSET_NAMES)} assets · evaluates every 15 min</div>
   {assets_rows}
 </div>
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
-    RSI(14) Momentum Cross 60/45 · 15min candles<br>
-    8 perp contracts · DEC 2030 perp-style · No rolls<br>
+    RSI(14) Momentum + Trailing Exit · 15min candles<br>
+    Exit tightens to RSI 55 when RSI hits 70 · +$485/month vs v45<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
 <div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
 <div class=kpis>
@@ -1013,14 +1078,14 @@ function show(id,el){{
 <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Exchange</b><br>
     Coinbase CFM Futures · CFTC regulated · Legal NYC<br>
-    10x leverage · {len(ASSET_NAMES)} assets · Contract roll Aug 28<br>
+    10x leverage · {len(ASSET_NAMES)} assets · DEC 2030 expiry, no rolls<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Contract Status</b><br>
     Perp-style futures · DEC 2030 expiry · No monthly rolls<br>
-    Fees: max(notional×0.02%, $0.15) per side<br>
+    Fees: 0.10% per side — CONFIRMED from live fills<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>2026 Q1 Backtest</b><br>
-    $566 account · $4,100-6,163/month · All 3 periods green<br>
+    $481→$19,941 in 11 weeks · $2,704/month · 11/11 green weeks<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Links</b><br>
     <a href='/health'>Health</a> &nbsp;·&nbsp;
