@@ -96,12 +96,39 @@ state = {
     "balance": TOTAL_USDC, "buying_power": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
     "week": None, "cycle": 0, "ntfy_errors": 0,
     "loop_last_run": "never", "loop_errors": 0,
-    "wins": 0, "total_trades": 0, "ntfy_last_sent": "never",
-    # PERP strategy removed in v33
+    "wins": 0, "total_trades": 0, "entries": 0, "ntfy_last_sent": "never",
     "skipped_assets": [],
     "skip_streak":    {},
     "api_errors":     {},
 }
+
+STATE_FILE = "/tmp/cb_state_v46.json"
+
+def save_state():
+    """Persist state to disk — survives Railway restarts within deployment."""
+    try:
+        import json as _j
+        with lock:
+            safe = {k: v for k, v in state.items()
+                    if isinstance(v, (int, float, str, bool, type(None)))}
+        _j.dump(safe, open(STATE_FILE, "w"))
+    except Exception as e:
+        log(f"State save error: {e}")
+
+def load_state():
+    """Restore state from disk on startup — keeps P&L/trades across restarts."""
+    import json as _j, os as _o
+    if not _o.path.exists(STATE_FILE):
+        return
+    try:
+        data = _j.load(open(STATE_FILE))
+        with lock:
+            for k, v in data.items():
+                if k in state:
+                    state[k] = v
+        log(f"✅ State restored | cycle={state['cycle']} trades={state['total_trades']} entries={state['entries']} pnl=${state['total_pnl']:+.2f}")
+    except Exception as e:
+        log(f"State load error (starting fresh): {e}")
 
 # ══════════════════════════════════════════════════════════════════
 # HELPERS
@@ -586,6 +613,7 @@ def enter_position(asset, direction, entry_price, candle, info=None):
         "paper": PAPER_MODE,
     }
     with lock:
+        state["entries"] = state.get("entries", 0) + 1
         state["buying_power"] = state.get("buying_power", state["balance"]) - entry_price * actual_size * ASSETS[asset]["margin_rate"]
     mode_label = "PAPER" if PAPER_MODE else "LIVE"
     add_audit(asset, f"📊 ENTER {direction}",
@@ -637,6 +665,7 @@ def exit_position(asset, exit_price, exit_reason, candle):
             log(f"Balance refresh error after exit: {e}")
     else:
         log(f"📄 Paper balance after exit: ${state['balance']:,.2f}")
+    save_state()  # persist after every completed trade
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP — RSI(14) Momentum + Trailing Exit
@@ -656,6 +685,7 @@ def trading_loop():
         log(f"📄 Paper mode: starting with ${TOTAL_USDC:,.2f} simulated balance")
     with lock:
         state["balance"] = TOTAL_USDC
+    load_state()
     log("🚀 CB Trader v46 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
@@ -743,13 +773,18 @@ def trading_loop():
                 if skipped_assets:
                     log(f"⚠️ Skipped: {skipped_assets}")
 
-                # Refresh balance every 50 cycles
+                # Refresh balance every 50 cycles (live only)
                 if cycle_num % 50 == 0:
                     try:
-                        live_bal = get_live_balance()
-                        if live_bal > 0:
-                            with lock: state["balance"] = live_bal
+                        if not PAPER_MODE:
+                            live_bal = get_live_balance()
+                            if live_bal > 0:
+                                with lock: state["balance"] = live_bal
                     except: pass
+
+                # Persist state every 10 cycles
+                if cycle_num % 10 == 0:
+                    save_state()
 
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
