@@ -1,5 +1,5 @@
 """
-CB TRADER v50
+CB TRADER v52
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(14) Momentum Cross + Trailing Exit
   LONG:  RSI(14) crosses ABOVE 60 → enter long
@@ -48,14 +48,16 @@ if not CB_API_KEY or not CB_API_SEC:
 # Contract sizes confirmed from Coinbase API: future_product_details.contract_size
 # Intraday margin rate ~10% confirmed from API
 ASSETS = {
-    "BTC":  {"perp":"BIP-20DEC30-CDE", "contract":0.01,   "margin_rate":0.10},
+    "ADA":  {"perp":"ADP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "AVAX": {"perp":"AVP-20DEC30-CDE", "contract":5.0,    "margin_rate":0.10},
+    "BCH":  {"perp":"BCP-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
+    "DOGE": {"perp":"DOP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
     "ETH":  {"perp":"ETP-20DEC30-CDE", "contract":0.10,   "margin_rate":0.10},
-    "SOL":  {"perp":"SLP-20DEC30-CDE", "contract":5.0,    "margin_rate":0.10},
-    "LINK": {"perp":"LNP-20DEC30-CDE", "contract":50.0,   "margin_rate":0.10},
     "HBAR": {"perp":"HEP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
+    "LTC":  {"perp":"LCP-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
+    "POP":  {"perp":"POP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "SHP":  {"perp":"SHP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
     "SUI":  {"perp":"SUP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
-    "XLM":  {"perp":"XLP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
-    "BNB":  {"perp":"BNB-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
 }
 ASSET_NAMES = list(ASSETS.keys())
 
@@ -64,10 +66,10 @@ FEE_PCT = 0.00100   # 0.10% per side confirmed real fee
 MAX_CONTRACTS = 5   # Coinbase intraday position limit per asset
 
 # RSI Momentum parameters — optimal from 174-combination backtest
-RSI_PERIOD      = 7     # RSI period — optimized from 29-asset sweep
-RSI_ENTRY       = 70    # cross above → LONG, cross below 30 → SHORT
+RSI_PERIOD      = 5     # RSI period — winner from comprehensive sweep
+RSI_ENTRY       = 65    # cross above → LONG, cross below 35 → SHORT
 RSI_EXIT        = 50    # exit LONG below 50, exit SHORT above 50
-RSI_TRAIL_TRIG  = 65    # when RSI hits 65, tighten exit threshold
+RSI_TRAIL_TRIG  = 70    # when RSI hits 70, tighten exit threshold
 RSI_TRAIL_EXIT  = 60    # tightened exit threshold (vs 50 standard)
 
 def get_active_ticker(asset):
@@ -104,7 +106,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v50.json"
+STATE_FILE = "/tmp/cb_state_v52.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -216,7 +218,10 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             "decision": decision,
             # Save last 20 candles — enough for RSI(7) + context
             # Sim uses these exact candles so RSI matches perfectly
-            "candles": candles[-20:] if isinstance(candles, list) else [],
+            "candles": candles[-50:] if isinstance(candles, list) else [],
+            # RSI values app actually used — sim uses these directly, no recalculation
+            "rsi_cur":  indicators.get("rsi_cur")  if isinstance(indicators, dict) else None,
+            "rsi_prev": indicators.get("rsi_prev") if isinstance(indicators, dict) else None,
             "indicators": indicators if isinstance(indicators, dict) else {},
             "position": {
                 "direction":  position.get("direction"),
@@ -631,9 +636,14 @@ def exit_position(asset, exit_price, exit_reason, candle):
     """
     pos = positions.get(asset)
     if not pos: return
-    pnl = round(
+    gross = round(
         (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
         else (pos["entry"] - exit_price) * pos["size"], 4)
+    # Fees: 0.10% on entry notional + 0.10% on exit notional
+    entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT, 4)
+    exit_fee  = round(exit_price  * pos["size"] * FEE_PCT, 4)
+    total_fee = entry_fee + exit_fee
+    pnl = round(gross - total_fee, 4)
     side = "SELL" if pos["direction"] == "LONG" else "BUY"
     place_market_order(asset, side, pos["contracts"])
     record_tax(asset, pos["direction"], pos["entry"], exit_price,
@@ -648,10 +658,10 @@ def exit_position(asset, exit_price, exit_reason, candle):
     emoji = "✅" if pnl >= 0 else "❌"
     add_audit(asset, f"{emoji} EXIT {exit_reason}",
               f"{pos['direction']} ${pos['entry']:,.4f} → ${exit_price:,.4f} | "
-              f"P&L=${pnl:+,.4f} | strategy={pos.get('strategy','')}",
+              f"gross=${gross:+,.4f} | fees=${total_fee:.4f} | P&L=${pnl:+,.4f} | strategy={pos.get('strategy','')}",
               candle=candle)
     ntfy(f"{emoji} EXIT {asset}",
-         f"{pos['direction']} | entry=${pos['entry']:,.4f} → ${exit_price:,.4f} | P&L=${pnl:+,.2f} | {exit_reason}",
+         f"{pos['direction']} | entry=${pos['entry']:,.4f} → ${exit_price:,.4f} | gross=${gross:+,.2f} | fees=${total_fee:.2f} | net=${pnl:+,.2f} | {exit_reason}",
          priority="default" if pnl >= 0 else "high")
     # Refresh real balance from Coinbase after exit (live mode only)
     if not PAPER_MODE:
@@ -669,8 +679,9 @@ def exit_position(asset, exit_price, exit_reason, candle):
 
 # ══════════════════════════════════════════════════════════════════
 # TRADING LOOP — RSI(14) Momentum + Trailing Exit
-# Fires every 15-min bucket. Signal on candles[-2]. Entry at candles[-2] close.
-# Exit: RSI < 45 (or < 55 if RSI previously hit 70 — trailing tighten)
+# Fires every 15-min bucket. Signal on candles[-2]. Entry at candles[-1] open.
+# Exit: RSI < 50 (or < 60 if RSI previously hit 70 — trailing tighten)
+# Fees: 0.10% per side deducted from every trade P&L
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
     global TOTAL_USDC
@@ -688,14 +699,14 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v50 started")
+    log("🚀 CB Trader v52 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}) Momentum Cross {RSI_ENTRY}/{RSI_EXIT} + Trailing Exit")
     log(f"   Exit: tighten to RSI {RSI_TRAIL_EXIT} when RSI hits {RSI_TRAIL_TRIG} (trailing)")
-    log(f"   Optimized: 29-asset sweep | +50% vs v46 | $529/month at $472")
+    log(f"   Optimized: comprehensive sweep | $1,734/month at $1,000 | correct candle alignment")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Fee: 0.10% confirmed | Backtest: $2,704/month (+$485 vs v45)")
+    log(f"   Fee: 0.10% per side included in all P&L calculations")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
     log(f"   Time: {ts_est()}")
 
@@ -736,7 +747,7 @@ def trading_loop():
                         pos = positions.get(asset)
                         if pos:
                             if should_exit(pos, candles):
-                                exit_price = float(candles[-2]["c"])  # exit at signal candle close — matches backtest
+                                exit_price = float(candles[-1]["o"])  # exit at current candle open — matches corrected backtest
                                 pnl_est = round(
                                     (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
                                     else (pos["entry"] - exit_price) * pos["size"], 4)
@@ -755,7 +766,7 @@ def trading_loop():
                             add_audit(asset, f"🚨 RSI-Mom {d}",
                                       f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f}",
                                       candle=cur, indicators=info)
-                            entry_price = float(candles[-2]["c"])  # enter at signal candle close — matches backtest
+                            entry_price = float(candles[-1]["o"])  # enter at current candle open — matches corrected backtest
                             enter_position(asset, d, entry_price, cur, info)
                             if positions.get(asset):
                                 save_sim_data(asset, current_bucket*1000, candles, info,
@@ -1016,7 +1027,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v50</title>
+<title>CB Trader v52</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
