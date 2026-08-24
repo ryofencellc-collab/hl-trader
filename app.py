@@ -1,17 +1,16 @@
 """
-CB TRADER v52
+CB TRADER v53
 ═══════════════════════════════════════════════════════════════════
-Strategy: RSI(14) Momentum Cross + Trailing Exit
-  LONG:  RSI(14) crosses ABOVE 60 → enter long
-  SHORT: RSI(14) crosses BELOW 40 → enter short
-  EXIT:  RSI drops below 45 (or 55 if RSI hit 70 — trailing tighten)
-Timeframe: 15-minute candles
+Strategy: RSI(5/65) + MTF (1hr trend filter) + Trailing Exit
+  LONG:  RSI(5) crosses ABOVE 65 AND 1hr RSI > 50 (uptrend confirmed)
+  SHORT: RSI(5) crosses BELOW 35 AND 1hr RSI < 50 (downtrend confirmed)
+  EXIT:  RSI drops below 50 (or 60 if RSI hit 70 — trailing tighten)
+Timeframe: 15-minute candles | Trend filter: 1-hour RSI(14)
 Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
-  BTC(BIP) ETH(ETP) SOL(SLP) LINK(LNP) HBAR(HEP) SUI(SUP) XLM(XLP) BNB — DEC 2030
 Fees:     0.10% per side — CONFIRMED from 4 live fills
-Backtest: $529/month new vs $352/month v46 (+$177/month) at $472 real balance
-          RSI(7/70/50/65) — optimized across all 29 Coinbase perp contracts
-          All 3 periods green | 11/11 green weeks in Jun-Aug 2026
+Backtest: RSI(5/65)+MTF — $1,842/month at $1,000 | 57.2% WR | Feb-Aug 2026
+          Winner from 118-strategy comprehensive sweep
+          All periods green | MTF filter raises WR from 48% to 57%
 
 PAPER MODE: Set TRADE_MODE=paper in Railway to paper trade.
             Set TRADE_MODE=live to go live. Default=paper.
@@ -76,8 +75,10 @@ def get_active_ticker(asset):
     """Returns perp ticker — no rolling needed, DEC 2030 expiry"""
     return ASSETS[asset]["perp"]
 
-CANDLE_TF   = "FIFTEEN_MINUTE"  # 15min optimal from backtest
-CANDLE_LIMIT= 150               # 150 candles = 37.5 hours lookback
+CANDLE_TF    = "FIFTEEN_MINUTE"  # 15min for signal
+CANDLE_LIMIT = 150               # 150 candles = 37.5 hours lookback
+CANDLE_1H_TF = "ONE_HOUR"        # 1hr for trend filter (MTF)
+CANDLE_1H_LIM= 50                # 50 hours lookback for 1hr RSI
 TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "0"))  # will be overwritten by Coinbase on startup
 TAX_RATE    = 0.35
 
@@ -95,6 +96,8 @@ skip_entry    = {}  # skip after exit: asset -> buckets remaining
 # PERP strategy removed in v33
 lock            = threading.Lock()
 sim_lock        = threading.Lock()   # separate lock for sim data file writes
+hr_candles_cache = {}    # asset -> list of 1hr candles, refreshed every hour
+hr_cache_ts      = {}    # asset -> last fetch timestamp
 
 state = {
     "balance": TOTAL_USDC, "buying_power": TOTAL_USDC, "weekly_pnl": 0.0, "total_pnl": 0.0,
@@ -106,7 +109,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v52.json"
+STATE_FILE = "/tmp/cb_state_v53.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -326,6 +329,33 @@ def fetch_candles(asset, granularity=None, n_candles=None):
         log(f"WARNING {asset}: candle fetch failed {e}")
         return None
 
+def fetch_hr_candles(asset):
+    """Fetch 1hr candles for MTF trend filter. Cached — refreshes every hour."""
+    global hr_candles_cache, hr_cache_ts
+    now = int(time.time())
+    if asset in hr_cache_ts and now - hr_cache_ts[asset] < 3600:
+        return hr_candles_cache.get(asset)
+    try:
+        candles = fetch_candles(asset, granularity=CANDLE_1H_TF, n_candles=CANDLE_1H_LIM)
+        if candles:
+            hr_candles_cache[asset] = candles
+            hr_cache_ts[asset] = now
+        return candles
+    except Exception as e:
+        log(f"1hr candle fetch error {asset}: {e}")
+        return hr_candles_cache.get(asset)
+
+def get_hr_rsi(asset):
+    """Get current 1hr RSI(14) for trend direction filter."""
+    candles = fetch_hr_candles(asset)
+    if not candles or len(candles) < 16:
+        return None
+    closes = [float(c["c"]) for c in candles]
+    rsi = calc_rsi(closes, 14)
+    # Use second-to-last candle (same logic as 15min signal)
+    i = len(rsi) - 2
+    return rsi[i] if rsi[i] is not None else None
+
 def get_live_balance():
     """
     Reads real available_margin from Coinbase — what Coinbase actually
@@ -527,7 +557,7 @@ def evaluate_signal(candles):
         }
 
     return d, None, None, {
-        "strategy": "RSI-Mom",
+        "strategy": "RSI-Mom+MTF",
         "rsi_prev": round(prev_rsi, 2),
         "rsi_cur":  round(cur_rsi, 2),
         "entry_candle": candles[i].get("dt", candles[i].get("ts",0)),
@@ -699,12 +729,12 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v52 started")
+    log("🚀 CB Trader v53 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
-    log(f"   Strategy: RSI({RSI_PERIOD}) Momentum Cross {RSI_ENTRY}/{RSI_EXIT} + Trailing Exit")
+    log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
     log(f"   Exit: tighten to RSI {RSI_TRAIL_EXIT} when RSI hits {RSI_TRAIL_TRIG} (trailing)")
-    log(f"   Optimized: comprehensive sweep | $1,734/month at $1,000 | correct candle alignment")
+    log(f"   Optimized: 118-strategy sweep | $1,842/month at $1,000 | 57.2% WR")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Fee: 0.10% per side included in all P&L calculations")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
@@ -763,8 +793,20 @@ def trading_loop():
                         # ── RSI MOMENTUM SIGNAL — enter immediately ────
                         d, _, _, info = evaluate_signal(candles)
                         if d:
+                            # MTF filter: check 1hr RSI trend direction
+                            hr_rsi = get_hr_rsi(asset)
+                            if hr_rsi is not None:
+                                if d == "LONG" and hr_rsi < 50:
+                                    save_sim_data(asset, current_bucket*1000, candles, info,
+                                                  f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}<50)")
+                                    continue
+                                if d == "SHORT" and hr_rsi > 50:
+                                    save_sim_data(asset, current_bucket*1000, candles, info,
+                                                  f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
+                                    continue
+                            info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi else None
                             add_audit(asset, f"🚨 RSI-Mom {d}",
-                                      f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f}",
+                                      f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f} | 1hr_RSI={info.get('hr_rsi','?')}",
                                       candle=cur, indicators=info)
                             entry_price = float(candles[-1]["o"])  # enter at current candle open — matches corrected backtest
                             enter_position(asset, d, entry_price, cur, info)
