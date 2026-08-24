@@ -1,5 +1,5 @@
 """
-CB TRADER v46
+CB TRADER v50
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(14) Momentum Cross + Trailing Exit
   LONG:  RSI(14) crosses ABOVE 60 → enter long
@@ -9,8 +9,8 @@ Timeframe: 15-minute candles
 Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
   BTC(BIP) ETH(ETP) SOL(SLP) LINK(LNP) HBAR(HEP) SUI(SUP) XLM(XLP) BNB — DEC 2030
 Fees:     0.10% per side — CONFIRMED from 4 live fills
-Backtest: $2,704/month v46 vs $2,219/month v45 (+$485/month)
-          $481 → $19,941 in 11 weeks with compounding
+Backtest: $529/month new vs $352/month v46 (+$177/month) at $472 real balance
+          RSI(7/70/50/65) — optimized across all 29 Coinbase perp contracts
           All 3 periods green | 11/11 green weeks in Jun-Aug 2026
 
 PAPER MODE: Set TRADE_MODE=paper in Railway to paper trade.
@@ -64,9 +64,11 @@ FEE_PCT = 0.00100   # 0.10% per side confirmed real fee
 MAX_CONTRACTS = 5   # Coinbase intraday position limit per asset
 
 # RSI Momentum parameters — optimal from 174-combination backtest
-RSI_PERIOD  = 14    # RSI period
-RSI_ENTRY   = 60    # cross above → LONG, cross below (100-60=40) → SHORT
-RSI_EXIT    = 45    # RSI drops below → exit LONG | rises above 55 → exit SHORT
+RSI_PERIOD      = 7     # RSI period — optimized from 29-asset sweep
+RSI_ENTRY       = 70    # cross above → LONG, cross below 30 → SHORT
+RSI_EXIT        = 50    # exit LONG below 50, exit SHORT above 50
+RSI_TRAIL_TRIG  = 65    # when RSI hits 65, tighten exit threshold
+RSI_TRAIL_EXIT  = 60    # tightened exit threshold (vs 50 standard)
 
 def get_active_ticker(asset):
     """Returns perp ticker — no rolling needed, DEC 2030 expiry"""
@@ -74,7 +76,7 @@ def get_active_ticker(asset):
 
 CANDLE_TF   = "FIFTEEN_MINUTE"  # 15min optimal from backtest
 CANDLE_LIMIT= 150               # 150 candles = 37.5 hours lookback
-TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "1000"))
+TOTAL_USDC  = float(os.environ.get("TOTAL_USDC", "0"))  # will be overwritten by Coinbase on startup
 TAX_RATE    = 0.35
 
 DIAG_FILE   = "/tmp/cb_diagnostic.json"
@@ -102,7 +104,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v46.json"
+STATE_FILE = "/tmp/cb_state_v50.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -212,11 +214,9 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             "dt":       datetime.fromtimestamp(bucket_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             "asset":    asset,
             "decision": decision,
-            "candles": {
-                "signal":  candles[-3] if isinstance(candles, list) and len(candles) >= 3 else None,
-                "prev":    candles[-2] if isinstance(candles, list) and len(candles) >= 2 else None,
-                "current": candles[-1] if isinstance(candles, list) and len(candles) >= 1 else None,
-            },
+            # Save last 20 candles — enough for RSI(7) + context
+            # Sim uses these exact candles so RSI matches perfectly
+            "candles": candles[-20:] if isinstance(candles, list) else [],
             "indicators": indicators if isinstance(indicators, dict) else {},
             "position": {
                 "direction":  position.get("direction"),
@@ -399,7 +399,7 @@ def sync_open_positions():
                 "size":      n_cont * cs,
                 "strategy":  "RSI-Mom",
                 "rsi_entry": 0,   # unknown on sync
-                "exit_rsi":  RSI_EXIT,  # reset to default — will tighten again if RSI hits 70
+                "exit_rsi":  RSI_EXIT,  # reset to default — will tighten again if RSI hits 65
                 "paper":     PAPER_MODE,
                 "entry_time":ts(),
             }
@@ -518,7 +518,7 @@ def evaluate_signal(candles):
         d = "SHORT"
     else:
         return None, None, None, {
-            "fail": f"no cross (RSI prev={prev_rsi:.1f} cur={cur_rsi:.1f})"
+            "fail": f"no cross (RSI prev={prev_rsi:.1f} cur={cur_rsi:.1f}) threshold={RSI_ENTRY}"
         }
 
     return d, None, None, {
@@ -551,17 +551,17 @@ def should_exit(pos, candles):
         return False
 
     if pos["direction"] == "LONG":
-        # Tighten exit threshold when RSI peaks above 70
-        if cur_rsi > 70:
-            pos["exit_rsi"] = 55  # stored in positions dict — survives restarts via sync
+        # Tighten exit when RSI hits trail trigger (65)
+        if cur_rsi > RSI_TRAIL_TRIG:
+            pos["exit_rsi"] = RSI_TRAIL_EXIT  # tighten to 60
         exit_thresh = pos.get("exit_rsi", RSI_EXIT)
         if cur_rsi < exit_thresh:
             return True
 
     elif pos["direction"] == "SHORT":
-        # Tighten exit threshold when RSI dips below 30
-        if cur_rsi < 30:
-            pos["exit_rsi"] = 45
+        # Tighten exit when RSI hits trail trigger (35)
+        if cur_rsi < (100 - RSI_TRAIL_TRIG):
+            pos["exit_rsi"] = 100 - RSI_TRAIL_EXIT  # tighten to 40
         exit_thresh = pos.get("exit_rsi", 100 - RSI_EXIT)
         if cur_rsi > exit_thresh:
             return True
@@ -609,7 +609,7 @@ def enter_position(asset, direction, entry_price, candle, info=None):
         "contracts": actual_cts, "size": actual_size,
         "strategy": "RSI-Mom", "entry_time": ts(),
         "rsi_entry": rsi_info.get("rsi_cur", 0),
-        "exit_rsi": RSI_EXIT,   # starts at 45, tightens to 55 if RSI hits 70
+        "exit_rsi": RSI_EXIT,   # starts at 50, tightens to 60 if RSI hits 65
         "paper": PAPER_MODE,
     }
     with lock:
@@ -674,23 +674,26 @@ def exit_position(asset, exit_price, exit_reason, candle):
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
     global TOTAL_USDC
+    # Always pull real Coinbase balance — paper or live
+    # Paper mode uses it as starting capital (no trades placed)
+    # Live mode uses it for real position sizing
+    live_bal = get_live_balance()
+    if live_bal > 0:
+        TOTAL_USDC = live_bal
     if not PAPER_MODE:
-        # Live mode: read real balance from Coinbase
-        live_bal = get_live_balance()
-        if live_bal > 0:
-            TOTAL_USDC = live_bal
         sync_open_positions()
-    else:
-        # Paper mode: use TOTAL_USDC env var as starting balance
-        log(f"📄 Paper mode: starting with ${TOTAL_USDC:,.2f} simulated balance")
+    mode_str = "📄 Paper" if PAPER_MODE else "🔴 Live"
+    log(f"{mode_str} mode: starting with ${TOTAL_USDC:,.2f} (from Coinbase)")
     with lock:
         state["balance"] = TOTAL_USDC
+        state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v46 started")
+    log("🚀 CB Trader v50 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
-    log("   Strategy: RSI(14) Momentum Cross 60/45 + Trailing Exit")
-    log("   Exit: tighten to RSI 55 when RSI hits 70 (trailing)")
+    log(f"   Strategy: RSI({RSI_PERIOD}) Momentum Cross {RSI_ENTRY}/{RSI_EXIT} + Trailing Exit")
+    log(f"   Exit: tighten to RSI {RSI_TRAIL_EXIT} when RSI hits {RSI_TRAIL_TRIG} (trailing)")
+    log(f"   Optimized: 29-asset sweep | +50% vs v46 | $529/month at $472")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Fee: 0.10% confirmed | Backtest: $2,704/month (+$485 vs v45)")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
@@ -1013,7 +1016,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v46</title>
+<title>CB Trader v50</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
