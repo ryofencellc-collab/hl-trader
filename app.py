@@ -1,5 +1,5 @@
 """
-CB TRADER v56
+CB TRADER v57
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
@@ -59,7 +59,12 @@ ASSET_NAMES = list(ASSETS.keys())
 FEE_PCT = 0.00100   # 0.10% per side confirmed real fee
 MAX_CONTRACTS = 5   # Coinbase intraday position limit per asset
 
-# RSI Momentum parameters — optimal from 174-combination backtest
+# Paper balance override — simulate with this balance in paper mode
+# Set PAPER_BALANCE=2000 in Railway to paper trade as if you have $2,000
+# This lets us test all 5 assets without funding the account
+PAPER_BALANCE = float(os.environ.get("PAPER_BALANCE", "2000"))
+
+# RSI Momentum parameters — winner from 308-strategy raw Kraken sweep
 RSI_PERIOD      = 3     # RSI period — winner from 308-strategy raw Kraken sweep
 RSI_ENTRY       = 70    # cross above → LONG, cross below 30 → SHORT
 RSI_EXIT        = 50    # exit LONG below 50, exit SHORT above 50
@@ -88,7 +93,6 @@ TAX_FILE    = "/tmp/cb_trades.csv"
 positions     = {}  # positions
 pending_entry = {}  # pending entries
 skip_entry    = {}  # skip after exit: asset -> buckets remaining
-# PERP strategy removed in v33
 lock            = threading.Lock()
 sim_lock        = threading.Lock()   # separate lock for sim data file writes
 hr_candles_cache = {}    # asset -> list of 1hr candles, refreshed every hour
@@ -104,7 +108,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v56.json"
+STATE_FILE = "/tmp/cb_state_v57.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -127,6 +131,9 @@ def load_state():
         with lock:
             for k, v in data.items():
                 if k in state:
+                    # Don't restore balance in paper mode — keep PAPER_BALANCE
+                    if k == "balance" and PAPER_MODE:
+                        continue
                     state[k] = v
         log(f"✅ State restored | cycle={state['cycle']} trades={state['total_trades']} entries={state['entries']} pnl=${state['total_pnl']:+.2f}")
     except Exception as e:
@@ -214,7 +221,7 @@ def _get_rsi_val(indicators, candles, idx):
         return round(val, 2) if val is not None else None
     return None
 
-def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None, ):
+def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None):
     """
     Saves everything needed to replay the sim and verify the app.
     Uses file locking to prevent corruption from concurrent reads/writes.
@@ -225,7 +232,7 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             "dt":       datetime.fromtimestamp(bucket_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             "asset":    asset,
             "decision": decision,
-            # Save last 20 candles — enough for RSI(7) + context
+            # Save last 50 candles — enough for RSI(3) warmup + full context
             # Sim uses these exact candles so RSI matches perfectly
             "candles": candles[-50:] if isinstance(candles, list) else [],
             # RSI values — always save so sim can compare without recalculating
@@ -441,7 +448,7 @@ def sync_open_positions():
                 "size":      n_cont * cs,
                 "strategy":  "RSI-Mom",
                 "rsi_entry": 0,   # unknown on sync
-                "exit_rsi":  RSI_EXIT,  # reset to default — will tighten again if RSI hits 65
+                "exit_rsi":  RSI_EXIT,  # reset to default — will tighten again if RSI hits 75
                 "paper":     PAPER_MODE,
                 "entry_time":ts(),
             }
@@ -521,7 +528,7 @@ def calc_atr(highs, lows, closes, period=14):
     return out
 
 def calc_rsi(closes, period=14):
-    """RSI(14) — standard Wilder smoothing"""
+    """RSI — standard Wilder smoothing. Period passed as argument."""
     if len(closes) < period + 1:
         return [None] * len(closes)
     out = [None] * period
@@ -539,14 +546,14 @@ def calc_rsi(closes, period=14):
     return out
 
 # ══════════════════════════════════════════════════════════════════
-# SIGNAL — RSI(14) Momentum Cross
+# SIGNAL — RSI(3/70) Momentum Cross + MTF
 # ══════════════════════════════════════════════════════════════════
 def evaluate_signal(candles):
     """
-    RSI(14) Momentum strategy — proven across 174 filter combinations
-    LONG:  RSI crosses ABOVE 60 on any candle
-    SHORT: RSI crosses BELOW 40 on any candle
-    EXIT:  RSI drops below 45 (long) or rises above 55 (short)
+    RSI(3/70) Momentum strategy — winner from 308-strategy raw Kraken sweep
+    LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50
+    SHORT: RSI(3) crosses BELOW 30 AND 1hr RSI < 50
+    EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
 
     Returns: (direction, None, None, info_dict) — no TP/stop, RSI exit
     """
@@ -583,14 +590,14 @@ def evaluate_signal(candles):
 
 def should_exit(pos, candles):
     """
-    RSI Trailing Exit — v46 improvement (+$485/month over v45)
+    RSI Trailing Exit — RSI(3/70/50/75/65)
 
-    Standard exit: RSI drops below 45 (LONG) or rises above 55 (SHORT)
-    Trailing tighten: if RSI hits 70 during LONG, tighten exit to 55
-                      if RSI hits 30 during SHORT, tighten exit to 45
+    Standard exit: RSI drops below 50 (LONG) or rises above 50 (SHORT)
+    Trailing tighten: if RSI hits 75 during LONG, tighten exit to 65
+                      if RSI hits 25 during SHORT, tighten exit to 35
 
     This lets winners run but exits sooner when momentum peaks.
-    Matches backtest exactly: $2,704/month vs $2,219/month for fixed exit.
+    13/13 quarters green on raw Kraken data.
 
     pos["exit_rsi"] stores the tightened threshold — persists in positions dict.
     """
@@ -603,9 +610,9 @@ def should_exit(pos, candles):
         return False
 
     if pos["direction"] == "LONG":
-        # Tighten exit when RSI hits trail trigger (65)
+        # Tighten exit when RSI hits trail trigger (75)
         if cur_rsi > RSI_TRAIL_TRIG:
-            pos["exit_rsi"] = RSI_TRAIL_EXIT  # tighten to 60
+            pos["exit_rsi"] = RSI_TRAIL_EXIT  # tighten to 65
         exit_thresh = pos.get("exit_rsi", RSI_EXIT)
         if cur_rsi < exit_thresh:
             return True
@@ -727,9 +734,9 @@ def exit_position(asset, exit_price, exit_reason, candle):
     save_state()  # persist after every completed trade
 
 # ══════════════════════════════════════════════════════════════════
-# TRADING LOOP — RSI(14) Momentum + Trailing Exit
+# TRADING LOOP — RSI(3/70) + MTF + Trailing Exit
 # Fires every 15-min bucket. Signal on candles[-2]. Entry at candles[-1] open.
-# Exit: RSI < 50 (or < 60 if RSI previously hit 70 — trailing tighten)
+# Exit: RSI < 50 (or < 65 if RSI previously hit 75 — trailing tighten)
 # Fees: 0.10% per side deducted from every trade P&L
 # ══════════════════════════════════════════════════════════════════
 def trading_loop():
@@ -740,15 +747,19 @@ def trading_loop():
     live_bal = get_live_balance()
     if live_bal > 0:
         TOTAL_USDC = live_bal
-    if not PAPER_MODE:
+    if PAPER_MODE:
+        # Use paper balance override for sizing — lets us test all assets
+        TOTAL_USDC = PAPER_BALANCE
+        log(f"📄 Paper mode: using simulated balance ${PAPER_BALANCE:,.2f} (real balance=${live_bal:,.2f})")
+    else:
         sync_open_positions()
     mode_str = "📄 Paper" if PAPER_MODE else "🔴 Live"
-    log(f"{mode_str} mode: starting with ${TOTAL_USDC:,.2f} (from Coinbase)")
+    log(f"{mode_str} mode: starting with ${TOTAL_USDC:,.2f}")
     with lock:
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v56 started")
+    log("🚀 CB Trader v57 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -793,7 +804,7 @@ def trading_loop():
                         if skip_entry.get(asset, 0) > 0:
                             skip_entry[asset] -= 1; continue
 
-                        # ── EXIT CHECK — RSI drops below 45 ───────────
+                        # ── EXIT CHECK — RSI drops below 50 ───────────
                         pos = positions.get(asset)
                         if pos:
                             # Update unrealized P&L every bucket
@@ -1108,7 +1119,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v56</title>
+<title>CB Trader v57</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1150,14 +1161,14 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v56 {mode_label}
+    <span style='color:{mode_color}'>● v57 {mode_label}
     </span>
   </div>
 </div>
 
-<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.8px'>📈 Spot Candles Strategy</div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.8px'>📈 RSI(3/70) + MTF Strategy</div>
 <div class=kpis>
-  <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
+  <div class=kpi><div class=kpi-l>{"Paper Bal" if PAPER_MODE else "Balance"}</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
   <div class=kpi><div class=kpi-l>This Week</div>
     <div class=kpi-v style='color:{wk_color}'>${s["weekly_pnl"]:+,.2f}</div></div>
   <div class=kpi><div class=kpi-l>Total P&L</div>
@@ -1193,10 +1204,10 @@ function show(id,el){{
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
-    RSI(3/70) Momentum + MTF + Trailing Exit · 15min candles<br>
-    Exit tightens to RSI 65 when RSI hits 75 · 13/13 quarters green<br>
+    RSI(3/70) + MTF(1hr RSI>50) + Trailing Exit · 15min candles<br>
+    Trail: RSI 75 → tighten exit to 65 · 13/13 quarters green since 2023<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 LIVE PERFORMANCE</div>
 <div class=kpis>
   <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
   <div class=kpi><div class=kpi-l>P&L</div>
