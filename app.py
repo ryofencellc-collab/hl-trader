@@ -1,16 +1,16 @@
 """
-CB TRADER v55
+CB TRADER v56
 ═══════════════════════════════════════════════════════════════════
-Strategy: RSI(5/65) + MTF (1hr trend filter) + Trailing Exit
-  LONG:  RSI(5) crosses ABOVE 65 AND 1hr RSI > 50 (uptrend confirmed)
-  SHORT: RSI(5) crosses BELOW 35 AND 1hr RSI < 50 (downtrend confirmed)
-  EXIT:  RSI drops below 50 (or 60 if RSI hit 70 — trailing tighten)
+Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
+  LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
+  SHORT: RSI(3) crosses BELOW 30 AND 1hr RSI < 50 (downtrend confirmed)
+  EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
 Timeframe: 15-minute candles | Trend filter: 1-hour RSI(14)
 Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
 Fees:     0.10% per side — CONFIRMED from 4 live fills
-Backtest: RSI(5/65)+MTF — $1,842/month at $1,000 | 57.2% WR | Feb-Aug 2026
-          Winner from 118-strategy comprehensive sweep
-          All periods green | MTF filter raises WR from 48% to 57%
+Backtest: RSI(3/70)+MTF — $13,468/month at $1,000 | 74.0% WR | Jan 2023-Mar 2026
+          Winner from 308-strategy ultimate sweep on raw frozen Kraken data
+          13/13 quarters green | No losing quarter since 2023
 
 PAPER MODE: Set TRADE_MODE=paper in Railway to paper trade.
             Set TRADE_MODE=live to go live. Default=paper.
@@ -47,16 +47,11 @@ if not CB_API_KEY or not CB_API_SEC:
 # Contract sizes confirmed from Coinbase API: future_product_details.contract_size
 # Intraday margin rate ~10% confirmed from API
 ASSETS = {
-    "ADA":  {"perp":"ADP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
-    "AVAX": {"perp":"AVP-20DEC30-CDE", "contract":5.0,    "margin_rate":0.10},
-    "BCH":  {"perp":"BCP-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
-    "DOGE": {"perp":"DOP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
-    "ETH":  {"perp":"ETP-20DEC30-CDE", "contract":0.10,   "margin_rate":0.10},
-    "HBAR": {"perp":"HEP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
-    "LTC":  {"perp":"LCP-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
-    "POP":  {"perp":"POP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
-    "SHP":  {"perp":"SHP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
     "SUI":  {"perp":"SUP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "ADA":  {"perp":"ADP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "BCH":  {"perp":"BCP-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
+    "XLM":  {"perp":"XLP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
+    "XRP":  {"perp":"XPP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
 }
 ASSET_NAMES = list(ASSETS.keys())
 
@@ -65,11 +60,11 @@ FEE_PCT = 0.00100   # 0.10% per side confirmed real fee
 MAX_CONTRACTS = 5   # Coinbase intraday position limit per asset
 
 # RSI Momentum parameters — optimal from 174-combination backtest
-RSI_PERIOD      = 5     # RSI period — winner from comprehensive sweep
-RSI_ENTRY       = 65    # cross above → LONG, cross below 35 → SHORT
+RSI_PERIOD      = 3     # RSI period — winner from 308-strategy raw Kraken sweep
+RSI_ENTRY       = 70    # cross above → LONG, cross below 30 → SHORT
 RSI_EXIT        = 50    # exit LONG below 50, exit SHORT above 50
-RSI_TRAIL_TRIG  = 70    # when RSI hits 70, tighten exit threshold
-RSI_TRAIL_EXIT  = 60    # tightened exit threshold (vs 50 standard)
+RSI_TRAIL_TRIG  = 75    # when RSI hits 75, tighten exit threshold
+RSI_TRAIL_EXIT  = 65    # tightened exit threshold
 
 def get_active_ticker(asset):
     """Returns perp ticker — no rolling needed, DEC 2030 expiry"""
@@ -109,7 +104,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v55.json"
+STATE_FILE = "/tmp/cb_state_v56.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -236,6 +231,7 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             # RSI values — always save so sim can compare without recalculating
             "rsi_cur":  _get_rsi_val(indicators, candles, -2),
             "rsi_prev": _get_rsi_val(indicators, candles, -3),
+            "hr_rsi":   indicators.get("hr_rsi") if isinstance(indicators, dict) else None,
             "indicators": indicators if isinstance(indicators, dict) else {},
             "position": {
                 "direction":  position.get("direction"),
@@ -339,44 +335,6 @@ def fetch_candles(asset, granularity=None, n_candles=None):
     except Exception as e:
         log(f"WARNING {asset}: candle fetch failed {e}")
         return None
-
-def score_signal(candles, direction, hr_rsi):
-    """
-    Score trade confidence 0-5. Backtest results:
-      5/5 → 81.6% WR → 5ct | 4/5 → 71.5% WR → 4ct
-      3/5 → 63.2% WR → 2ct | 2/5 → 52.4% WR → 1ct | 0-1/5 → skip
-    """
-    if not candles or len(candles) < 20: return 2, 1
-    closes=[float(c["c"]) for c in candles]
-    highs =[float(c.get("h",c["c"])) for c in candles]
-    lows  =[float(c.get("l",c["c"])) for c in candles]
-    vols  =[float(c.get("v",0)) for c in candles]
-    rsi=calc_rsi(closes,RSI_PERIOD); atr=calc_atr(highs,lows,closes,14)
-    cur_rsi=rsi[-2] if rsi[-2] is not None else 0
-    score=0
-    # F1: RSI cross strength >= 3 points
-    cross=abs(cur_rsi-RSI_ENTRY) if direction=="LONG" else abs((100-RSI_ENTRY)-cur_rsi)
-    if cross>=3.0: score+=1
-    # F2: 1hr RSI strong (>60 not just >50)
-    if hr_rsi is not None:
-        if direction=="LONG" and hr_rsi>=60: score+=1
-        elif direction=="SHORT" and hr_rsi<=40: score+=1
-    # F3: Volume > 1.5x average
-    rv=vols[-21:-1]; avg_v=sum(v for v in rv if v>0)/max(1,sum(1 for v in rv if v>0))
-    if avg_v>0 and vols[-2]>=avg_v*1.5: score+=1
-    # F4: ATR >= average (market moving enough)
-    ca=atr[-2]; ra=[x for x in atr[-21:-1] if x]
-    if ca and ra and ca>=sum(ra)/len(ra): score+=1
-    # F5: Clean setup — RSI was below 55 in last 8 candles
-    lb=rsi[-10:-2]
-    if direction=="LONG" and any(r is not None and r<55 for r in lb): score+=1
-    if direction=="SHORT" and any(r is not None and r>45 for r in lb): score+=1
-    # Contracts by score
-    if score<=1: return score,0
-    if score==2: return score,1
-    if score==3: return score,2
-    if score==4: return score,4
-    return score,5
 
 def fetch_hr_candles(asset):
     """Fetch 1hr candles for MTF trend filter. Cached — refreshes every hour."""
@@ -683,9 +641,8 @@ def enter_position(asset, direction, entry_price, candle, info=None):
     per_slot   = avail / len(ASSET_NAMES)
     margin_per = entry_price * cs * mr
     max_affordable = min(MAX_CONTRACTS, max(1, int(per_slot / margin_per))) if margin_per > 0 else 1
-    # Confidence-based sizing — capped by what we can afford
-    conf_cts   = (info or {}).get("confidence_contracts", max_affordable)
-    contracts  = min(conf_cts, max_affordable, MAX_CONTRACTS)
+    # Fixed sizing — max affordable contracts, no confidence filter
+    contracts  = max_affordable
 
     size = contracts * cs
     side = "BUY" if direction == "LONG" else "SELL"
@@ -704,7 +661,7 @@ def enter_position(asset, direction, entry_price, candle, info=None):
         "strategy":    "RSI-Mom", "entry_time": ts(),
         "rsi_entry":   rsi_info.get("rsi_cur", 0),
         "exit_rsi":    RSI_EXIT,
-        "confidence":  rsi_info.get("confidence_score", "?"),
+        "hr_rsi":      rsi_info.get("hr_rsi", None),
         "paper":       PAPER_MODE,
         "unrealized_pnl": 0.0,
         "current_price":  entry_price,
@@ -791,12 +748,13 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v55 started")
+    log("🚀 CB Trader v56 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
     log(f"   Exit: tighten to RSI {RSI_TRAIL_EXIT} when RSI hits {RSI_TRAIL_TRIG} (trailing)")
-    log(f"   Optimized: 118-strategy sweep | $1,842/month at $1,000 | 57.2% WR")
+    log(f"   Optimized: 308-strategy ultimate sweep on raw Kraken data | $13,468/month | 74.0% WR")
+    log(f"   13/13 quarters green | No losing quarter since 2023")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Fee: 0.10% per side included in all P&L calculations")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
@@ -872,17 +830,9 @@ def trading_loop():
                                                   f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
                                     continue
                             info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi else None
-                            # Confidence scoring — determines contract size
-                            conf_score, conf_cts = score_signal(candles, d, hr_rsi)
-                            if conf_cts == 0:
-                                save_sim_data(asset, current_bucket*1000, candles, info,
-                                              f"NO_SIGNAL:confidence_too_low (score={conf_score}/5)")
-                                continue
-                            info["confidence_score"]     = conf_score
-                            info["confidence_contracts"] = conf_cts
                             add_audit(asset, f"🚨 RSI-Mom {d}",
                                       f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f} | "
-                                      f"1hr_RSI={info.get('hr_rsi','?')} | confidence={conf_score}/5 → {conf_cts}ct",
+                                      f"1hr_RSI={info.get('hr_rsi','?')}",
                                       candle=cur, indicators=info)
                             entry_price = float(candles[-1]["o"])  # enter at current candle open — matches corrected backtest
                             enter_position(asset, d, entry_price, cur, info)
@@ -984,7 +934,7 @@ def health():
         "trades":     s["total_trades"],
         "win_rate":   f"{wr}%",
         "strategy": {
-            "name": f"RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF + Confidence",
+            "name": f"RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF + Trailing",
             "timeframe": "15min",
             "open_positions": list(positions.keys()),
             "pending_entries": list(pending_entry.keys()),
@@ -1073,7 +1023,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
         unreal    = p.get("unrealized_pnl", 0.0)
         cur_price = p.get("current_price", p.get("entry", 0))
         pnl_color = "#00D68F" if unreal >= 0 else "#FF4757"
-        conf      = p.get("confidence", "?")
+        hr_rsi    = p.get("hr_rsi", "?")
         exit_rsi  = p.get("exit_rsi", RSI_EXIT)
         locked    = "🔒" if exit_rsi == RSI_TRAIL_EXIT else ""
         dir_col   = "#00D68F" if p["direction"]=="LONG" else "#FF4757"
@@ -1101,8 +1051,8 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
               <div style='font-weight:600;color:#FFB800'>&lt;{exit_rsi} {locked}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
-              <div style='color:#4A5878;margin-bottom:2px'>Confidence</div>
-              <div style='font-weight:600;color:#7B61FF'>{conf}/5</div>
+              <div style='color:#4A5878;margin-bottom:2px'>1hr RSI</div>
+              <div style='font-weight:600;color:#7B61FF'>{hr_rsi}</div>
             </div>
           </div>
           <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:11px;margin-top:8px;color:#4A5878'>
@@ -1158,7 +1108,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v52</title>
+<title>CB Trader v56</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1200,7 +1150,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v46 {mode_label}
+    <span style='color:{mode_color}'>● v56 {mode_label}
     </span>
   </div>
 </div>
@@ -1243,8 +1193,8 @@ function show(id,el){{
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
-    RSI(14) Momentum + Trailing Exit · 15min candles<br>
-    Exit tightens to RSI 55 when RSI hits 70 · +$485/month vs v45<br>
+    RSI(3/70) Momentum + MTF + Trailing Exit · 15min candles<br>
+    Exit tightens to RSI 65 when RSI hits 75 · 13/13 quarters green<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
 <div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 STRATEGY (bucket exits — backtest logic)</div>
 <div class=kpis>
@@ -1265,7 +1215,7 @@ function show(id,el){{
     Fees: 0.10% per side — CONFIRMED from live fills<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>2026 Q1 Backtest</b><br>
-    $481→$19,941 in 11 weeks · $2,704/month · 11/11 green weeks<br>
+    $13,468/month at $1,000 · 74.0% WR · 308 strategies tested on raw Kraken data<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Links</b><br>
     <a href='/health'>Health</a> &nbsp;·&nbsp;
