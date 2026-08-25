@@ -1,5 +1,5 @@
 """
-CB TRADER v54
+CB TRADER v55
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(5/65) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(5) crosses ABOVE 65 AND 1hr RSI > 50 (uptrend confirmed)
@@ -109,7 +109,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v54.json"
+STATE_FILE = "/tmp/cb_state_v55.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -682,10 +682,10 @@ def enter_position(asset, direction, entry_price, candle, info=None):
     avail      = current_bal * 0.70
     per_slot   = avail / len(ASSET_NAMES)
     margin_per = entry_price * cs * mr
-    contracts  = min(MAX_CONTRACTS, max(1, int(per_slot / margin_per)))
-    # Cap by buying power
-    bp_contracts = max(1, int(buying_power / 100 / max(1, len(positions) + 1)))
-    contracts = min(contracts, bp_contracts, MAX_CONTRACTS)
+    max_affordable = min(MAX_CONTRACTS, max(1, int(per_slot / margin_per))) if margin_per > 0 else 1
+    # Confidence-based sizing — capped by what we can afford
+    conf_cts   = (info or {}).get("confidence_contracts", max_affordable)
+    contracts  = min(conf_cts, max_affordable, MAX_CONTRACTS)
 
     size = contracts * cs
     side = "BUY" if direction == "LONG" else "SELL"
@@ -699,12 +699,15 @@ def enter_position(asset, direction, entry_price, candle, info=None):
     actual_size = actual_cts * cs
     rsi_info = info or {}
     positions[asset] = {
-        "direction": direction, "entry": entry_price,
-        "contracts": actual_cts, "size": actual_size,
-        "strategy": "RSI-Mom", "entry_time": ts(),
-        "rsi_entry": rsi_info.get("rsi_cur", 0),
-        "exit_rsi": RSI_EXIT,   # starts at 50, tightens to 60 if RSI hits 65
-        "paper": PAPER_MODE,
+        "direction":   direction, "entry": entry_price,
+        "contracts":   actual_cts, "size": actual_size,
+        "strategy":    "RSI-Mom", "entry_time": ts(),
+        "rsi_entry":   rsi_info.get("rsi_cur", 0),
+        "exit_rsi":    RSI_EXIT,
+        "confidence":  rsi_info.get("confidence_score", "?"),
+        "paper":       PAPER_MODE,
+        "unrealized_pnl": 0.0,
+        "current_price":  entry_price,
     }
     with lock:
         state["entries"] = state.get("entries", 0) + 1
@@ -788,7 +791,7 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v54 started")
+    log("🚀 CB Trader v55 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -835,6 +838,11 @@ def trading_loop():
                         # ── EXIT CHECK — RSI drops below 45 ───────────
                         pos = positions.get(asset)
                         if pos:
+                            # Update unrealized P&L every bucket
+                            cur_close = float(candles[-1]["c"])
+                            gross_u = (cur_close-pos["entry"])*pos["size"] if pos["direction"]=="LONG"                                       else (pos["entry"]-cur_close)*pos["size"]
+                            pos["unrealized_pnl"] = round(gross_u - pos["entry"]*pos["size"]*FEE_PCT - cur_close*pos["size"]*FEE_PCT, 4)
+                            pos["current_price"]  = cur_close
                             if should_exit(pos, candles):
                                 exit_price = float(candles[-1]["o"])  # exit at current candle open — matches corrected backtest
                                 pnl_est = round(
@@ -864,8 +872,17 @@ def trading_loop():
                                                   f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
                                     continue
                             info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi else None
+                            # Confidence scoring — determines contract size
+                            conf_score, conf_cts = score_signal(candles, d, hr_rsi)
+                            if conf_cts == 0:
+                                save_sim_data(asset, current_bucket*1000, candles, info,
+                                              f"NO_SIGNAL:confidence_too_low (score={conf_score}/5)")
+                                continue
+                            info["confidence_score"]     = conf_score
+                            info["confidence_contracts"] = conf_cts
                             add_audit(asset, f"🚨 RSI-Mom {d}",
-                                      f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f} | 1hr_RSI={info.get('hr_rsi','?')}",
+                                      f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f} | "
+                                      f"1hr_RSI={info.get('hr_rsi','?')} | confidence={conf_score}/5 → {conf_cts}ct",
                                       candle=cur, indicators=info)
                             entry_price = float(candles[-1]["o"])  # enter at current candle open — matches corrected backtest
                             enter_position(asset, d, entry_price, cur, info)
@@ -967,7 +984,7 @@ def health():
         "trades":     s["total_trades"],
         "win_rate":   f"{wr}%",
         "strategy": {
-            "name": "RSI(14) Momentum Cross 60/45",
+            "name": f"RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF + Confidence",
             "timeframe": "15min",
             "open_positions": list(positions.keys()),
             "pending_entries": list(pending_entry.keys()),
@@ -1053,35 +1070,48 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     # Positions
     pos_rows = ""
     for asset, p in pos.items():
-        cur_price = float(p.get("entry", 0))  # will update with live price when available
-        pnl_est = 0  # RSI exit — no fixed TP/stop to estimate from
-        pnl_color = "#00D68F" if pnl_est>=0 else "#FF4757"
+        unreal    = p.get("unrealized_pnl", 0.0)
+        cur_price = p.get("current_price", p.get("entry", 0))
+        pnl_color = "#00D68F" if unreal >= 0 else "#FF4757"
+        conf      = p.get("confidence", "?")
+        exit_rsi  = p.get("exit_rsi", RSI_EXIT)
+        locked    = "🔒" if exit_rsi == RSI_TRAIL_EXIT else ""
+        dir_col   = "#00D68F" if p["direction"]=="LONG" else "#FF4757"
+        dir_bg    = "#00D68F22" if p["direction"]=="LONG" else "#FF475722"
+        entry_fee = round(p["entry"] * p["size"] * FEE_PCT, 4)
+        exit_fee  = round(cur_price  * p["size"] * FEE_PCT, 4)
         pos_rows += f"""<div style='background:#0A1628;border:1px solid #1E2D45;border-radius:10px;padding:14px;margin-bottom:10px'>
           <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px'>
             <span style='font-size:18px;font-weight:800'>{asset}</span>
             <span style='font-size:13px;font-weight:700;padding:3px 10px;border-radius:20px;
-              background:{"#00D68F22" if p["direction"]=="LONG" else "#FF475722"};
-              color:{"#00D68F" if p["direction"]=="LONG" else "#FF4757"}'>{p["direction"]}</span>
-            <span style='font-size:16px;font-weight:700;color:{pnl_color}'>${pnl_est:+,.2f}</span>
+              background:{dir_bg};color:{dir_col}'>{p["direction"]}</span>
+            <span style='font-size:16px;font-weight:700;color:{pnl_color}'>${unreal:+,.2f}</span>
           </div>
-          <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px'>
+          <div style='display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px'>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
               <div style='color:#4A5878;margin-bottom:2px'>Entry</div>
               <div style='font-weight:600'>${p["entry"]:,.4f}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
-              <div style='color:#4A5878;margin-bottom:2px'>Exit RSI</div>
-              <div style='font-weight:600;color:#FFB800'>&lt;{p.get('exit_rsi',45)} {'🔒' if p.get('exit_rsi',45)==55 else ''}</div>
+              <div style='color:#4A5878;margin-bottom:2px'>Current</div>
+              <div style='font-weight:600;color:{pnl_color}'>${cur_price:,.4f}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
-              <div style='color:#4A5878;margin-bottom:2px'>Peak</div>
-              <div style='font-weight:600'>RSI @ Entry: {p.get("rsi_entry",0):.1f}</div>
+              <div style='color:#4A5878;margin-bottom:2px'>Exit RSI</div>
+              <div style='font-weight:600;color:#FFB800'>&lt;{exit_rsi} {locked}</div>
+            </div>
+            <div style='background:#060D1A;border-radius:6px;padding:8px'>
+              <div style='color:#4A5878;margin-bottom:2px'>Confidence</div>
+              <div style='font-weight:600;color:#7B61FF'>{conf}/5</div>
             </div>
           </div>
-          <div style='margin-top:8px;font-size:11px;color:#4A5878'>Since {p.get("entry_time","?")}</div>
+          <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:11px;margin-top:8px;color:#4A5878'>
+            <div>{p.get("contracts",1)}ct | {p.get("strategy","RSI-Mom")}</div>
+            <div>Fees est: ${entry_fee+exit_fee:,.4f}</div>
+            <div>Since {p.get("entry_time","?")[:16]}</div>
+          </div>
         </div>"""
 
-    # Pending
     if pend:
         pos_rows += f"<div style='color:#FFB800;font-size:12px;padding:8px'>⏳ Pending entry: {', '.join(pend.keys())}</div>"
 
