@@ -1,5 +1,5 @@
 """
-CB TRADER v60
+CB TRADER v62
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
@@ -108,7 +108,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v60.json"
+STATE_FILE = "/tmp/cb_state_v62.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -824,7 +824,7 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v60 started")
+    log("🚀 CB Trader v62 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -856,6 +856,8 @@ def trading_loop():
                 log(f"🕐 {bucket_dt} UTC | open={len(positions)} | bal=${state['balance']:,.2f}")
 
                 skipped_assets = []
+                # Cache candles from trading loop — reused in heartbeat for accurate RSI
+                _candle_cache = {}
                 for asset in ASSET_NAMES:
                     try:
                         # Fetch 15-min candles — single timeframe
@@ -863,6 +865,8 @@ def trading_loop():
                         if not candles or len(candles) < RSI_PERIOD + 5:
                             skipped_assets.append(asset); continue
 
+                        # Cache for heartbeat reuse — accurate RSI from full 150 candles
+                        _candle_cache[asset] = candles
                         cur = candles[-1]
 
                         # Skip cooldown after exit
@@ -961,15 +965,12 @@ def trading_loop():
                 hb_lines = [f"candle={bucket_dt} | open={len(positions)} | bal=${_bal:,.2f} | trades={_trades}"]
                 for _a in ASSET_NAMES:
                     _pos = positions.get(_a)
-                    # Get candle age from cache
-                    _c = None
-                    try:
-                        _c = fetch_candles(_a, granularity=CANDLE_TF, n_candles=2)
-                    except: pass
+                    # Reuse candles from trading loop — accurate RSI, no extra API calls
+                    _c = _candle_cache.get(_a)
                     _age = "?"
                     if _c and _c[-1].get("ts"):
                         _age = f"{round((int(time.time())*1000 - _c[-1]['ts'])/60000,1)}m"
-                    # Get latest RSI
+                    # RSI from full 150 candles — accurate Wilder smoothing
                     _rsi_cur = "?"
                     _rsi_prev = "?"
                     _hr = "?"
@@ -1003,9 +1004,11 @@ def trading_loop():
                         )
                 for _line in hb_lines:
                     log(_line)
-                add_audit("SYSTEM", "💓 CYCLE",
-                          f"candle={bucket_dt} | open={len(positions)} | "
-                          f"balance=${state['balance']:,.2f} | trades={state['total_trades']}")
+                # Build heartbeat detail string for dashboard
+                hb_detail = f"candle={bucket_dt} | open={len(positions)} | balance=${state['balance']:,.2f} | trades={state['total_trades']}"
+                for _line in hb_lines[1:]:  # skip the summary line, add asset lines
+                    hb_detail += f"\n{_line}"
+                add_audit("SYSTEM", "💓 CYCLE", hb_detail)
 
                 # Weekly P&L report every Monday 9am UTC
                 if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 15:
@@ -1172,9 +1175,9 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
               background:{dir_bg};color:{dir_col}'>{p["direction"]}</span>
             <span style='font-size:16px;font-weight:700;color:{pnl_color}'>${unreal:+,.2f}</span>
           </div>
-          <div style='display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:12px'>
-            <div style='background:#060D1A;border-radius:6px;padding:8px'>
-              <div style='color:#4A5878;margin-bottom:2px'>Entry</div>
+          <div class=pos-grid>
+            <div class=pos-cell>
+              <div class=pos-label>Entry</div>
               <div style='font-weight:600'>${p["entry"]:,.4f}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:8px'>
@@ -1203,27 +1206,48 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     if not pos_rows:
         pos_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>No open positions</div>"
 
-    # Journal
+    # Journal + Heartbeat
     try: audit_data=json.load(open(DIAG_FILE)) if os.path.exists(DIAG_FILE) else []
     except: audit_data=[]
 
     journal_rows = ""
-    shown = 0
+    heartbeat_rows = ""
+    j_shown = 0
+    hb_built = False
+
     for a in audit_data:
-        if shown >= 100: break
         evt = a.get("event","")
-        if "CYCLE" in evt:
-            journal_rows += f"<div style='padding:5px 0;border-bottom:1px solid #0A1628;font-size:11px;color:#4A5878'>{a['time']} — {a.get('detail','')[:80]}</div>"
-        else:
-            color = "#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt else "#FFB800" if "SIGNAL" in evt else "#E0E6F0"
-            journal_rows += f"""<div style='border-left:3px solid {color};padding:8px 12px;margin-bottom:6px;background:#0A1628;border-radius:0 8px 8px 0'>
-              <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>{a["time"]} · {a.get("asset","SYSTEM")}</div>
-              <div style='font-size:13px;font-weight:700;color:{color}'>{evt}</div>
-              <div style='font-size:11px;color:#8892A4;margin-top:3px'>{a.get("detail","")[:120]}</div>
-            </div>"""
-        shown += 1
+
+        # Heartbeat tab — use most recent CYCLE entry only
+        if "CYCLE" in evt and not hb_built:
+            hb_built = True
+            detail = a.get("detail","")
+            lines = detail.split("\n")
+            # Summary line
+            heartbeat_rows += f"<div style='font-size:12px;font-weight:700;color:#E0E6F0;padding:6px 0;border-bottom:1px solid #1E2D45;margin-bottom:8px'>{lines[0] if lines else detail}</div>"
+            # Per-asset lines
+            for line in lines[1:]:
+                line = line.strip()
+                if not line: continue
+                css = "hb-hold" if "HOLD" in line else "hb-skip" if "SKIP" in line or "❌" in line else "hb-watch"
+                heartbeat_rows += f"<div class='hb-row {css}'>{line}</div>"
+            heartbeat_rows += f"<div style='font-size:10px;color:#4A5878;margin-top:8px'>Last updated: {a.get('time','?')}</div>"
+
+        # Journal tab — trades only, no CYCLE clutter
+        if j_shown >= 100: continue
+        if "CYCLE" in evt: continue  # skip cycle from journal
+        j_shown += 1
+        color = "#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt else "#FFB800" if "🔒" in evt or "TRAIL" in evt else "#E0E6F0"
+        journal_rows += f"""<div class=j-trade style='border-color:{color}'>
+          <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>{a["time"]} · {a.get("asset","SYSTEM")}</div>
+          <div style='font-size:13px;font-weight:700;color:{color}'>{evt}</div>
+          <div style='font-size:11px;color:#8892A4;margin-top:3px'>{a.get("detail","")[:150]}</div>
+        </div>"""
+
     if not journal_rows:
-        journal_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>No events yet — waiting for first signal</div>"
+        journal_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>No trades yet — waiting for first signal</div>"
+    if not heartbeat_rows:
+        heartbeat_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>No heartbeat yet — waiting for first bucket</div>"
 
     # Markets
     assets_rows = ""
@@ -1243,14 +1267,14 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v60</title>
+<title>CB Trader v62</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
+  *{{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}}
   body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;
-       padding:14px;max-width:620px;margin:0 auto;padding-bottom:50px}}
+       padding:14px;max-width:620px;margin:0 auto;padding-bottom:80px}}
   .kpis{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}}
   @media(min-width:400px){{.kpis{{grid-template-columns:repeat(4,1fr)}}}}
   .kpi{{background:#0A1628;border:1px solid #1E2D45;border-radius:10px;padding:12px;text-align:center}}
@@ -1258,15 +1282,25 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
   .kpi-v{{font-size:20px;font-weight:800;line-height:1.2}}
   .tabs{{display:flex;gap:4px;margin-bottom:0;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}}
   .tabs::-webkit-scrollbar{{display:none}}
-  .tab{{flex-shrink:0;padding:9px 18px;cursor:pointer;border-radius:8px 8px 0 0;
+  .tab{{flex-shrink:0;padding:12px 16px;cursor:pointer;border-radius:8px 8px 0 0;
         font-size:13px;font-weight:600;background:#060D1A;color:#4A5878;
-        border:1px solid #1E2D45;border-bottom:none;-webkit-tap-highlight-color:transparent}}
+        border:1px solid #1E2D45;border-bottom:none;min-height:44px;
+        display:flex;align-items:center;touch-action:manipulation}}
   .tab.on{{background:#0A1628;color:#E0E6F0}}
   .panel{{display:none;background:#0A1628;border:1px solid #1E2D45;
           border-radius:0 10px 10px 10px;padding:14px;min-height:200px}}
   .panel.on{{display:block}}
+  .pos-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px}}
+  @media(min-width:400px){{.pos-grid{{grid-template-columns:repeat(4,1fr)}}}}
+  .pos-cell{{background:#060D1A;border-radius:6px;padding:8px}}
+  .pos-label{{color:#4A5878;margin-bottom:2px;font-size:11px}}
+  .hb-row{{font-family:monospace;font-size:11px;padding:6px 0;
+           border-bottom:1px solid #0A1628;line-height:1.6;word-break:break-all}}
+  .hb-hold{{color:#00D68F}}.hb-watch{{color:#4A5878}}.hb-skip{{color:#FF4757}}
+  .j-trade{{border-left:3px solid;padding:8px 12px;margin-bottom:6px;
+            background:#0A1628;border-radius:0 8px 8px 0}}
+  .j-cycle{{padding:4px 0;border-bottom:1px solid #0A1628;font-size:11px;color:#4A5878}}
   a{{color:#8892A4;text-decoration:none}}
-  a:hover{{color:#E0E6F0}}
 </style>
 <script>
 function show(id,el){{
@@ -1277,7 +1311,7 @@ function show(id,el){{
 </script>
 </head><body>
 
-{'' if not s.get('skipped_assets') else "<div style='background:#FF475722;border:1px solid #FF4757;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#FF4757'><b>⚠️ SKIPPED ASSETS</b> — not enough candles: "+ ', '.join(s.get('skipped_assets',[])) + "<br>These assets are NOT evaluated this cycle.</div>"}
+{'' if not s.get('skipped_assets') else "<div style='background:#FF475722;border:1px solid #FF4757;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#FF4757'><b>⚠️ SKIPPED ASSETS</b>: "+ ', '.join(s.get('skipped_assets',[])) + "</div>"}
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px'>
   <div>
     <div style='font-size:24px;font-weight:800;letter-spacing:-0.5px'>CB Trader</div>
@@ -1285,8 +1319,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v60 {mode_label}
-    </span>
+    <span style='color:{mode_color}'>● v62 {mode_label}</span>
   </div>
 </div>
 
@@ -1308,49 +1341,46 @@ function show(id,el){{
   <div class=kpi><div class=kpi-l>Cycle</div><div class=kpi-v style='font-size:14px;color:#4A5878'>#{s.get("cycle",0)}</div></div>
 </div>
 
-
 <div class=tabs>
   <span class='tab on' onclick="show('pos',this)">Positions</span>
   <span class=tab onclick="show('journal',this)">Journal</span>
+  <span class=tab onclick="show('heartbeat',this)">Heartbeat</span>
   <span class=tab onclick="show('markets',this)">Markets</span>
   <span class=tab onclick="show('info',this)">Info</span>
 </div>
 
 <div id=pos class='panel on'>{pos_rows}</div>
+
 <div id=journal class=panel>
-  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>Last 100 events · auto-refresh 30s</div>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>Trades only · auto-refresh 30s</div>
   {journal_rows}
 </div>
+
+<div id=heartbeat class=panel>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>Last bucket · per-asset detail · auto-refresh 30s</div>
+  {heartbeat_rows}
+</div>
+
 <div id=markets class=panel>
   <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>{len(ASSET_NAMES)} assets · evaluates every 15 min</div>
   {assets_rows}
 </div>
+
 <div id=info class=panel>
   <div style='font-size:13px;line-height:2;color:#8892A4'>
     <b style='color:#E0E6F0;font-size:14px'>Strategy</b><br>
     RSI(3/70) + MTF(1hr RSI>50) + Trailing Exit · 15min candles<br>
     Trail: RSI 75 → tighten exit to 65 · 13/13 quarters green since 2023<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-<div style='font-size:11px;color:#4A5878;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em'>📊 LIVE PERFORMANCE</div>
-<div class=kpis>
-  <div class=kpi><div class=kpi-l>Balance</div><div class=kpi-v>${s['balance']:,.2f}</div></div>
-  <div class=kpi><div class=kpi-l>P&L</div>
-    <div class=kpi-v style='color:{"#00D68F" if s["total_pnl"]>=0 else "#FF4757"}'>${s["total_pnl"]:+,.2f}</div></div>
-  <div class=kpi><div class=kpi-l>Trades</div><div class=kpi-v>{s['total_trades']}</div></div>
-  <div class=kpi><div class=kpi-l>WR</div><div class=kpi-v>{round(s['wins']/s['total_trades']*100,1) if s['total_trades'] else 0}%</div></div>
-  <div class=kpi><div class=kpi-l>Open</div><div class=kpi-v>{len(pos)}</div></div>
-</div>
-<div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Exchange</b><br>
     Coinbase CFM Futures · CFTC regulated · Legal NYC<br>
     10x leverage · {len(ASSET_NAMES)} assets · DEC 2030 expiry, no rolls<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-    <b style='color:#E0E6F0;font-size:14px'>Contract Status</b><br>
-    Perp-style futures · DEC 2030 expiry · No monthly rolls<br>
-    Fees: 0.10% per side — CONFIRMED from live fills<br>
+    <b style='color:#E0E6F0;font-size:14px'>Fees</b><br>
+    0.10% per side — CONFIRMED from live fills<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
-    <b style='color:#E0E6F0;font-size:14px'>2026 Q1 Backtest</b><br>
-    $13,468/month at $1,000 · 74.0% WR · 308 strategies tested on raw Kraken data<br>
+    <b style='color:#E0E6F0;font-size:14px'>Backtest</b><br>
+    $13,468/month at $1,000 · 74.0% WR · 308 strategies on raw Kraken data<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Links</b><br>
     <a href='/health'>Health</a> &nbsp;·&nbsp;
