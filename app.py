@@ -1,5 +1,5 @@
 """
-CB TRADER v58
+CB TRADER v59
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
@@ -108,7 +108,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v58.json"
+STATE_FILE = "/tmp/cb_state_v59.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -273,14 +273,23 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
     except Exception as e:
         log(f"sim_data save error: {e}")  # log instead of silent pass
 
-def fetch_with_retry(fn, asset, retries=2, delay=2):
-    """Retry wrapper for all Coinbase API calls — handles transient timeouts."""
+def fetch_with_retry(fn, asset, retries=3):
+    """Retry wrapper for all Coinbase API calls — handles transient timeouts.
+    3 attempts total. Exponential backoff + jitter between retries:
+      attempt 1 fail → wait ~1-2s → attempt 2
+      attempt 2 fail → wait ~2-3s → attempt 3
+      attempt 3 fail → raise exception → caller skips this bucket
+    Data fetches (candles): safe to skip one 15-min bucket then retry fresh.
+    Orders: handled separately with their own retry logic.
+    """
+    import random as _random
     for attempt in range(retries):
         try:
             return fn()
         except Exception as e:
             if attempt < retries - 1:
-                log(f"⚠️ {asset} attempt {attempt+1} failed: {e} — retrying in {delay}s")
+                delay = (2 ** attempt) + _random.uniform(0, 1)
+                log(f"⚠️ {asset} attempt {attempt+1}/{retries} failed: {e} — retrying in {delay:.1f}s")
                 time.sleep(delay)
             else:
                 raise e
@@ -804,7 +813,7 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v58 started")
+    log("🚀 CB Trader v59 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -1164,7 +1173,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v58</title>
+<title>CB Trader v59</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1206,7 +1215,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v58 {mode_label}
+    <span style='color:{mode_color}'>● v59 {mode_label}
     </span>
   </div>
 </div>
