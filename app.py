@@ -1,5 +1,5 @@
 """
-CB TRADER v57
+CB TRADER v58
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
@@ -108,7 +108,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v57.json"
+STATE_FILE = "/tmp/cb_state_v58.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -273,6 +273,19 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
     except Exception as e:
         log(f"sim_data save error: {e}")  # log instead of silent pass
 
+def fetch_with_retry(fn, asset, retries=2, delay=2):
+    """Retry wrapper for all Coinbase API calls — handles transient timeouts."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt < retries - 1:
+                log(f"⚠️ {asset} attempt {attempt+1} failed: {e} — retrying in {delay}s")
+                time.sleep(delay)
+            else:
+                raise e
+    return None
+
 def ntfy(title, body, priority="default"):
     try:
         resp = req.post(NTFY_URL, data=body.encode("utf-8"),
@@ -303,6 +316,14 @@ def get_cb_client():
             if _cb_client is None:
                 from coinbase.rest import RESTClient
                 _cb_client = RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
+                # Patch 10s timeout on underlying requests session — prevents infinite hangs
+                if hasattr(_cb_client, "session"):
+                    _orig = _cb_client.session.request
+                    def _req_with_timeout(method, url, **kwargs):
+                        kwargs.setdefault("timeout", 10)
+                        return _orig(method, url, **kwargs)
+                    _cb_client.session.request = _req_with_timeout
+                    log("✅ Coinbase client: 10s timeout applied")
     return _cb_client
 
 def fetch_candles(asset, granularity=None, n_candles=None):
@@ -324,19 +345,36 @@ def fetch_candles(asset, granularity=None, n_candles=None):
             start = end - limit * 300
         else:
             start = end - limit * 300
-        resp  = client.get_candles(product_id, start=str(start),
+        def _do_fetch():
+            r = client.get_candles(product_id, start=str(start),
                                    end=str(end), granularity=tf)
-        if not resp.candles:
-            log(f"WARNING {asset}: API returned 0 candles")
+            if not r.candles:
+                raise ValueError(f"API returned 0 candles")
+            return r
+
+        resp = fetch_with_retry(_do_fetch, asset)
+        if resp is None:
+            log(f"WARNING {asset}: candle fetch failed after retries")
             return None
+
         candles = sorted([{
             "ts":  int(c.start)*1000,
             "dt":  datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
             "o":   float(c.open),"h":float(c.high),
             "l":   float(c.low), "c":float(c.close),"v":float(c.volume),
         } for c in resp.candles], key=lambda x:x["ts"])[-limit:]
-        if candles and candles[-1]["c"] == 0:
+
+        if not candles:
+            log(f"WARNING {asset}: no candles after sort")
+            return None
+        if candles[-1]["c"] == 0:
             log(f"WARNING {asset}: last candle close=0 dead feed")
+            return None
+        # Freshness check — skip if last candle > 30 min old
+        now_ms = int(time.time()) * 1000
+        age_min = round((now_ms - candles[-1]["ts"]) / 60000, 1)
+        if age_min > 30 and tf == "FIFTEEN_MINUTE":
+            log(f"WARNING {asset}: last candle is {age_min} min old — STALE, skipping")
             return None
         return candles
     except Exception as e:
@@ -701,7 +739,14 @@ def exit_position(asset, exit_price, exit_reason, candle):
     total_fee = entry_fee + exit_fee
     pnl = round(gross - total_fee, 4)
     side = "SELL" if pos["direction"] == "LONG" else "BUY"
-    place_market_order(asset, side, pos["contracts"])
+    oid, _ = place_market_order(asset, side, pos["contracts"])
+    if not oid and not PAPER_MODE:
+        # Exit order failed — keep position open and retry next bucket
+        log(f"⚠️ EXIT ORDER FAILED {asset} — position preserved, retrying next bucket")
+        ntfy(f"⚠️ EXIT FAILED {asset}",
+             f"Order rejected — position still open, will retry next bucket",
+             priority="urgent")
+        return
     record_tax(asset, pos["direction"], pos["entry"], exit_price,
                pos["size"], pnl, pos["entry_time"])
     with lock:
@@ -759,7 +804,7 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v57 started")
+    log("🚀 CB Trader v58 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -1119,7 +1164,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v57</title>
+<title>CB Trader v58</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1161,7 +1206,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v57 {mode_label}
+    <span style='color:{mode_color}'>● v58 {mode_label}
     </span>
   </div>
 </div>
