@@ -1,5 +1,5 @@
 """
-CB TRADER v59
+CB TRADER v60
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
@@ -108,7 +108,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v59.json"
+STATE_FILE = "/tmp/cb_state_v60.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -221,12 +221,19 @@ def _get_rsi_val(indicators, candles, idx):
         return round(val, 2) if val is not None else None
     return None
 
-def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None):
+def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None, pnl=None,
+                  candle_age_min=None, balance_at_decision=None, contracts_at_decision=None):
     """
-    Saves everything needed to replay the sim and verify the app.
+    Saves EVERYTHING the live app sees so SimA can be truly blind and 1:1.
+    Every variable needed to reproduce the decision is saved here.
     Uses file locking to prevent corruption from concurrent reads/writes.
     """
     try:
+        # Candle age — how old was the last candle when app saw it
+        _age = candle_age_min
+        if _age is None and isinstance(candles, list) and candles:
+            now_ms = int(time.time()) * 1000
+            _age = round((now_ms - candles[-1]["ts"]) / 60000, 1)
         record = {
             "ts":       bucket_ts,
             "dt":       datetime.fromtimestamp(bucket_ts/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
@@ -239,6 +246,10 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             "rsi_cur":  _get_rsi_val(indicators, candles, -2),
             "rsi_prev": _get_rsi_val(indicators, candles, -3),
             "hr_rsi":   indicators.get("hr_rsi") if isinstance(indicators, dict) else None,
+            # New fields for complete 1:1 sim replay
+            "candle_age_min":        _age,
+            "balance_at_decision":   balance_at_decision or state.get("balance", 0),
+            "contracts_at_decision": contracts_at_decision,
             "indicators": indicators if isinstance(indicators, dict) else {},
             "position": {
                 "direction":  position.get("direction"),
@@ -382,7 +393,7 @@ def fetch_candles(asset, granularity=None, n_candles=None):
         # Freshness check — skip if last candle > 30 min old
         now_ms = int(time.time()) * 1000
         age_min = round((now_ms - candles[-1]["ts"]) / 60000, 1)
-        if age_min > 30 and tf == "FIFTEEN_MINUTE":
+        if age_min > 45 and tf == "FIFTEEN_MINUTE":
             log(f"WARNING {asset}: last candle is {age_min} min old — STALE, skipping")
             return None
         return candles
@@ -813,7 +824,7 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v59 started")
+    log("🚀 CB Trader v60 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -872,12 +883,16 @@ def trading_loop():
                                     (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
                                     else (pos["entry"] - exit_price) * pos["size"], 4)
                                 save_sim_data(asset, current_bucket*1000, candles, {},
-                                              "EXIT_RSI", position=dict(pos), pnl=pnl_est)
+                                              "EXIT_RSI", position=dict(pos), pnl=pnl_est,
+                                              balance_at_decision=state.get("balance",0),
+                                              contracts_at_decision=pos.get("contracts",0))
                                 exit_position(asset, exit_price, "RSI_EXIT", cur)
                                 skip_entry[asset] = 1
                             else:
                                 save_sim_data(asset, current_bucket*1000, candles, {},
-                                              "HOLD", position=dict(pos))
+                                              "HOLD", position=dict(pos),
+                                              balance_at_decision=state.get("balance",0),
+                                              contracts_at_decision=pos.get("contracts",0))
                             continue
 
                         # ── RSI MOMENTUM SIGNAL — enter immediately ────
@@ -885,6 +900,9 @@ def trading_loop():
                         if d:
                             # MTF filter: check 1hr RSI trend direction
                             hr_rsi = get_hr_rsi(asset)
+                            # Set hr_rsi in info FIRST — before any save_sim_data calls
+                            # This ensures SimA always has hr_rsi to replicate MTF filter
+                            info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi else None
                             if hr_rsi is not None:
                                 if d == "LONG" and hr_rsi < 50:
                                     save_sim_data(asset, current_bucket*1000, candles, info,
@@ -894,7 +912,6 @@ def trading_loop():
                                     save_sim_data(asset, current_bucket*1000, candles, info,
                                                   f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
                                     continue
-                            info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi else None
                             add_audit(asset, f"🚨 RSI-Mom {d}",
                                       f"RSI prev={info.get('rsi_prev',0):.1f} → cur={info.get('rsi_cur',0):.1f} | "
                                       f"1hr_RSI={info.get('hr_rsi','?')}",
@@ -902,11 +919,15 @@ def trading_loop():
                             entry_price = float(candles[-1]["o"])  # enter at current candle open — matches corrected backtest
                             enter_position(asset, d, entry_price, cur, info)
                             if positions.get(asset):
+                                _pos = positions[asset]
                                 save_sim_data(asset, current_bucket*1000, candles, info,
-                                              f"ENTER_{d}", position=dict(positions[asset]))
+                                              f"ENTER_{d}", position=dict(_pos),
+                                              balance_at_decision=state.get("balance",0),
+                                              contracts_at_decision=_pos.get("contracts",0))
                         else:
                             save_sim_data(asset, current_bucket*1000, candles, info,
-                                          f"NO_SIGNAL:{info.get('fail','?')}")
+                                          f"NO_SIGNAL:{info.get('fail','?')}",
+                                          balance_at_decision=state.get("balance",0))
 
                     except Exception as e:
                         import traceback
@@ -933,6 +954,55 @@ def trading_loop():
                 if cycle_num % 10 == 0:
                     save_state()
 
+                # Detailed per-asset heartbeat — every variable for every asset
+                with lock:
+                    _bal = state["balance"]
+                    _trades = state["total_trades"]
+                hb_lines = [f"candle={bucket_dt} | open={len(positions)} | bal=${_bal:,.2f} | trades={_trades}"]
+                for _a in ASSET_NAMES:
+                    _pos = positions.get(_a)
+                    # Get candle age from cache
+                    _c = None
+                    try:
+                        _c = fetch_candles(_a, granularity=CANDLE_TF, n_candles=2)
+                    except: pass
+                    _age = "?"
+                    if _c and _c[-1].get("ts"):
+                        _age = f"{round((int(time.time())*1000 - _c[-1]['ts'])/60000,1)}m"
+                    # Get latest RSI
+                    _rsi_cur = "?"
+                    _rsi_prev = "?"
+                    _hr = "?"
+                    if _c and len(_c) >= RSI_PERIOD + 2:
+                        _closes = [float(x["c"]) for x in _c]
+                        _rsi_vals = calc_rsi(_closes, RSI_PERIOD)
+                        if _rsi_vals[-2] is not None:
+                            _rsi_cur = f"{_rsi_vals[-2]:.1f}"
+                        if len(_rsi_vals) >= 3 and _rsi_vals[-3] is not None:
+                            _rsi_prev = f"{_rsi_vals[-3]:.1f}"
+                    _hr_val = get_hr_rsi(_a)
+                    _hr = f"{_hr_val:.1f}" if _hr_val is not None else "?"
+                    # Contracts available at current balance
+                    _cs = ASSETS[_a]["contract"]; _mr = ASSETS[_a]["margin_rate"]
+                    _avail = _bal * 0.70 / len(ASSET_NAMES)
+                    _mp = float(_c[-1]["c"]) * _cs * _mr if _c else 0
+                    _cts_avail = min(MAX_CONTRACTS, max(0, int(_avail/_mp))) if _mp > 0 else 0
+                    if _pos:
+                        _unreal = _pos.get("unrealized_pnl", 0.0)
+                        _exit_r = _pos.get("exit_rsi", RSI_EXIT)
+                        _locked = "🔒" if _exit_r == RSI_TRAIL_EXIT else ""
+                        hb_lines.append(
+                            f"  {_a:<4} {_pos['direction']:<5} | prev={_rsi_prev} cur={_rsi_cur} | "
+                            f"hr={_hr} | cts={_cts_avail} | exit<{_exit_r}{_locked} | "
+                            f"unreal=${_unreal:+.2f} | age={_age} | HOLD"
+                        )
+                    else:
+                        hb_lines.append(
+                            f"  {_a:<4} {'—':<5} | prev={_rsi_prev} cur={_rsi_cur} | "
+                            f"hr={_hr} | cts={_cts_avail} | age={_age} | WATCHING"
+                        )
+                for _line in hb_lines:
+                    log(_line)
                 add_audit("SYSTEM", "💓 CYCLE",
                           f"candle={bucket_dt} | open={len(positions)} | "
                           f"balance=${state['balance']:,.2f} | trades={state['total_trades']}")
@@ -1173,7 +1243,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v59</title>
+<title>CB Trader v60</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1215,7 +1285,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v59 {mode_label}
+    <span style='color:{mode_color}'>● v60 {mode_label}
     </span>
   </div>
 </div>
