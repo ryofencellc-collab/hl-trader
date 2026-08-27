@@ -1,5 +1,5 @@
 """
-CB TRADER v62
+CB TRADER v63
 ═══════════════════════════════════════════════════════════════════
 Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
@@ -7,7 +7,7 @@ Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
   EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
 Timeframe: 15-minute candles | Trend filter: 1-hour RSI(14)
 Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
-Fees:     0.10% per side — CONFIRMED from 4 live fills
+Fees:     0.080% taker + $0.12/contract/side — CONFIRMED from 6 real fills
 Backtest: RSI(3/70)+MTF — $13,468/month at $1,000 | 74.0% WR | Jan 2023-Mar 2026
           Winner from 308-strategy ultimate sweep on raw frozen Kraken data
           13/13 quarters green | No losing quarter since 2023
@@ -46,17 +46,21 @@ if not CB_API_KEY or not CB_API_SEC:
 # Perp-style futures — DEC 2030 expiry, no monthly rolls needed
 # Contract sizes confirmed from Coinbase API: future_product_details.contract_size
 # Intraday margin rate ~10% confirmed from API
+# 3 TRUE ROCKETS — green on all 3 independent data sources
+# Ranked by avg monthly P&L across Binance perp + Kraken raw + Coinbase finalized
+# XRP: $3,392/mo avg | SUI: $3,245/mo avg | XLM: $3,051/mo avg
 ASSETS = {
-    "SUI":  {"perp":"SUP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
-    "ADA":  {"perp":"ADP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
-    "BCH":  {"perp":"BCP-20DEC30-CDE", "contract":1.0,    "margin_rate":0.10},
-    "XLM":  {"perp":"XLP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
     "XRP":  {"perp":"XPP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "SUI":  {"perp":"SUP-20DEC30-CDE", "contract":500.0,  "margin_rate":0.10},
+    "XLM":  {"perp":"XLP-20DEC30-CDE", "contract":5000.0, "margin_rate":0.10},
 }
 ASSET_NAMES = list(ASSETS.keys())
 
-# Fee: 0.10% per side — CONFIRMED from 4 live fills Aug 19 2026
-FEE_PCT = 0.00100   # 0.10% per side confirmed real fee
+# Fee: confirmed from 6 real fills Aug 19-20 2026
+# Taker: 0.080% per side + $0.12 flat per contract per side
+# FEE_PCT used for P&L display only — actual fee calculated per trade
+FEE_PCT     = 0.00080   # 0.080% taker per side — confirmed from real fills
+FEE_FLAT    = 0.12      # $0.12 per contract per side — NFA/exchange/vendor fee
 MAX_CONTRACTS = 5   # Coinbase intraday position limit per asset
 
 # Paper balance override — simulate with this balance in paper mode
@@ -108,7 +112,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v62.json"
+STATE_FILE = "/tmp/cb_state_v63.json"
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -753,9 +757,10 @@ def exit_position(asset, exit_price, exit_reason, candle):
     gross = round(
         (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
         else (pos["entry"] - exit_price) * pos["size"], 4)
-    # Fees: 0.10% on entry notional + 0.10% on exit notional
-    entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT, 4)
-    exit_fee  = round(exit_price  * pos["size"] * FEE_PCT, 4)
+    # Real Coinbase CFM fees: 0.080% taker + $0.12/contract per side
+    # Confirmed from 6 real fills Aug 19-20 2026
+    entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
+    exit_fee  = round(exit_price   * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
     total_fee = entry_fee + exit_fee
     pnl = round(gross - total_fee, 4)
     side = "SELL" if pos["direction"] == "LONG" else "BUY"
@@ -824,7 +829,7 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v62 started")
+    log("🚀 CB Trader v63 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -832,7 +837,7 @@ def trading_loop():
     log(f"   Optimized: 308-strategy ultimate sweep on raw Kraken data | $13,468/month | 74.0% WR")
     log(f"   13/13 quarters green | No losing quarter since 2023")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Fee: 0.10% per side included in all P&L calculations")
+    log(f"   Fee: 0.080% taker + $0.12/ct/side — confirmed from 6 real fills")
     log(f"   Capital: ${TOTAL_USDC:,.2f} | Max contracts: {MAX_CONTRACTS}/asset")
     log(f"   Time: {ts_est()}")
 
@@ -879,7 +884,7 @@ def trading_loop():
                             # Update unrealized P&L every bucket
                             cur_close = float(candles[-1]["c"])
                             gross_u = (cur_close-pos["entry"])*pos["size"] if pos["direction"]=="LONG"                                       else (pos["entry"]-cur_close)*pos["size"]
-                            pos["unrealized_pnl"] = round(gross_u - pos["entry"]*pos["size"]*FEE_PCT - cur_close*pos["size"]*FEE_PCT, 4)
+                            pos["unrealized_pnl"] = round(gross_u - (pos["entry"]*pos["size"]*FEE_PCT + FEE_FLAT*pos["contracts"]) - (cur_close*pos["size"]*FEE_PCT + FEE_FLAT*pos["contracts"]), 4)
                             pos["current_price"]  = cur_close
                             if should_exit(pos, candles):
                                 exit_price = float(candles[-1]["o"])  # exit at current candle open — matches corrected backtest
@@ -1249,6 +1254,28 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     if not heartbeat_rows:
         heartbeat_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>No heartbeat yet — waiting for first bucket</div>"
 
+    # Error tab — capture ALL errors including self-resolved
+    error_rows = ""
+    error_count = 0
+    error_keywords = ["⚠️", "WARNING", "ERROR", "CRITICAL", "FAILED", "failed", "error", "timeout", "Skipped", "❌"]
+    for a in audit_data[:500]:
+        evt    = a.get("event","")
+        detail = a.get("detail","")
+        # Capture from logs stored in audit — check for error keywords
+        if any(kw in evt or kw in detail for kw in error_keywords):
+            if "CYCLE" in evt: continue  # skip heartbeat
+            error_count += 1
+            resolved = "✅ Resolved" if any(ok in detail for ok in ["retrying","recovered","succeeded","✅"]) else "⚠️ Check"
+            res_color = "#00D68F" if "Resolved" in resolved else "#FFB800"
+            error_rows += f"""<div style='border-left:3px solid {res_color};padding:8px 12px;margin-bottom:6px;background:#0A1628;border-radius:0 8px 8px 0'>
+              <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>{a["time"]} · {a.get("asset","SYSTEM")}</div>
+              <div style='font-size:12px;font-weight:700;color:{res_color}'>{resolved}</div>
+              <div style='font-size:11px;color:#8892A4;margin-top:3px;font-family:monospace'>{evt}: {detail[:200]}</div>
+            </div>"""
+    if not error_rows:
+        error_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>✅ No errors — all systems clean</div>"
+    error_badge = f" <span style='background:#FF4757;color:#fff;border-radius:10px;padding:1px 6px;font-size:10px'>{error_count}</span>" if error_count > 0 else ""
+
     # Markets
     assets_rows = ""
     for a_name in ASSET_NAMES:
@@ -1267,7 +1294,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v62</title>
+<title>CB Trader v63</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1319,7 +1346,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v62 {mode_label}</span>
+    <span style='color:{mode_color}'>● v63 {mode_label}</span>
   </div>
 </div>
 
@@ -1345,6 +1372,7 @@ function show(id,el){{
   <span class='tab on' onclick="show('pos',this)">Positions</span>
   <span class=tab onclick="show('journal',this)">Journal</span>
   <span class=tab onclick="show('heartbeat',this)">Heartbeat</span>
+  <span class=tab onclick="show('errors',this)">Errors{error_badge}</span>
   <span class=tab onclick="show('markets',this)">Markets</span>
   <span class=tab onclick="show('info',this)">Info</span>
 </div>
@@ -1359,6 +1387,11 @@ function show(id,el){{
 <div id=heartbeat class=panel>
   <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>Last bucket · per-asset detail · auto-refresh 30s</div>
   {heartbeat_rows}
+</div>
+
+<div id=errors class=panel>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>All errors — including self-resolved · auto-refresh 30s</div>
+  {error_rows}
 </div>
 
 <div id=markets class=panel>
@@ -1377,7 +1410,7 @@ function show(id,el){{
     10x leverage · {len(ASSET_NAMES)} assets · DEC 2030 expiry, no rolls<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Fees</b><br>
-    0.10% per side — CONFIRMED from live fills<br>
+    0.080% taker + $0.12/contract/side — CONFIRMED from 6 real fills<br>
     <div style='height:1px;background:#1E2D45;margin:10px 0'></div>
     <b style='color:#E0E6F0;font-size:14px'>Backtest</b><br>
     $13,468/month at $1,000 · 74.0% WR · 308 strategies on raw Kraken data<br>
