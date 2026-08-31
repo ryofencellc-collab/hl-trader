@@ -1,25 +1,32 @@
 """
-CB TRADER v64
+CB TRADER v65
 ═══════════════════════════════════════════════════════════════════
-Strategy: RSI(3/70) + MTF (1hr trend filter) + Trailing Exit
-  LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50 (uptrend confirmed)
-  SHORT: RSI(3) crosses BELOW 30 AND 1hr RSI < 50 (downtrend confirmed)
-  EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
-Timeframe: 15-minute candles | Trend filter: 1-hour RSI(14)
-Exchange: Coinbase CFM Perpetual Futures (CFTC regulated, legal NYC)
-Fees:     0.080% taker + $0.12/contract/side — CONFIRMED from 6 real fills
-Backtest: RSI(3/70)+MTF — $13,468/month at $1,000 | 74.0% WR | Jan 2023-Mar 2026
-          Winner from 308-strategy ultimate sweep on raw frozen Kraken data
-          13/13 quarters green | No losing quarter since 2023
+TWO INDEPENDENT STRATEGIES — paper trading both to find the winner
 
-PAPER MODE: Set TRADE_MODE=paper in Railway to paper trade.
-            Set TRADE_MODE=live to go live. Default=paper.
+Strategy A — 15min (current):
+  RSI(3) on 15min candles + 1hr RSI(14) MTF filter + Trailing Exit
+  LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI(14) > 50
+  SHORT: RSI(3) crosses BELOW 30 AND 1hr RSI(14) < 50
+
+Strategy B — 1hr (new):
+  RSI(3) on 1hr candles + 4hr RSI(3) MTF filter + Trailing Exit
+  LONG:  RSI(3) crosses ABOVE 70 AND 4hr RSI(3) > 50
+  SHORT: RSI(3) crosses BELOW 30 AND 4hr RSI(3) < 50
+
+Both strategies:
+  EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
+  Fees:  0.080% taker + $0.12/contract/side — CONFIRMED from 6 real fills
+  Assets: XRP, SUI, XLM — completely isolated between strategies
+
+Paper trade both for 1 week. Remove the loser. Go live with the winner.
 
 Railway variables needed:
   CB_API_KEY      — Coinbase API key
   CB_API_SECRET   — Coinbase API secret
   NTFY_TOPIC      — ntfy.sh topic for alerts
   TRADE_MODE      — "paper" or "live" (default: paper)
+  MAX_CONTRACTS   — max contracts per asset (default: 5)
+  PAPER_BALANCE   — paper balance per strategy (default: 2000)
 """
 
 import time, os, math, json, csv, uuid, threading
@@ -112,7 +119,45 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v64.json"
+STATE_FILE = "/tmp/cb_state_v65.json"
+
+# ══════════════════════════════════════════════════════════════════
+# STRATEGY B — 1HR STATE (completely isolated from 15min)
+# ══════════════════════════════════════════════════════════════════
+positions_1h  = {}   # 1hr positions — blind to 15min positions
+skip_entry_1h = {}   # 1hr cooldown — blind to 15min cooldown
+state_1h = {
+    "balance": 0.0, "weekly_pnl": 0.0, "total_pnl": 0.0,
+    "wins": 0, "total_trades": 0, "entries": 0,
+    "week": None, "skipped_assets": [],
+}
+STATE_1H_FILE  = "/tmp/cb_state_1h_v65.json"
+DATA_FILE_1H   = "/tmp/cb_sim_data_1hr.json"   # 1hr sim replay data
+lock_1h        = threading.Lock()
+
+def save_state_1h():
+    try:
+        import json as _j
+        with lock_1h:
+            safe = {k:v for k,v in state_1h.items()
+                    if isinstance(v,(int,float,str,bool,type(None)))}
+        _j.dump(safe, open(STATE_1H_FILE,"w"))
+    except Exception as e:
+        log(f"State 1h save error: {e}")
+
+def load_state_1h():
+    import json as _j, os as _o
+    if not _o.path.exists(STATE_1H_FILE): return
+    try:
+        data = _j.load(open(STATE_1H_FILE))
+        with lock_1h:
+            for k,v in data.items():
+                if k in state_1h:
+                    if k == "balance" and PAPER_MODE: continue
+                    state_1h[k] = v
+        log(f"✅ State 1h restored | trades={state_1h['total_trades']} pnl=${state_1h['total_pnl']:+.2f}")
+    except Exception as e:
+        log(f"State 1h load error (starting fresh): {e}")
 
 def save_state():
     """Persist state to disk — survives Railway restarts within deployment."""
@@ -287,6 +332,36 @@ def save_sim_data(asset, bucket_ts, candles, indicators, decision, position=None
             os.replace(tmp, target)
     except Exception as e:
         log(f"sim_data save error: {e}")  # log instead of silent pass
+
+def save_sim_data_1h(asset, bucket_ts, candles, decision,
+                     position=None, pnl=None, balance_at=None, contracts_at=None):
+    """Save 1hr strategy sim data for replay and verification."""
+    try:
+        now_ms = int(time.time())*1000
+        age = round((now_ms-candles[-1]["ts"])/60000,1) if candles else None
+        record = {
+            "ts":bucket_ts,
+            "dt":datetime.fromtimestamp(bucket_ts/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "asset":asset, "decision":decision,
+            "candles":candles[-50:] if candles else [],
+            "candle_age_min":age,
+            "balance_at_decision":balance_at or state_1h.get("balance",0),
+            "contracts_at_decision":contracts_at,
+            "position":{"direction":position.get("direction"),"entry":position.get("entry"),
+                        "contracts":position.get("contracts"),"exit_rsi":position.get("exit_rsi",50),
+                        "entry_time":position.get("entry_time")} if position else None,
+            "pnl":pnl,
+        }
+        with sim_lock:
+            try: existing=json.load(open(DATA_FILE_1H))
+            except: existing=[]
+            existing.append(record)
+            if len(existing)>50000: existing=existing[-50000:]
+            tmp=DATA_FILE_1H+".tmp"
+            with open(tmp,"w") as f: json.dump(existing,f)
+            os.replace(tmp,DATA_FILE_1H)
+    except Exception as e:
+        log(f"sim_data_1h save error: {e}")
 
 def fetch_with_retry(fn, asset, retries=3):
     """Retry wrapper for all Coinbase API calls — handles transient timeouts.
@@ -507,6 +582,49 @@ def fetch_secondary_candles(asset, existing_candles):
         return existing_candles  # no fills found
 
     return sorted(filled, key=lambda x: x["ts"])
+
+def fetch_1hr_candles(asset, n=150):
+    """Fetch 1hr candles for Strategy B signal. 150 candles = ~6 days lookback."""
+    try:
+        client = get_cb_client()
+        product_id = get_active_ticker(asset)
+        end   = int(time.time())
+        start = end - n * 3600
+        def _do():
+            r = client.get_candles(product_id, start=str(start), end=str(end), granularity="ONE_HOUR")
+            if not r.candles: raise ValueError("0 candles")
+            return r
+        resp = fetch_with_retry(_do, asset)
+        if not resp: return None
+        candles = sorted([{
+            "ts":int(c.start)*1000,
+            "dt":datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "o":float(c.open),"h":float(c.high),"l":float(c.low),
+            "c":float(c.close),"v":float(c.volume),
+        } for c in resp.candles], key=lambda x:x["ts"])[-n:]
+        if not candles or candles[-1]["c"]==0: return None
+        now_ms = int(time.time())*1000
+        age_min = round((now_ms-candles[-1]["ts"])/60000,1)
+        if age_min > 90:  # 1hr candle — allow up to 90min stale
+            log(f"WARNING {asset} 1hr: candle is {age_min}min old — using anyway")
+        return candles
+    except Exception as e:
+        log(f"WARNING {asset}: 1hr candle fetch failed {e}")
+        return None
+
+def get_4hr_rsi(asset, candles_1hr):
+    """Compute 4hr RSI(3) by resampling 1hr candles — MTF for 1hr strategy.
+    Resamples every 4 1hr candles into one 4hr candle, then RSI(3).
+    Confirmed approach: same as backtest, avoids extra API call."""
+    if not candles_1hr or len(candles_1hr) < 16: return None
+    # Resample 1hr → 4hr (every 4 candles)
+    c4h = []
+    for i in range(0, len(candles_1hr)-3, 4):
+        c4h.append(float(candles_1hr[i+3]["c"]))
+    if len(c4h) < RSI_PERIOD + 1: return None
+    rsi4h = calc_rsi(c4h, RSI_PERIOD)
+    val = rsi4h[-2] if len(rsi4h)>=2 and rsi4h[-2] is not None else None
+    return round(val, 1) if val is not None else None
 
 def fetch_hr_candles(asset):
     """Fetch 1hr candles for MTF trend filter. Cached — refreshes every hour."""
@@ -907,6 +1025,81 @@ def exit_position(asset, exit_price, exit_reason, candle):
     save_state()  # persist after every completed trade
 
 # ══════════════════════════════════════════════════════════════════
+# STRATEGY B — 1HR ENTER/EXIT (isolated from 15min)
+# ══════════════════════════════════════════════════════════════════
+def enter_position_1h(asset, direction, entry_price, info=None):
+    """Enter 1hr position. Completely isolated from 15min positions."""
+    cs = ASSETS[asset]["contract"]
+    mr = ASSETS[asset]["margin_rate"]
+    with lock_1h:
+        current_bal = state_1h["balance"]
+    avail     = current_bal * 0.70
+    per_slot  = avail / len(ASSET_NAMES)
+    margin_per= entry_price * cs * mr
+    contracts = min(MAX_CONTRACTS, max(1, int(per_slot/margin_per))) if margin_per>0 else 1
+    size      = contracts * cs
+    # Paper only for now — same order mechanism when live
+    oid, actual_cts = place_market_order(asset, direction if direction=="BUY" else "SELL",
+                                         contracts) if not PAPER_MODE else                       (f"PAPER-1H-{asset}-{int(time.time())}", contracts)
+    if PAPER_MODE:
+        log(f"📄 1HR PAPER: {asset} {direction} {contracts}ct @ ${entry_price:.4f}")
+    actual_size = actual_cts * cs
+    rsi_info = info or {}
+    positions_1h[asset] = {
+        "direction":direction,"entry":entry_price,
+        "contracts":actual_cts,"size":actual_size,
+        "strategy":"RSI-1hr","entry_time":ts(),
+        "rsi_entry":rsi_info.get("rsi_cur",0),
+        "exit_rsi":RSI_EXIT,
+        "mtf_rsi":rsi_info.get("mtf_rsi",None),
+        "paper":PAPER_MODE,
+        "unrealized_pnl":0.0,"current_price":entry_price,
+    }
+    with lock_1h:
+        state_1h["entries"] = state_1h.get("entries",0)+1
+    add_audit(asset, f"📊 1HR ENTER {direction}",
+              f"RSI-1hr | entry=${entry_price:.4f} | rsi={rsi_info.get('rsi_cur',0):.1f} | "
+              f"4hr_rsi={rsi_info.get('mtf_rsi','?')} | {actual_cts}ct | {'PAPER' if PAPER_MODE else 'LIVE'}")
+    ntfy(f"{'📄' if PAPER_MODE else '📊'} 1HR ENTER {direction} {asset}",
+         f"RSI-1hr | entry=${entry_price:.4f} | RSI={rsi_info.get('rsi_cur',0):.1f} | {actual_cts}ct")
+
+def exit_position_1h(asset, exit_price, exit_reason):
+    """Exit 1hr position. Updates 1hr state only."""
+    pos = positions_1h.get(asset)
+    if not pos: return
+    cs = ASSETS[asset]["contract"]
+    gross = round(
+        (exit_price-pos["entry"])*pos["size"] if pos["direction"]=="LONG"
+        else (pos["entry"]-exit_price)*pos["size"], 4)
+    entry_fee = round(pos["entry"]*pos["size"]*FEE_PCT + FEE_FLAT*pos["contracts"],4)
+    exit_fee  = round(exit_price*pos["size"]*FEE_PCT   + FEE_FLAT*pos["contracts"],4)
+    total_fee = entry_fee+exit_fee
+    pnl = round(gross-total_fee,4)
+    # Place exit order
+    side = "SELL" if pos["direction"]=="LONG" else "BUY"
+    if PAPER_MODE:
+        log(f"📄 1HR PAPER EXIT: {asset} {side} {pos['contracts']}ct @ ${exit_price:.4f}")
+    else:
+        place_market_order(asset, side, pos["contracts"])
+    with lock_1h:
+        state_1h["total_pnl"]    = round(state_1h["total_pnl"]+pnl,4)
+        state_1h["weekly_pnl"]   = round(state_1h["weekly_pnl"]+pnl,4)
+        state_1h["balance"]      = round(state_1h["balance"]+pnl,4)
+        state_1h["total_trades"] += 1
+        if pnl>=0: state_1h["wins"] = state_1h.get("wins",0)+1
+    del positions_1h[asset]
+    emoji = "✅" if pnl>=0 else "❌"
+    add_audit(asset, f"{emoji} 1HR EXIT {exit_reason}",
+              f"{pos['direction']} ${pos['entry']:.4f}→${exit_price:.4f} | "
+              f"gross=${gross:+.4f} | fees=${total_fee:.4f} | P&L=${pnl:+.4f}")
+    ntfy(f"{emoji} 1HR EXIT {asset}",
+         f"{pos['direction']} | ${pos['entry']:.4f}→${exit_price:.4f} | net=${pnl:+.2f} | {exit_reason}",
+         priority="default" if pnl>=0 else "high")
+    if PAPER_MODE:
+        log(f"📄 1hr paper balance after exit: ${state_1h['balance']:,.2f}")
+    save_state_1h()
+
+# ══════════════════════════════════════════════════════════════════
 # TRADING LOOP — RSI(3/70) + MTF + Trailing Exit
 # Fires every 15-min bucket. Signal on candles[-2]. Entry at candles[-1] open.
 # Exit: RSI < 50 (or < 65 if RSI previously hit 75 — trailing tighten)
@@ -932,7 +1125,11 @@ def trading_loop():
         state["balance"] = TOTAL_USDC
         state["buying_power"] = TOTAL_USDC
     load_state()
-    log("🚀 CB Trader v64 started")
+    # Initialize 1hr strategy balance
+    with lock_1h:
+        state_1h["balance"] = PAPER_BALANCE if PAPER_MODE else live_bal
+    load_state_1h()
+    log("🚀 CB Trader v65 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -1118,6 +1315,115 @@ def trading_loop():
                     hb_detail += f"\n{_line}"
                 add_audit("SYSTEM", "💓 CYCLE", hb_detail)
 
+                # ── STRATEGY B: 1HR TRADING LOOP ─────────────────────────
+                # Only fires when 1hr bucket changes (every 60 min)
+                current_1hr_bucket = (int(time.time()) // 3600) * 3600
+                if not hasattr(trading_loop, "_last_1hr_bucket"):
+                    trading_loop._last_1hr_bucket = current_1hr_bucket
+                if current_1hr_bucket != trading_loop._last_1hr_bucket:
+                    trading_loop._last_1hr_bucket = current_1hr_bucket
+                    log(f"🕐 1HR BUCKET: {datetime.fromtimestamp(current_1hr_bucket,tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+
+                    skipped_1h = []
+                    for asset in ASSET_NAMES:
+                        try:
+                            candles_1h = fetch_1hr_candles(asset, n=150)
+                            if not candles_1h or len(candles_1h) < RSI_PERIOD+5:
+                                skipped_1h.append(asset); continue
+
+                            closes_1h = [float(c["c"]) for c in candles_1h]
+                            rsi_1h    = calc_rsi(closes_1h, RSI_PERIOD)
+                            cur_1h    = rsi_1h[-2] if rsi_1h[-2] is not None else None
+                            prev_1h   = rsi_1h[-3] if len(rsi_1h)>=3 and rsi_1h[-3] is not None else None
+                            if cur_1h is None or prev_1h is None: continue
+
+                            ep_1h = float(candles_1h[-1]["o"])
+
+                            # Skip cooldown
+                            if skip_entry_1h.get(asset,0) > 0:
+                                skip_entry_1h[asset] -= 1; continue
+
+                            # EXIT CHECK
+                            pos_1h = positions_1h.get(asset)
+                            if pos_1h:
+                                cur_close_1h = float(candles_1h[-1]["c"])
+                                gross_u_1h = (cur_close_1h-pos_1h["entry"])*pos_1h["size"]                                              if pos_1h["direction"]=="LONG"                                              else (pos_1h["entry"]-cur_close_1h)*pos_1h["size"]
+                                pos_1h["unrealized_pnl"] = round(
+                                    gross_u_1h
+                                    - (pos_1h["entry"]*pos_1h["size"]*FEE_PCT + FEE_FLAT*pos_1h["contracts"])
+                                    - (cur_close_1h*pos_1h["size"]*FEE_PCT   + FEE_FLAT*pos_1h["contracts"]), 4)
+                                pos_1h["current_price"] = cur_close_1h
+                                # Trailing exit
+                                if pos_1h["direction"]=="LONG":
+                                    if cur_1h > RSI_TRAIL_TRIG: pos_1h["exit_rsi"]=RSI_TRAIL_EXIT
+                                    should_exit_1h = cur_1h < pos_1h.get("exit_rsi",RSI_EXIT)
+                                else:
+                                    if cur_1h < (100-RSI_TRAIL_TRIG): pos_1h["exit_rsi"]=100-RSI_TRAIL_EXIT
+                                    should_exit_1h = cur_1h > pos_1h.get("exit_rsi",100-RSI_EXIT)
+                                if should_exit_1h:
+                                    pnl_est_1h = round(
+                                        (ep_1h-pos_1h["entry"])*pos_1h["size"] if pos_1h["direction"]=="LONG"
+                                        else (pos_1h["entry"]-ep_1h)*pos_1h["size"],4)
+                                    save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
+                                                     "EXIT_RSI", position=dict(pos_1h), pnl=pnl_est_1h,
+                                                     balance_at=state_1h.get("balance",0),
+                                                     contracts_at=pos_1h.get("contracts",0))
+                                    exit_position_1h(asset, ep_1h, "RSI_EXIT")
+                                    skip_entry_1h[asset] = 1
+                                else:
+                                    save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
+                                                     "HOLD", position=dict(pos_1h),
+                                                     balance_at=state_1h.get("balance",0),
+                                                     contracts_at=pos_1h.get("contracts",0))
+                                continue
+
+                            # ENTRY SIGNAL
+                            if prev_1h < RSI_ENTRY and cur_1h >= RSI_ENTRY: d_1h="LONG"
+                            elif prev_1h > (100-RSI_ENTRY) and cur_1h <= (100-RSI_ENTRY): d_1h="SHORT"
+                            else:
+                                save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
+                                                 f"NO_SIGNAL:no cross (prev={prev_1h:.1f} cur={cur_1h:.1f})",
+                                                 balance_at=state_1h.get("balance",0))
+                                continue
+
+                            # 4HR MTF FILTER
+                            mtf_rsi_1h = get_4hr_rsi(asset, candles_1h)
+                            if mtf_rsi_1h is not None:
+                                if d_1h=="LONG"  and mtf_rsi_1h < 50:
+                                    save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
+                                                     f"NO_SIGNAL:4hr_MTF ({mtf_rsi_1h:.1f}<50)",
+                                                     balance_at=state_1h.get("balance",0))
+                                    continue
+                                if d_1h=="SHORT" and mtf_rsi_1h > 50:
+                                    save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
+                                                     f"NO_SIGNAL:4hr_MTF ({mtf_rsi_1h:.1f}>50)",
+                                                     balance_at=state_1h.get("balance",0))
+                                    continue
+
+                            info_1h = {"rsi_cur":round(cur_1h,2),"rsi_prev":round(prev_1h,2),
+                                       "mtf_rsi":mtf_rsi_1h}
+                            add_audit(asset, f"🚨 1HR RSI-Mom {d_1h}",
+                                      f"RSI prev={prev_1h:.1f}→cur={cur_1h:.1f} | 4hr_RSI={mtf_rsi_1h}")
+                            enter_position_1h(asset, d_1h, ep_1h, info_1h)
+                            if positions_1h.get(asset):
+                                _p1h = positions_1h[asset]
+                                save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
+                                                 f"ENTER_{d_1h}", position=dict(_p1h),
+                                                 balance_at=state_1h.get("balance",0),
+                                                 contracts_at=_p1h.get("contracts",0))
+
+                        except Exception as e:
+                            import traceback
+                            log(f"1hr asset error {asset}: {e}")
+                            log(traceback.format_exc())
+
+                    with lock_1h:
+                        state_1h["skipped_assets"] = skipped_1h
+                    if skipped_1h:
+                        log(f"⚠️ 1hr skipped: {skipped_1h}")
+                    save_state_1h()
+
+                # ── WEEKLY P&L REPORT ─────────────────────────────────────
                 # Weekly P&L report every Monday 9am UTC
                 if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 15:
                     with lock:
@@ -1214,6 +1520,17 @@ def sim_data():
     try:
         return Response(open(DATA_FILE).read(), mimetype="application/json",
                        headers={"Content-Disposition":"attachment;filename=cb_sim_data.json"})
+    except:
+        return Response("[]", mimetype="application/json")
+
+@app.route("/sim-data-1hr")
+def sim_data_1hr():
+    """Download 1hr strategy sim replay data"""
+    if request.cookies.get("auth") != "3757":
+        return Response("Unauthorized", status=401)
+    try:
+        return Response(open(DATA_FILE_1H).read(), mimetype="application/json",
+                       headers={"Content-Disposition":"attachment;filename=cb_sim_data_1hr.json"})
     except:
         return Response("[]", mimetype="application/json")
 
@@ -1357,6 +1674,24 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
     if not heartbeat_rows:
         heartbeat_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:14px'>No heartbeat yet — waiting for first bucket</div>"
 
+    # 1hr journal from audit — filter for 1hr events
+    journal1h_rows = ""
+    j1h_shown = 0
+    for a in audit_data:
+        if j1h_shown >= 100: break
+        evt = a.get("event","")
+        if "1HR" not in evt and "1hr" not in evt: continue
+        if "CYCLE" in evt: continue
+        j1h_shown += 1
+        color = "#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt else "#FFB800"
+        journal1h_rows += f"""<div class=j-trade style='border-color:{color}'>
+          <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>{a["time"]} · {a.get("asset","SYSTEM")}</div>
+          <div style='font-size:13px;font-weight:700;color:{color}'>{evt}</div>
+          <div style='font-size:11px;color:#8892A4;margin-top:3px'>{a.get("detail","")[:150]}</div>
+        </div>"""
+    if not journal1h_rows:
+        journal1h_rows = "<div style='color:#4A5878;padding:32px;text-align:center;font-size:13px'>No 1hr trades yet — fires every hour</div>"
+
     # Error tab — capture ALL errors including self-resolved
     error_rows = ""
     error_count = 0
@@ -1396,12 +1731,53 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
           <span style='color:{sc};font-size:11px;font-weight:600'>{status}</span>
         </div>"""
 
+    # 1hr strategy state for dashboard
+    with lock_1h:
+        s1h = dict(state_1h)
+        pos1h = dict(positions_1h)
+    wr_1h = round(s1h.get("wins",0)/s1h["total_trades"]*100,1) if s1h["total_trades"] else 0
+    wk_color_1h = "#00D68F" if s1h["weekly_pnl"]>=0 else "#FF4757"
+    tot_color_1h = "#00D68F" if s1h["total_pnl"]>=0 else "#FF4757"
+
+    # 1hr positions
+    pos1h_rows = ""
+    for asset, p in pos1h.items():
+        unreal  = p.get("unrealized_pnl",0.0)
+        cur_p   = p.get("current_price",p.get("entry",0))
+        pnl_col = "#00D68F" if unreal>=0 else "#FF4757"
+        dir_col = "#00D68F" if p["direction"]=="LONG" else "#FF4757"
+        dir_bg  = "#00D68F22" if p["direction"]=="LONG" else "#FF475722"
+        pos1h_rows += f"""<div style='background:#0A1628;border:1px solid #1E2D45;border-radius:10px;padding:14px;margin-bottom:10px'>
+          <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px'>
+            <span style='font-size:18px;font-weight:800'>{asset}</span>
+            <span style='font-size:12px;padding:2px 8px;border-radius:20px;background:{dir_bg};color:{dir_col}'>{p["direction"]}</span>
+            <span style='font-size:16px;font-weight:700;color:{pnl_col}'>${unreal:+,.2f}</span>
+          </div>
+          <div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:12px'>
+            <div style='background:#060D1A;border-radius:6px;padding:8px'>
+              <div style='color:#4A5878;margin-bottom:2px'>Entry</div>
+              <div style='font-weight:600'>${p["entry"]:.4f}</div>
+            </div>
+            <div style='background:#060D1A;border-radius:6px;padding:8px'>
+              <div style='color:#4A5878;margin-bottom:2px'>Current</div>
+              <div style='font-weight:600;color:{pnl_col}'>${cur_p:.4f}</div>
+            </div>
+            <div style='background:#060D1A;border-radius:6px;padding:8px'>
+              <div style='color:#4A5878;margin-bottom:2px'>Exit RSI</div>
+              <div style='font-weight:600;color:#FFB800'>&lt;{p.get("exit_rsi",50)}</div>
+            </div>
+          </div>
+          <div style='font-size:11px;color:#4A5878;margin-top:6px'>{p.get("contracts",1)}ct | RSI-1hr | Since {p.get("entry_time","?")[:16]}</div>
+        </div>"""
+    if not pos1h_rows:
+        pos1h_rows = "<div style='color:#4A5878;padding:24px;text-align:center;font-size:13px'>No open 1hr positions</div>"
+
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     now_est = ts_est()
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v64</title>
+<title>CB Trader v65</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1446,6 +1822,22 @@ function show(id,el){{
 </head><body>
 
 {'' if not s.get('skipped_assets') else "<div style='background:#FF475722;border:1px solid #FF4757;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#FF4757'><b>⚠️ SKIPPED ASSETS</b>: "+ ', '.join(s.get('skipped_assets',[])) + "</div>"}
+<div style='background:#0A1628;border:1px solid #1E2D45;border-radius:10px;padding:10px 14px;margin-bottom:12px'>
+  <div style='font-size:10px;color:#4A5878;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px'>Strategy Comparison</div>
+  <div style='display:grid;grid-template-columns:1fr 1fr;gap:8px'>
+    <div style='text-align:center'>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>15min P&L</div>
+      <div style='font-size:16px;font-weight:800;color:{tot_color}'>${s["total_pnl"]:+,.2f}</div>
+      <div style='font-size:11px;color:#4A5878'>{s["total_trades"]} trades · {wr}% WR</div>
+    </div>
+    <div style='text-align:center'>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>1hr P&L</div>
+      <div style='font-size:16px;font-weight:800;color:{tot_color_1h}'>${s1h["total_pnl"]:+,.2f}</div>
+      <div style='font-size:11px;color:#4A5878'>{s1h["total_trades"]} trades · {wr_1h}% WR</div>
+    </div>
+  </div>
+</div>
+
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px'>
   <div>
     <div style='font-size:24px;font-weight:800;letter-spacing:-0.5px'>CB Trader</div>
@@ -1453,7 +1845,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v64 {mode_label}</span>
+    <span style='color:{mode_color}'>● v65 {mode_label}</span>
   </div>
 </div>
 
@@ -1475,6 +1867,7 @@ function show(id,el){{
   <div class=kpi><div class=kpi-l>Cycle</div><div class=kpi-v style='font-size:14px;color:#4A5878'>#{s.get("cycle",0)}</div></div>
 </div>
 
+<div style='font-size:11px;font-weight:700;color:#4A5878;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px'>15MIN STRATEGY</div>
 <div class=tabs>
   <span class='tab on' onclick="show('pos',this)">Positions</span>
   <span class=tab onclick="show('journal',this)">Journal</span>
@@ -1504,6 +1897,21 @@ function show(id,el){{
 <div id=markets class=panel>
   <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>{len(ASSET_NAMES)} assets · evaluates every 15 min</div>
   {assets_rows}
+</div>
+
+<div style='margin-top:20px;border-top:2px solid #1E2D45;padding-top:16px'>
+<div style='font-size:11px;font-weight:700;color:#4A5878;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px'>1HR STRATEGY</div>
+<div class=tabs>
+  <span class='tab on' onclick="show('pos1h',this)" id=tab1h_pos>Positions 1hr</span>
+  <span class=tab onclick="show('journal1h',this)">Journal 1hr</span>
+</div>
+
+<div id=pos1h class='panel on'>{pos1h_rows}</div>
+
+<div id=journal1h class=panel>
+  <div style='font-size:11px;color:#4A5878;margin-bottom:10px'>1hr trades only · auto-refresh 30s</div>
+  {journal1h_rows}
+</div>
 </div>
 
 <div id=info class=panel>
