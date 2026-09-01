@@ -1,20 +1,24 @@
 """
-CB TRADER v67
+CB TRADER v68
 ═══════════════════════════════════════════════════════════════════
 TWO INDEPENDENT STRATEGIES — paper trading both to find the winner
 
 Strategy A — 15min (current):
-  RSI(3) on 15min candles + 1hr RSI(14) MTF filter + Trailing Exit
-  LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI(14) > 50
-  SHORT: RSI(3) crosses BELOW 30 AND 1hr RSI(14) < 50
+  RSI(2) on 15min candles + 1hr RSI(14) MTF filter + Trailing Exit
+  LONG:  RSI(2) crosses ABOVE 70 AND 1hr RSI(14) > 50
+  SHORT: RSI(2) crosses BELOW 30 AND 1hr RSI(14) < 50
+  EXIT:  RSI drops below 50 (or 60 if RSI hit 80 — trailing tighten)
+  Parameters: RSI(2/70/50/80→60) — winner from INTX sweep Sep 2026
 
 Strategy B — 1hr (new):
-  RSI(3) on 1hr candles + 4hr RSI(3) MTF filter + Trailing Exit
-  LONG:  RSI(3) crosses ABOVE 70 AND 4hr RSI(3) > 50
-  SHORT: RSI(3) crosses BELOW 30 AND 4hr RSI(3) < 50
+  RSI(2) on 1hr candles + 4hr RSI(3) MTF filter + Trailing Exit
+  LONG:  RSI(2) crosses ABOVE 65 AND 4hr RSI(3) > 50
+  SHORT: RSI(2) crosses BELOW 35 AND 4hr RSI(3) < 50
+  EXIT:  RSI drops below 40 (or 65 if RSI hit 75 — trailing tighten)
+  Parameters: RSI(2/65/40/75→65) — winner from 1hr INTX sweep Sep 2026
+  Expected: $14,342/mo | 91.4% WR | 39/39 green weeks
 
 Both strategies:
-  EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
   Fees:  0.080% taker + $0.12/contract/side — CONFIRMED from 6 real fills
   Assets: XRP, SUI, XLM — completely isolated between strategies
 
@@ -76,11 +80,23 @@ MAX_CONTRACTS = int(os.environ.get("MAX_CONTRACTS", "5"))  # raise via Railway e
 PAPER_BALANCE = float(os.environ.get("PAPER_BALANCE", "2000"))
 
 # RSI Momentum parameters — winner from 308-strategy raw Kraken sweep
-RSI_PERIOD      = 3     # RSI period — winner from 308-strategy raw Kraken sweep
+RSI_PERIOD      = 2     # RSI period — winner from INTX/CFM parameter sweep Sep 2026
 RSI_ENTRY       = 70    # cross above → LONG, cross below 30 → SHORT
 RSI_EXIT        = 50    # exit LONG below 50, exit SHORT above 50
-RSI_TRAIL_TRIG  = 75    # when RSI hits 75, tighten exit threshold
-RSI_TRAIL_EXIT  = 65    # tightened exit threshold
+RSI_TRAIL_TRIG  = 80    # when RSI hits 80, tighten exit threshold (was 75)
+RSI_TRAIL_EXIT  = 60    # tightened exit threshold (was 65)
+# v68: RSI(2)/70/50/80→60 — best on INTX clean data (v67 gap fill dataset)
+# Tested on Dec 2025-Aug 2026 | $19,396/mo | $2,240/wk after tax | 39/39 green wks
+# Beats RSI(3)/70/50/75→65: +$2,326/mo (+14%) on same dataset
+
+# ── STRATEGY B: 1hr parameters — kept original, not yet swept ─────
+# These constants used ONLY in 1hr trading loop — never in 15min
+RSI1H_PERIOD     = 2    # 1hr RSI period — winner from 1hr INTX sweep (was 3)
+RSI1H_ENTRY      = 65   # 1hr entry threshold — winner (was 70)
+RSI1H_EXIT       = 40   # 1hr exit threshold — winner (was 50)
+RSI1H_TRAIL_TRIG = 75   # 1hr trail trigger — unchanged
+RSI1H_TRAIL_EXIT = 65   # 1hr trail exit — unchanged
+# 1hr sweep winner: RSI(2)/65/40/75→65 | $14,342/mo | 91.4% WR | 39 green wks
 
 def get_active_ticker(asset):
     """Returns perp ticker — no rolling needed, DEC 2030 expiry"""
@@ -121,7 +137,7 @@ state = {
     "api_errors":     {},
 }
 
-STATE_FILE = "/tmp/cb_state_v67.json"
+STATE_FILE = "/tmp/cb_state_v68.json"
 
 # ══════════════════════════════════════════════════════════════════
 # STRATEGY B — 1HR STATE (completely isolated from 15min)
@@ -133,7 +149,7 @@ state_1h = {
     "wins": 0, "total_trades": 0, "entries": 0,
     "week": None, "skipped_assets": [],
 }
-STATE_1H_FILE  = "/tmp/cb_state_1h_v67.json"
+STATE_1H_FILE  = "/tmp/cb_state_1h_v68.json"
 DATA_FILE_1H   = "/tmp/cb_sim_data_1hr.json"   # 1hr sim replay data
 lock_1h        = threading.Lock()
 
@@ -906,14 +922,14 @@ def calc_rsi(closes, period=14):
     return out
 
 # ══════════════════════════════════════════════════════════════════
-# SIGNAL — RSI(3/70) Momentum Cross + MTF
+# SIGNAL — RSI(2/70) Momentum Cross + MTF
 # ══════════════════════════════════════════════════════════════════
 def evaluate_signal(candles):
     """
-    RSI(3/70) Momentum strategy — winner from 308-strategy raw Kraken sweep
-    LONG:  RSI(3) crosses ABOVE 70 AND 1hr RSI > 50
-    SHORT: RSI(3) crosses BELOW 30 AND 1hr RSI < 50
-    EXIT:  RSI drops below 50 (or 65 if RSI hit 75 — trailing tighten)
+    RSI(2/70) Momentum strategy — winner from INTX parameter sweep Sep 2026
+    LONG:  RSI(2) crosses ABOVE 70 AND 1hr RSI(14) resampled > 50
+    SHORT: RSI(2) crosses BELOW 30 AND 1hr RSI(14) resampled < 50
+    EXIT:  RSI drops below 50 (or 60 if RSI hit 80 — trailing tighten)
 
     Returns: (direction, None, None, info_dict) — no TP/stop, RSI exit
     """
@@ -950,14 +966,14 @@ def evaluate_signal(candles):
 
 def should_exit(pos, candles):
     """
-    RSI Trailing Exit — RSI(3/70/50/75/65)
+    RSI Trailing Exit — RSI(2/70/50/80→60)
 
     Standard exit: RSI drops below 50 (LONG) or rises above 50 (SHORT)
-    Trailing tighten: if RSI hits 75 during LONG, tighten exit to 65
-                      if RSI hits 25 during SHORT, tighten exit to 35
+    Trailing tighten: if RSI hits 80 during LONG, tighten exit to 60
+                      if RSI hits 20 during SHORT, tighten exit to 40
 
     This lets winners run but exits sooner when momentum peaks.
-    13/13 quarters green on raw Kraken data.
+    39/39 weeks green on INTX data Dec 2025-Aug 2026.
 
     pos["exit_rsi"] stores the tightened threshold — persists in positions dict.
     """
@@ -1127,7 +1143,7 @@ def enter_position_1h(asset, direction, entry_price, info=None):
         "contracts":actual_cts,"size":actual_size,
         "strategy":"RSI-1hr","entry_time":ts(),
         "rsi_entry":rsi_info.get("rsi_cur",0),
-        "exit_rsi":RSI_EXIT,
+        "exit_rsi":RSI1H_EXIT,
         "mtf_rsi":rsi_info.get("mtf_rsi",None),
         "paper":PAPER_MODE,
         "unrealized_pnl":0.0,"current_price":entry_price,
@@ -1206,7 +1222,7 @@ def trading_loop():
     with lock_1h:
         state_1h["balance"] = PAPER_BALANCE if PAPER_MODE else live_bal
     load_state_1h()
-    log("🚀 CB Trader v67 started")
+    log("🚀 CB Trader v68 started")
     mode_str = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
     log(f"   Mode: {mode_str} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}) + MTF(1hr RSI>50) + Trailing Exit")
@@ -1421,11 +1437,11 @@ def trading_loop():
                     for asset in ASSET_NAMES:
                         try:
                             candles_1h = fetch_1hr_candles(asset, n=150)
-                            if not candles_1h or len(candles_1h) < RSI_PERIOD+5:
+                            if not candles_1h or len(candles_1h) < RSI1H_PERIOD+5:
                                 skipped_1h.append(asset); continue
 
                             closes_1h = [float(c["c"]) for c in candles_1h]
-                            rsi_1h    = calc_rsi(closes_1h, RSI_PERIOD)
+                            rsi_1h    = calc_rsi(closes_1h, RSI1H_PERIOD)
                             cur_1h    = rsi_1h[-2] if rsi_1h[-2] is not None else None
                             prev_1h   = rsi_1h[-3] if len(rsi_1h)>=3 and rsi_1h[-3] is not None else None
                             if cur_1h is None or prev_1h is None: continue
@@ -1448,11 +1464,11 @@ def trading_loop():
                                 pos_1h["current_price"] = cur_close_1h
                                 # Trailing exit
                                 if pos_1h["direction"]=="LONG":
-                                    if cur_1h > RSI_TRAIL_TRIG: pos_1h["exit_rsi"]=RSI_TRAIL_EXIT
-                                    should_exit_1h = cur_1h < pos_1h.get("exit_rsi",RSI_EXIT)
+                                    if cur_1h > RSI1H_TRAIL_TRIG: pos_1h["exit_rsi"]=RSI1H_TRAIL_EXIT
+                                    should_exit_1h = cur_1h < pos_1h.get("exit_rsi",RSI1H_EXIT)
                                 else:
-                                    if cur_1h < (100-RSI_TRAIL_TRIG): pos_1h["exit_rsi"]=100-RSI_TRAIL_EXIT
-                                    should_exit_1h = cur_1h > pos_1h.get("exit_rsi",100-RSI_EXIT)
+                                    if cur_1h < (100-RSI1H_TRAIL_TRIG): pos_1h["exit_rsi"]=100-RSI1H_TRAIL_EXIT
+                                    should_exit_1h = cur_1h > pos_1h.get("exit_rsi",100-RSI1H_EXIT)
                                 if should_exit_1h:
                                     pnl_est_1h = round(
                                         (ep_1h-pos_1h["entry"])*pos_1h["size"] if pos_1h["direction"]=="LONG"
@@ -1471,8 +1487,8 @@ def trading_loop():
                                 continue
 
                             # ENTRY SIGNAL
-                            if prev_1h < RSI_ENTRY and cur_1h >= RSI_ENTRY: d_1h="LONG"
-                            elif prev_1h > (100-RSI_ENTRY) and cur_1h <= (100-RSI_ENTRY): d_1h="SHORT"
+                            if prev_1h < RSI1H_ENTRY and cur_1h >= RSI1H_ENTRY: d_1h="LONG"
+                            elif prev_1h > (100-RSI1H_ENTRY) and cur_1h <= (100-RSI1H_ENTRY): d_1h="SHORT"
                             else:
                                 save_sim_data_1h(asset, current_1hr_bucket*1000, candles_1h,
                                                  f"NO_SIGNAL:no cross (prev={prev_1h:.1f} cur={cur_1h:.1f})",
@@ -1870,7 +1886,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v67</title>
+<title>CB Trader v68</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1938,7 +1954,7 @@ function show(id,el){{
   </div>
   <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
     {now_utc}<br>{now_est}<br>
-    <span style='color:{mode_color}'>● v67 {mode_label}</span>
+    <span style='color:{mode_color}'>● v68 {mode_label}</span>
   </div>
 </div>
 
