@@ -127,7 +127,7 @@ RSI_TRAIL_TRIG = 80  # When RSI hits 80 (LONG) or 20 (SHORT), tighten exit
 RSI_TRAIL_EXIT = 55  # Tightened exit threshold (LONG: <55 | SHORT: >45)
 
 CANDLE_TF    = "FIFTEEN_MINUTE"
-CANDLE_LIMIT = 150  # 37.5 hours lookback — enough for RSI warmup + MTF
+CANDLE_LIMIT = 300  # 75 hours lookback — guarantees MTF ready immediately on startup
 
 DIAG_FILE  = "/tmp/cb_diagnostic.json"
 DATA_FILE  = "/tmp/cb_sim_data.json"
@@ -141,8 +141,9 @@ positions        = {}
 skip_entry       = {}
 lock             = threading.Lock()
 sim_lock         = threading.Lock()
-intx_candle_cache = {}
-intx_cache_ts    = {}
+intx_candle_cache  = {}
+intx_cache_ts     = {}
+startup_candle_cache = {}  # pre-loaded merged candles — fallback if first bucket fetch is thin
 
 state = {
     "balance": PAPER_BALANCE, "buying_power": PAPER_BALANCE,
@@ -983,6 +984,21 @@ def trading_loop():
                         # Merge: CFM primary, INTX fills gaps
                         candles      = merge_cfm_intx(cfm_candles, intx_candles)
 
+                        # Overkill fallback: if fresh fetch thin (<100 candles), backfill
+                        # from startup cache. Guarantees MTF ready immediately after cold
+                        # start — even if API returns only a handful of candles.
+                        if len(candles or []) < 100 and asset in startup_candle_cache:
+                            cached   = startup_candle_cache[asset]
+                            combined = merge_cfm_intx(cached, candles or [])
+                            if len(combined) > len(candles or []):
+                                log(f"  {asset}: backfilled startup cache ({len(candles or [])} → {len(combined)} candles)")
+                                candles = combined
+
+                        # Always update startup cache with latest merged candles
+                        # so cache stays fresh across restarts and long runs
+                        if candles and len(candles) >= 100:
+                            startup_candle_cache[asset] = candles[-CANDLE_LIMIT:]
+
                         if not candles or len(candles) < RSI_PERIOD + 5:
                             skipped_assets.append(asset)
                             continue
@@ -1031,19 +1047,24 @@ def trading_loop():
                         # ── ENTRY SIGNAL ──────────────────────────────
                         d, _, _, info = evaluate_signal(candles)
                         if d:
-                            # MTF filter: resampled 1hr RSI(14)
+                            # MTF filter: resampled 1hr RSI(14) from 15min candles
                             hr_rsi = get_hr_rsi(asset, candles)
                             info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi is not None else None
 
-                            if hr_rsi is not None:
-                                if d == "LONG" and hr_rsi < 50:
-                                    save_sim_data(asset, current_bucket * 1000, candles, info,
-                                                  f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}<50)")
-                                    continue
-                                if d == "SHORT" and hr_rsi > 50:
-                                    save_sim_data(asset, current_bucket * 1000, candles, info,
-                                                  f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
-                                    continue
+                            # Block trade if MTF not ready — should never happen after
+                            # startup cache fix, but belt-and-suspenders
+                            if hr_rsi is None:
+                                save_sim_data(asset, current_bucket * 1000, candles, info,
+                                              "NO_SIGNAL:MTF_not_ready (need 60+ candles)")
+                                continue
+                            if d == "LONG" and hr_rsi < 50:
+                                save_sim_data(asset, current_bucket * 1000, candles, info,
+                                              f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}<50)")
+                                continue
+                            if d == "SHORT" and hr_rsi > 50:
+                                save_sim_data(asset, current_bucket * 1000, candles, info,
+                                              f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
+                                continue
 
                             add_audit(asset, f"🚨 RSI-Mom {d}",
                                       f"RSI prev={info.get('rsi_prev', 0):.1f} → cur={info.get('rsi_cur', 0):.1f} | "
@@ -1512,12 +1533,26 @@ function show(id,el){{
 # ══════════════════════════════════════════════════════════════════
 # STARTUP
 # ══════════════════════════════════════════════════════════════════
-log("📡 Pre-loading 15min candles via REST...")
+log("📡 Pre-loading candles on startup — CFM + INTX...")
 for a in ASSET_NAMES:
-    c = fetch_candles(a, granularity=CANDLE_TF, n_candles=CANDLE_LIMIT)
-    log(f"  {a}: {len(c) if c else 0} candles")
+    # CFM primary
+    cfm = fetch_candles(a, granularity=CANDLE_TF, n_candles=CANDLE_LIMIT)
+    # INTX gap fill — pre-warm cache so first bucket has full data immediately
+    intx = fetch_intx_candles(a, n=CANDLE_LIMIT)
+    merged = merge_cfm_intx(cfm, intx)
+    # Store in startup cache — trading loop uses this as fallback if first fetch is thin
+    if merged and len(merged) >= 60:
+        startup_candle_cache[a] = merged
+    hr = None
+    if merged and len(merged) >= 60:
+        c1h = [float(merged[i+3]["c"]) for i in range(0, len(merged)-3, 4)]
+        if len(c1h) >= 16:
+            rsi1h = calc_rsi(c1h, 14)
+            val = rsi1h[-2] if len(rsi1h) >= 2 and rsi1h[-2] is not None else None
+            hr = round(val, 1) if val is not None else None
+    log(f"  {a}: {len(merged) if merged else 0} candles ({sum(1 for c in (merged or []) if c.get('source')=='intx')} INTX) | hr_rsi={hr}")
     time.sleep(0.5)
-log("✅ All candles pre-loaded")
+log("✅ Pre-load complete — MTF ready immediately")
 
 check_weekly_reset()
 threading.Thread(target=trading_loop, daemon=True).start()
