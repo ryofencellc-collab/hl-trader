@@ -1531,28 +1531,41 @@ function show(id,el){{
 </body></html>"""
 
 # ══════════════════════════════════════════════════════════════════
-# STARTUP
+# STARTUP — deferred to first request so gunicorn worker is fully
+# forked before we fetch candles or start the trading thread.
+# _started flag ensures it only runs once per worker.
 # ══════════════════════════════════════════════════════════════════
-log("📡 Pre-loading candles on startup — CFM + INTX...")
-for a in ASSET_NAMES:
-    # CFM primary
-    cfm = fetch_candles(a, granularity=CANDLE_TF, n_candles=CANDLE_LIMIT)
-    # INTX gap fill — pre-warm cache so first bucket has full data immediately
-    intx = fetch_intx_candles(a, n=CANDLE_LIMIT)
-    merged = merge_cfm_intx(cfm, intx)
-    # Store in startup cache — trading loop uses this as fallback if first fetch is thin
-    if merged and len(merged) >= 60:
-        startup_candle_cache[a] = merged
-    hr = None
-    if merged and len(merged) >= 60:
-        c1h = [float(merged[i+3]["c"]) for i in range(0, len(merged)-3, 4)]
-        if len(c1h) >= 16:
-            rsi1h = calc_rsi(c1h, 14)
-            val = rsi1h[-2] if len(rsi1h) >= 2 and rsi1h[-2] is not None else None
-            hr = round(val, 1) if val is not None else None
-    log(f"  {a}: {len(merged) if merged else 0} candles ({sum(1 for c in (merged or []) if c.get('source')=='intx')} INTX) | hr_rsi={hr}")
-    time.sleep(0.5)
-log("✅ Pre-load complete — MTF ready immediately")
+_started      = False
+_start_lock   = threading.Lock()
 
-check_weekly_reset()
-threading.Thread(target=trading_loop, daemon=True).start()
+def startup():
+    global _started
+    with _start_lock:
+        if _started:
+            return
+        _started = True
+
+    log("📡 Pre-loading candles on startup — CFM + INTX...")
+    for a in ASSET_NAMES:
+        cfm    = fetch_candles(a, granularity=CANDLE_TF, n_candles=CANDLE_LIMIT)
+        intx   = fetch_intx_candles(a, n=CANDLE_LIMIT)
+        merged = merge_cfm_intx(cfm, intx)
+        if merged and len(merged) >= 60:
+            startup_candle_cache[a] = merged
+        hr = None
+        if merged and len(merged) >= 60:
+            c1h = [float(merged[i+3]["c"]) for i in range(0, len(merged)-3, 4)]
+            if len(c1h) >= 16:
+                rsi1h = calc_rsi(c1h, 14)
+                val   = rsi1h[-2] if len(rsi1h) >= 2 and rsi1h[-2] is not None else None
+                hr    = round(val, 1) if val is not None else None
+        log(f"  {a}: {len(merged) if merged else 0} candles "
+            f"({sum(1 for c in (merged or []) if c.get('source')=='intx')} INTX) | hr_rsi={hr}")
+        time.sleep(0.5)
+    log("✅ Pre-load complete — MTF ready immediately")
+    check_weekly_reset()
+    threading.Thread(target=trading_loop, daemon=True).start()
+
+@app.before_request
+def ensure_started():
+    startup()
