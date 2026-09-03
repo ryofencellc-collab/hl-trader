@@ -1,5 +1,5 @@
 """
-CB TRADER v69
+CB TRADER v70
 ═══════════════════════════════════════════════════════════════════
 SINGLE STRATEGY — RSI(3/75/50/80→55) on 15min candles
 
@@ -27,7 +27,6 @@ Fees confirmed from 6 real fills Aug 19-20 2026:
 Candle sources:
   Primary: Coinbase CFM (XPP/SUP/XLP)
   Gap fill: INTX (XRP-PERP/SUI-PERP/XLM-PERP) — fills CFM gaps seamlessly
-  Fallback: Hyperliquid — secondary gap fill if INTX misses
 
 Sim data:
   Saves everything the app sees every bucket — blind replay possible
@@ -65,22 +64,31 @@ CHECKLIST — triple checked before push:
   ✅ No 1hr trading loop block anywhere
   ✅ No 1hr dashboard panels anywhere
   ✅ No roll countdown (DEC 2030 expiry, no rolls needed)
-  ✅ State file = cb_state_v69.json
+  ✅ State file = cb_state_v70.json
   ✅ Sim saves: candles[-50:], hr_rsi, entry price, contracts, pnl NET
   ✅ Entry at candle open (candles[-1]["o"])
   ✅ Exit at candle open (candles[-1]["o"])
   ✅ Skip cooldown: 1 bucket after exit
   ✅ MTF: resampled 1hr RSI(14) from 15min candles (no separate API call)
   ✅ INTX gap fill active
-  ✅ Hyperliquid fallback active
-  ✅ docstring updated to v69
-  ✅ startup log updated to v69
-  ✅ dashboard title = CB Trader v69
+  ✅ docstring updated to v70
+  ✅ startup log updated to v70
+  ✅ dashboard title = CB Trader v70
   ✅ info panel strategy description updated
   ✅ No stale RSI(2)/RSI(3/70) comments from v68
+  ✅ hr_rsi computed BEFORE evaluate_signal — always saved in sim data
+  ✅ MTF explicitly blocks trade when hr_rsi is None
+  ✅ CANDLE_LIMIT = 300 (75hr lookback — MTF ready on startup)
+  ✅ Startup cache pre-loads CFM+INTX — backfills if first bucket thin
+  ✅ Startup cache refreshes every bucket — never stale
+  ✅ Startup deferred to @app.before_request — gunicorn compatible
+  ✅ Dead code removed: fetch_secondary_candles, round_price
+  ✅ docstring updated to v70
+  ✅ startup log updated to v70
+  ✅ State file = cb_state_v70.json
 """
 
-import time, os, math, json, csv, uuid, threading
+import time, os, json, csv, uuid, threading
 from datetime import datetime, timezone
 from flask import Flask, Response, request, redirect
 import requests as req
@@ -132,7 +140,7 @@ CANDLE_LIMIT = 300  # 75 hours lookback — guarantees MTF ready immediately on 
 DIAG_FILE  = "/tmp/cb_diagnostic.json"
 DATA_FILE  = "/tmp/cb_sim_data.json"
 TAX_FILE   = "/tmp/cb_trades.csv"
-STATE_FILE = "/tmp/cb_state_v69.json"
+STATE_FILE = "/tmp/cb_state_v70.json"
 
 # ══════════════════════════════════════════════════════════════════
 # STATE
@@ -477,98 +485,6 @@ def merge_cfm_intx(cfm_candles, intx_candles):
     all_ts   = sorted(set(cfm_map.keys()) | set(intx_map.keys()))
     return [cfm_map[ts] if ts in cfm_map else intx_map[ts] for ts in all_ts]
 
-def fetch_secondary_candles(asset, existing_candles):
-    """
-    Fill gaps in CFM candles using INTX first, then Hyperliquid as fallback.
-    Used for one-off gap filling — separate from the proactive INTX fetch.
-    """
-    if not existing_candles:
-        return None
-
-    existing_map = {c["ts"]: c for c in existing_candles}
-    sorted_ts    = sorted(existing_map.keys())
-    gap_slots    = []
-    for i in range(1, len(sorted_ts)):
-        gap_ms = sorted_ts[i] - sorted_ts[i - 1]
-        if gap_ms > 900000:
-            slots = int(gap_ms / 900000) - 1
-            for s in range(slots):
-                gap_slots.append(sorted_ts[i - 1] + (s + 1) * 900000)
-
-    if not gap_slots:
-        return existing_candles
-
-    filled = list(existing_candles)
-    filled_count = 0
-
-    # INTX first
-    intx_sym = {"XRP": "XRP-PERP", "SUI": "SUI-PERP", "XLM": "XLM-PERP"}.get(asset)
-    if intx_sym:
-        try:
-            start_ms  = min(gap_slots) - 900000
-            end_ms    = max(gap_slots) + 900000
-            start_rfc = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            end_rfc   = datetime.fromtimestamp(end_ms / 1000,   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            url = f"https://api.international.coinbase.com/api/v1/instruments/{intx_sym}/candles"
-            r = req.get(url, params={"granularity": "FIFTEEN_MINUTE",
-                                     "start": start_rfc, "end": end_rfc}, timeout=8)
-            if r.status_code == 200:
-                intx_map = {}
-                for c in r.json().get("aggregations", []):
-                    ts_c = int(datetime.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")
-                               .replace(tzinfo=timezone.utc).timestamp() * 1000)
-                    intx_map[ts_c] = {
-                        "ts": ts_c, "o": float(c["open"]), "h": float(c["high"]),
-                        "l": float(c["low"]), "c": float(c["close"]), "v": float(c["volume"]),
-                        "dt": c["start"], "source": "intx",
-                    }
-                for ts in gap_slots:
-                    for offset in [0, 60000, -60000, 120000, -120000]:
-                        if ts + offset in intx_map and ts not in existing_map:
-                            c = dict(intx_map[ts + offset])
-                            c["ts"] = ts
-                            existing_map[ts] = c
-                            filled.append(c)
-                            filled_count += 1
-                            break
-        except Exception as e:
-            log(f"  INTX secondary failed {asset}: {e}")
-
-    # Hyperliquid fallback
-    remaining = [ts for ts in gap_slots if ts not in existing_map]
-    if remaining:
-        hl_sym = {"XRP": "XRP", "SUI": "SUI", "XLM": "XLM"}.get(asset)
-        if hl_sym:
-            try:
-                start_ms = min(remaining) - 900000
-                end_ms   = max(remaining) + 900000
-                r = req.post("https://api.hyperliquid.xyz/info",
-                    json={"type": "candleSnapshot", "req": {
-                        "coin": hl_sym, "interval": "15m",
-                        "startTime": start_ms, "endTime": end_ms}},
-                    timeout=8)
-                if r.status_code == 200 and r.json():
-                    hl_map = {int(c["t"]): {
-                        "ts": int(c["t"]), "o": float(c["o"]), "h": float(c["h"]),
-                        "l": float(c["l"]), "c": float(c["c"]), "v": float(c["v"]),
-                        "dt": datetime.fromtimestamp(int(c["t"]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                        "source": "hyperliquid",
-                    } for c in r.json()}
-                    for ts in remaining:
-                        for offset in [0, 60000, -60000, 120000, -120000]:
-                            if ts + offset in hl_map and ts not in existing_map:
-                                c = hl_map[ts + offset]
-                                c["ts"] = ts
-                                existing_map[ts] = c
-                                filled.append(c)
-                                filled_count += 1
-                                break
-            except Exception as e:
-                log(f"  Hyperliquid fallback failed {asset}: {e}")
-
-    if filled_count == 0:
-        return existing_candles
-    return sorted(filled, key=lambda x: x["ts"])
 
 # ══════════════════════════════════════════════════════════════════
 # BALANCE
@@ -687,11 +603,6 @@ def place_market_order(asset, side, contracts):
 # ══════════════════════════════════════════════════════════════════
 # MATH
 # ══════════════════════════════════════════════════════════════════
-def round_price(p, sig=5):
-    if p == 0: return 0.0
-    mag = math.floor(math.log10(abs(p)))
-    return round(p, max(0, sig - 1 - mag))
-
 def calc_rsi(closes, period=14):
     """RSI — standard Wilder smoothing."""
     if len(closes) < period + 1:
@@ -944,7 +855,7 @@ def trading_loop():
         state["buying_power"] = TOTAL_USDC
     load_state()
 
-    log(f"🚀 CB Trader v69 started")
+    log(f"🚀 CB Trader v70 started")
     log(f"   Mode:     {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} (TRADE_MODE={TRADE_MODE})")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF(1hr RSI>50)")
     log(f"   Assets:   {', '.join(ASSET_NAMES)}")
@@ -1045,12 +956,15 @@ def trading_loop():
                             continue
 
                         # ── ENTRY SIGNAL ──────────────────────────────
+                        # Compute hr_rsi BEFORE evaluate_signal so it is
+                        # always saved in sim data — even on NO_SIGNAL buckets
+                        hr_rsi = get_hr_rsi(asset, candles)
+
                         d, _, _, info = evaluate_signal(candles)
+                        info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi is not None else None
+
                         if d:
                             # MTF filter: resampled 1hr RSI(14) from 15min candles
-                            hr_rsi = get_hr_rsi(asset, candles)
-                            info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi is not None else None
-
                             # Block trade if MTF not ready — should never happen after
                             # startup cache fix, but belt-and-suspenders
                             if hr_rsi is None:
@@ -1400,7 +1314,7 @@ h2{margin-bottom:20px;font-size:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v69</title>
+<title>CB Trader v70</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
