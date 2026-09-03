@@ -1027,16 +1027,16 @@ h2{margin-bottom:20px}</style></head>
         wk_col  = "#00D68F" if s["weekly_pnl"] >= 0 else "#FF4757"
         tot_col = "#00D68F" if s["total_pnl"]  >= 0 else "#FF4757"
 
-        # Position rows for this system
+        # Position rows
         pos_rows = ""
         for asset, p in pos.items():
-            unreal   = p.get("unrealized_pnl", 0.0)
-            pnl_col  = "#00D68F" if unreal >= 0 else "#FF4757"
-            dir_col  = "#00D68F" if p["direction"] == "LONG" else "#FF4757"
-            exit_rsi = p.get("exit_rsi", RSI_EXIT)
-            locked   = "🔒" if exit_rsi == RSI_TRAIL_EXIT else ""
-            entry_fee = round(p["entry"] * p["size"] * FEE_PCT + FEE_FLAT * p["contracts"], 4)
+            unreal    = p.get("unrealized_pnl", 0.0)
+            pnl_col   = "#00D68F" if unreal >= 0 else "#FF4757"
+            dir_col   = "#00D68F" if p["direction"] == "LONG" else "#FF4757"
+            exit_rsi  = p.get("exit_rsi", RSI_EXIT)
+            locked    = "🔒" if exit_rsi == RSI_TRAIL_EXIT else ""
             cur_price = p.get("current_price", p.get("entry", 0))
+            entry_fee = round(p["entry"]   * p["size"] * FEE_PCT + FEE_FLAT * p["contracts"], 4)
             exit_fee  = round(cur_price * p["size"] * FEE_PCT + FEE_FLAT * p["contracts"], 4)
             pos_rows += f"""<div style='background:#060D1A;border-radius:8px;padding:10px;margin-bottom:8px;border:1px solid #1E2D45'>
               <div style='display:flex;justify-content:space-between;margin-bottom:6px'>
@@ -1051,36 +1051,97 @@ h2{margin-bottom:20px}</style></head>
         if not pos_rows:
             pos_rows = "<div style='color:#4A5878;font-size:12px;padding:8px'>No open positions</div>"
 
-        sys_cards += f"""<div style='background:#0A1628;border:2px solid {col};border-radius:12px;padding:16px;margin-bottom:16px'>
+        # Journal rows
+        try:    audit_data = json.load(open(sys.diag_file)) if os.path.exists(sys.diag_file) else []
+        except: audit_data = []
+
+        journal_rows = ""; j_shown = 0
+        heartbeat_rows = ""; hb_built = False
+        error_rows = ""; error_count = 0
+
+        error_kw  = ["⚠️","WARNING","ERROR","CRITICAL","FAILED","failed","timeout","Skipped"]
+        trade_evt = ["ENTER","EXIT","HOLD","NO_SIGNAL","CYCLE","RSI-Mom","📊","📄","✅ EXIT","❌ EXIT"]
+
+        for a in audit_data:
+            evt = a.get("event","")
+
+            if "CYCLE" in evt and not hb_built:
+                hb_built = True
+                detail = a.get("detail","")
+                lines  = detail.split("\n")
+                heartbeat_rows += f"<div style='font-size:12px;font-weight:700;color:#E0E6F0;padding:6px 0;border-bottom:1px solid #1E2D45;margin-bottom:8px'>{lines[0] if lines else detail}</div>"
+                for line in lines[1:]:
+                    line = line.strip()
+                    if not line: continue
+                    css = "hb-hold" if "HOLD" in line else "hb-skip" if "❌" in line else "hb-watch"
+                    heartbeat_rows += f"<div class='hb-row {css}'>{line}</div>"
+                heartbeat_rows += f"<div style='font-size:10px;color:#4A5878;margin-top:8px'>Updated: {a.get('time','?')}</div>"
+
+            if j_shown < 50 and "CYCLE" not in evt:
+                j_shown += 1
+                jcol = "#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt else "#E0E6F0"
+                journal_rows += f"""<div class=j-trade style='border-color:{jcol}'>
+                  <div style='font-size:10px;color:#4A5878'>{a["time"]} · {a.get("asset","SYS")}</div>
+                  <div style='font-size:12px;font-weight:700;color:{jcol}'>{evt}</div>
+                  <div style='font-size:11px;color:#8892A4'>{a.get("detail","")[:120]}</div>
+                </div>"""
+
+            if not any(te in evt for te in trade_evt):
+                if any(kw in evt or kw in a.get("detail","") for kw in error_kw) and "CYCLE" not in evt:
+                    error_count += 1
+                    error_rows += f"""<div style='border-left:3px solid #FFB800;padding:8px 12px;margin-bottom:6px;background:#060D1A;border-radius:0 8px 8px 0'>
+                      <div style='font-size:10px;color:#4A5878'>{a["time"]} · {a.get("asset","SYS")}</div>
+                      <div style='font-size:11px;color:#8892A4;font-family:monospace'>{evt}: {a.get("detail","")[:150]}</div>
+                    </div>"""
+
+        if not journal_rows:   journal_rows   = "<div style='color:#4A5878;padding:20px;text-align:center;font-size:13px'>No trades yet</div>"
+        if not heartbeat_rows: heartbeat_rows = "<div style='color:#4A5878;padding:20px;text-align:center;font-size:13px'>No heartbeat yet</div>"
+        if not error_rows:     error_rows     = "<div style='color:#4A5878;padding:20px;text-align:center;font-size:13px'>✅ No errors</div>"
+
+        err_badge = f" <span style='background:#FF4757;color:#fff;border-radius:10px;padding:1px 5px;font-size:10px'>{error_count}</span>" if error_count else ""
+
+        # Markets rows
+        markets_rows = ""
+        for a_name in ASSET_NAMES:
+            is_open = a_name in pos
+            sc = "#00D68F" if is_open else "#4A5878"
+            markets_rows += f"""<div style='display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1E2D45;font-size:12px'>
+              <b>{a_name}</b>
+              <span style='color:#4A5878'>{ASSETS[a_name]["perp"]}</span>
+              <span style='color:#4A5878'>{ASSETS[a_name]["margin_rate"]*100:.0f}% margin</span>
+              <span style='color:{sc};font-weight:600'>{"● OPEN" if is_open else "○ READY"}</span>
+            </div>"""
+
+        sid = sys.sys_id
+        sys_cards += f"""<div class='sys-card' style='background:#0A1628;border:2px solid {col};border-radius:12px;padding:16px;margin-bottom:20px'>
           <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
             <div>
-              <span style='font-size:16px;font-weight:800;color:{col}'>S{sys.sys_id}</span>
+              <span style='font-size:16px;font-weight:800;color:{col}'>S{sid}</span>
               <span style='font-size:13px;color:#8892A4;margin-left:8px'>{sys.label}</span>
             </div>
             <span style='font-size:11px;color:#4A5878;background:#060D1A;padding:3px 8px;border-radius:20px'>{sys.source}</span>
           </div>
-          <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px'>
+          <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px'>
             <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
               <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>BALANCE</div>
-              <div style='font-size:16px;font-weight:800'>${s["balance"]:,.2f}</div>
+              <div style='font-size:15px;font-weight:800'>${s["balance"]:,.2f}</div>
             </div>
             <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
               <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>WEEK</div>
-              <div style='font-size:16px;font-weight:800;color:{wk_col}'>${s["weekly_pnl"]:+,.2f}</div>
+              <div style='font-size:15px;font-weight:800;color:{wk_col}'>${s["weekly_pnl"]:+,.2f}</div>
             </div>
             <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
               <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>TOTAL P&L</div>
-              <div style='font-size:16px;font-weight:800;color:{tot_col}'>${s["total_pnl"]:+,.2f}</div>
+              <div style='font-size:15px;font-weight:800;color:{tot_col}'>${s["total_pnl"]:+,.2f}</div>
             </div>
             <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
               <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>WR</div>
-              <div style='font-size:16px;font-weight:800'>{wr}%</div>
+              <div style='font-size:15px;font-weight:800'>{wr}%</div>
             </div>
           </div>
           <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;font-size:12px'>
             <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
-              <div style='color:#4A5878;font-size:10px'>TRADES</div>
-              <div style='font-weight:700'>{s["total_trades"]}</div>
+              <div style='color:#4A5878;font-size:10px'>TRADES</div><div style='font-weight:700'>{s["total_trades"]}</div>
             </div>
             <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
               <div style='color:#4A5878;font-size:10px'>OPEN</div>
@@ -1091,11 +1152,33 @@ h2{margin-bottom:20px}</style></head>
               <div style='font-weight:700;color:{"#FF4757" if s.get("loop_errors",0)>0 else "#4A5878"}'>{s.get("loop_errors",0)}</div>
             </div>
           </div>
-          {pos_rows}
-          <div style='font-size:10px;color:#4A5878;margin-top:8px'>
-            <a href='/sim-data-s{sys.sys_id}' style='color:#4A5878'>Sim Data</a> &nbsp;·&nbsp;
-            <a href='/tax-s{sys.sys_id}' style='color:#4A5878'>Tax CSV</a> &nbsp;·&nbsp;
-            <a href='/diag-s{sys.sys_id}' style='color:#4A5878'>Diagnostic</a>
+          <div class=tabs>
+            <span class='tab on' onclick="show('s{sid}pos',this,'s{sid}')">Positions</span>
+            <span class=tab onclick="show('s{sid}jrn',this,'s{sid}')">Journal</span>
+            <span class=tab onclick="show('s{sid}hb',this,'s{sid}')">Heartbeat</span>
+            <span class=tab onclick="show('s{sid}err',this,'s{sid}')">Errors{err_badge}</span>
+            <span class=tab onclick="show('s{sid}mkt',this,'s{sid}')">Markets</span>
+            <span class=tab onclick="show('s{sid}inf',this,'s{sid}')">Info</span>
+          </div>
+          <div id='s{sid}pos' class='panel on'>{pos_rows}</div>
+          <div id='s{sid}jrn' class=panel>{journal_rows}</div>
+          <div id='s{sid}hb'  class=panel>{heartbeat_rows}</div>
+          <div id='s{sid}err' class=panel>{error_rows}</div>
+          <div id='s{sid}mkt' class=panel>{markets_rows}</div>
+          <div id='s{sid}inf' class=panel>
+            <div style='font-size:12px;line-height:2;color:#8892A4'>
+              <b style='color:#E0E6F0'>Source</b>: {sys.source}<br>
+              <b style='color:#E0E6F0'>Strategy</b>: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF<br>
+              <b style='color:#E0E6F0'>Capital</b>: ${PAPER_BALANCE:,.2f} isolated<br>
+              <b style='color:#E0E6F0'>Assets</b>: XRP · SUI · XLM<br>
+              <b style='color:#E0E6F0'>Execution</b>: CFM always<br>
+              <b style='color:#E0E6F0'>Fees</b>: 0.080% + $0.12/ct/side<br>
+              <div style='margin-top:8px'>
+                <a href='/sim-data-s{sid}' style='color:#4A5878'>Sim Data</a> &nbsp;·&nbsp;
+                <a href='/tax-s{sid}' style='color:#4A5878'>Tax CSV</a> &nbsp;·&nbsp;
+                <a href='/diag-s{sid}' style='color:#4A5878'>Diagnostic</a>
+              </div>
+            </div>
           </div>
         </div>"""
 
@@ -1115,7 +1198,28 @@ h2{margin-bottom:20px}</style></head>
   body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;
        padding:14px;max-width:640px;margin:0 auto;padding-bottom:40px}}
   a{{color:#8892A4;text-decoration:none}}
+  .tabs{{display:flex;gap:4px;margin-bottom:0;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}}
+  .tabs::-webkit-scrollbar{{display:none}}
+  .tab{{flex-shrink:0;padding:10px 14px;cursor:pointer;border-radius:8px 8px 0 0;font-size:12px;font-weight:600;
+        background:#060D1A;color:#4A5878;border:1px solid #1E2D45;border-bottom:none;
+        min-height:40px;display:flex;align-items:center;touch-action:manipulation}}
+  .tab.on{{background:#0A1628;color:#E0E6F0}}
+  .panel{{display:none;background:#0A1628;border:1px solid #1E2D45;
+          border-radius:0 10px 10px 10px;padding:12px;min-height:80px}}
+  .panel.on{{display:block}}
+  .hb-row{{font-family:monospace;font-size:11px;padding:5px 0;border-bottom:1px solid #060D1A;word-break:break-all}}
+  .hb-hold{{color:#00D68F}}.hb-watch{{color:#4A5878}}.hb-skip{{color:#FF4757}}
+  .j-trade{{border-left:3px solid;padding:8px 12px;margin-bottom:6px;background:#060D1A;border-radius:0 8px 8px 0}}
 </style>
+<script>
+function show(id,el,prefix){{
+  var card=el.closest('.sys-card');
+  card.querySelectorAll('.panel').forEach(function(p){{p.classList.remove('on')}});
+  card.querySelectorAll('.tab').forEach(function(t){{t.classList.remove('on')}});
+  document.getElementById(id).classList.add('on');
+  el.classList.add('on');
+}}
+</script>
 </head><body>
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px'>
   <div>
