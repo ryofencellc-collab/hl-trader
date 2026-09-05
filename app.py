@@ -592,6 +592,19 @@ class TradingSystem:
                             _candle_cache[asset] = signal_candles
                             cur_cfm = cfm_candles[-1]  # CFM candle for price reference
 
+                            # ── FORMING CANDLE CHECK ───────────────────
+                            # Skip if last signal candle is still forming
+                            # (age < 60s means candle just opened, price not settled)
+                            # Confirmed fix: eliminates bad entries on unsettled prices
+                            last_sig_ts   = signal_candles[-1]["ts"]
+                            now_epoch_ms  = int(time.time()) * 1000
+                            candle_age_ms = now_epoch_ms - last_sig_ts
+                            if candle_age_ms < 60000:
+                                self.save_sim_data(asset, current_bucket*1000, signal_candles,
+                                    {"reason": f"forming candle age={round(candle_age_ms/1000)}s"},
+                                    f"SKIP_FORMING:age={round(candle_age_ms/1000)}s")
+                                continue
+
                             # Skip cooldown after exit
                             if self.skip_entry.get(asset, 0) > 0:
                                 self.skip_entry[asset] -= 1
