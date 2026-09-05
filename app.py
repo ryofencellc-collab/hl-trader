@@ -1,7 +1,7 @@
 """
-CB TRADER v71
+CB TRADER v72
 ═══════════════════════════════════════════════════════════════════
-THREE ISOLATED SYSTEMS — RSI(3/75/50/80→60) on 15min candles
+THREE ISOLATED SYSTEMS — RSI(2/70/55/80→70) on 15min candles
 
 Purpose: Run 3 candle sources in parallel for 1 week to find the winner.
 Each system is completely blind and isolated from the others.
@@ -12,19 +12,18 @@ System 2 — INTX only:  Coinbase International candles for signals
 System 3 — Hybrid:     CFM primary + INTX gap fill for signals
 
 Strategy (identical across all 3 systems):
-  RSI(3) on 15min candles + 1hr RSI(14) MTF filter (resampled) + Trailing Exit
-  LONG:  RSI(3) crosses ABOVE 75 AND 1hr RSI(14) resampled > 50
-  SHORT: RSI(3) crosses BELOW 25 AND 1hr RSI(14) resampled < 50
-  EXIT:  RSI drops below 50 (or 60 if RSI hit 80 — trailing tighten)
+  RSI(2) on 15min candles + 1hr RSI(14) MTF filter (resampled) + Trailing Exit
+  LONG:  RSI(2) crosses ABOVE 70 AND 1hr RSI(14) resampled > 50
+  SHORT: RSI(2) crosses BELOW 30 AND 1hr RSI(14) resampled < 50
+  EXIT:  RSI drops below 55 (or 70 if RSI hit 80 — trailing tighten)
 
-Parameters confirmed by full test suite Sep 3 2026:
+Parameters confirmed by full sweep Sep 5 2026 (11,520 combos × 3 sources):
   RSI(3/75/50/80→60) — all 47 tests passed
   Trail exit: 60 beats 55 by $377/mo confirmed on real INTX data
   Backtest: System 2 (INTX): $13,644/mo | 70.5% WR | 37/38 green weeks
 
 Assets (all 3 systems):
   XRP (XPP-20DEC30-CDE) — 500 XRP/contract | 20.01% intraday margin
-  SUI (SUP-20DEC30-CDE) — 500 SUI/contract | 24.99% intraday margin
   XLM (XLP-20DEC30-CDE) — 5000 XLM/contract | 25.00% intraday margin
   Confirmed via Coinbase API Sep 2, 2026
 
@@ -45,18 +44,17 @@ Railway variables:
   PAPER_BALANCE — starting balance per system (default: 2000)
 
 CHECKLIST — triple checked before push:
-  ✅ Version = v71 everywhere
-  ✅ RSI_PERIOD = 3
-  ✅ RSI_ENTRY = 75
-  ✅ RSI_EXIT = 50
+  ✅ Version = v72 everywhere
+  ✅ RSI_PERIOD = 2
+  ✅ RSI_ENTRY = 70
+  ✅ RSI_EXIT = 55
   ✅ RSI_TRAIL_TRIG = 80
-  ✅ RSI_TRAIL_EXIT = 60 (was 55 — proven better by test suite)
-  ✅ SHORT entry: RSI crosses BELOW 25 (100-RSI_ENTRY)
+  ✅ RSI_TRAIL_EXIT = 70 (optimal from 11,520-combo sweep)
+  ✅ SHORT entry: RSI crosses BELOW 30 (100-RSI_ENTRY)
   ✅ SHORT trail: tighten when RSI < 20 (100-RSI_TRAIL_TRIG)
-  ✅ SHORT trail exit: RSI rises above 40 (100-RSI_TRAIL_EXIT)
-  ✅ SHORT standard exit: RSI rises above 50 (100-RSI_EXIT)
+  ✅ SHORT trail exit: RSI rises above 30 (100-RSI_TRAIL_EXIT)
+  ✅ SHORT standard exit: RSI rises above 45 (100-RSI_EXIT)
   ✅ XRP margin = 0.2001
-  ✅ SUI margin = 0.2499
   ✅ XLM margin = 0.2500
   ✅ Fees = 0.080% + $0.12/ct/side
   ✅ CANDLE_LIMIT = 300
@@ -76,16 +74,16 @@ CHECKLIST — triple checked before push:
   ✅ System 2 cache: pure INTX only
   ✅ System 3 cache: hybrid (CFM+INTX merged, CFM wins)
   ✅ pnl saved = NET after fees
-  ✅ Entry at CFM candles[-1]["o"]
-  ✅ Exit at CFM candles[-1]["o"]
-  ✅ Skip cooldown = 1 bucket per system independently
+  ✅ Entry at CFM candles[-2]["c"] (close of last completed candle)
+  ✅ Exit at CFM candles[-2]["c"] (close of last completed candle)
+  ✅ Skip cooldown = 0 (immediate re-entry allowed)
   ✅ Startup deferred to @app.before_request
-  ✅ State file = cb_state_v71_s{N}.json per system
+  ✅ State file = cb_state_v72_s{N}.json per system
   ✅ No 1hr strategy anywhere
   ✅ No dead code
   ✅ Dashboard shows all 3 systems side by side
   ✅ Separate sim-data endpoints per system
-  ✅ Dashboard version = v71
+  ✅ Dashboard version = v72
 """
 
 import time, os, json, csv, uuid, threading
@@ -108,7 +106,6 @@ if not CB_API_KEY or not CB_API_SEC:
 
 ASSETS = {
     "XRP": {"perp": "XPP-20DEC30-CDE", "intx": "XRP-PERP", "contract": 500.0,  "margin_rate": 0.2001},
-    "SUI": {"perp": "SUP-20DEC30-CDE", "intx": "SUI-PERP", "contract": 500.0,  "margin_rate": 0.2499},
     "XLM": {"perp": "XLP-20DEC30-CDE", "intx": "XLM-PERP", "contract": 5000.0, "margin_rate": 0.2500},
 }
 ASSET_NAMES = list(ASSETS.keys())
@@ -119,11 +116,11 @@ FEE_FLAT  = 0.12
 MAX_CONTRACTS = int(os.environ.get("MAX_CONTRACTS", "5"))
 PAPER_BALANCE = float(os.environ.get("PAPER_BALANCE", "2000"))
 
-RSI_PERIOD     = 3
-RSI_ENTRY      = 75
-RSI_EXIT       = 50
+RSI_PERIOD     = 2
+RSI_ENTRY      = 70
+RSI_EXIT       = 55
 RSI_TRAIL_TRIG = 80
-RSI_TRAIL_EXIT = 60   # proven better than 55 by $377/mo in test suite
+RSI_TRAIL_EXIT = 70   # optimal from full 11,520-combo sweep Sep 5 2026
 
 CANDLE_TF    = "FIFTEEN_MINUTE"
 CANDLE_LIMIT = 300
@@ -146,7 +143,7 @@ class TradingSystem:
         # Files — unique per system
         self.data_file  = f"/tmp/cb_sim_s{sys_id}.json"
         self.diag_file  = f"/tmp/cb_diag_s{sys_id}.json"
-        self.state_file = f"/tmp/cb_state_v71_s{sys_id}.json"
+        self.state_file = f"/tmp/cb_state_v72_s{sys_id}.json"
         self.tax_file   = f"/tmp/cb_trades_s{sys_id}.csv"
 
         # Isolated state
@@ -613,15 +610,15 @@ class TradingSystem:
                                 pos["current_price"]  = cur_close
 
                                 if should_exit(pos, signal_candles):
-                                    # Exit price = CFM candle open — always
-                                    exit_price = float(cfm_candles[-1]["o"])
+                                    # Exit price = CFM candles[-2]["c"] — last completed candle close
+                                    exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                     pnl_net = self.exit_position(asset, exit_price, "RSI_EXIT", cur_cfm)
                                     if pnl_net is not None:
                                         self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
                                                            "EXIT_RSI", position=dict(pos), pnl_net=pnl_net,
                                                            balance_at_decision=self.state.get("balance",0),
                                                            contracts_at_decision=pos.get("contracts",0))
-                                    self.skip_entry[asset] = 1
+                                    self.skip_entry[asset] = 0
                                 else:
                                     self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
                                                        "HOLD", position=dict(pos),
@@ -657,8 +654,8 @@ class TradingSystem:
                                                f"hr={hr_rsi:.1f}",
                                                candle=cur_cfm, indicators=info)
 
-                                # Entry price = CFM candle open — always
-                                entry_price = float(cfm_candles[-1]["o"])
+                                # Entry price = CFM candles[-2]["c"] — last completed candle close
+                                entry_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                 self.enter_position(asset, d, entry_price, cur_cfm, info)
 
                                 if self.positions.get(asset):
@@ -999,7 +996,7 @@ def diag_sys(sid):
 @app.route("/")
 def dashboard():
     if request.cookies.get("auth") != "3757":
-        return """<!DOCTYPE html><html><head><title>CB Trader v71</title>
+        return """<!DOCTYPE html><html><head><title>CB Trader v72</title>
 <meta name=viewport content='width=device-width,initial-scale=1'>
 <style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -1010,7 +1007,7 @@ button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius
 cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
 h2{margin-bottom:20px}</style></head>
 <body><form method=post action=/login class=box>
-<h2>CB Trader v71</h2>
+<h2>CB Trader v72</h2>
 <input type=password name=pw placeholder='Password' autofocus>
 <button type=submit>Login</button>
 </form></body></html>"""
@@ -1170,7 +1167,7 @@ h2{margin-bottom:20px}</style></head>
               <b style='color:#E0E6F0'>Source</b>: {sys.source}<br>
               <b style='color:#E0E6F0'>Strategy</b>: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF<br>
               <b style='color:#E0E6F0'>Capital</b>: ${PAPER_BALANCE:,.2f} isolated<br>
-              <b style='color:#E0E6F0'>Assets</b>: XRP · SUI · XLM<br>
+              <b style='color:#E0E6F0'>Assets</b>: XRP · XLM<br>
               <b style='color:#E0E6F0'>Execution</b>: CFM always<br>
               <b style='color:#E0E6F0'>Fees</b>: 0.080% + $0.12/ct/side<br>
               <div style='margin-top:8px'>
@@ -1189,7 +1186,7 @@ h2{margin-bottom:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v71</title>
+<title>CB Trader v72</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1223,7 +1220,7 @@ function show(id,el,prefix){{
 </head><body>
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px'>
   <div>
-    <div style='font-size:22px;font-weight:800'>CB Trader v71</div>
+    <div style='font-size:22px;font-weight:800'>CB Trader v72</div>
     <div style='font-size:12px;font-weight:700;color:{mode_color};margin-top:2px'>{mode_label}</div>
     <div style='font-size:11px;color:#4A5878;margin-top:2px'>3-System Candle Source Test</div>
   </div>
@@ -1252,7 +1249,7 @@ def startup():
         if _started: return
         _started = True
 
-    log("📡 CB Trader v71 — pre-loading candles for all 3 systems...")
+    log("📡 CB Trader v72 — pre-loading candles for all 3 systems...")
 
     # Shared candle fetch on startup — each system caches its own copy
     for asset in ASSET_NAMES:
@@ -1309,7 +1306,7 @@ def startup():
             log(f"  Startup preload {asset}: {e}")
 
     log("✅ Pre-load complete — all 3 systems ready")
-    log(f"🚀 CB Trader v71 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
+    log(f"🚀 CB Trader v72 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Capital: ${PAPER_BALANCE:,.2f} per system (${PAPER_BALANCE*3:,.2f} total)")
