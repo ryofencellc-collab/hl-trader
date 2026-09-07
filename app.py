@@ -1,5 +1,5 @@
 """
-CB TRADER v72
+CB TRADER v73
 ═══════════════════════════════════════════════════════════════════
 THREE ISOLATED SYSTEMS — RSI(2/70/55/80→70) on 15min candles
 
@@ -9,7 +9,7 @@ All 3 execute orders on CFM. Only candle source differs.
 
 System 1 — CFM only:   Coinbase CFM candles for signals
 System 2 — INTX only:  Coinbase International candles for signals
-System 3 — Hybrid:     CFM primary + INTX gap fill for signals
+System 3 — Hybrid:     Smart per-asset source (XRP→INTX, XLM→CFM) + gap fill
 
 Strategy (identical across all 3 systems):
   RSI(2) on 15min candles + 1hr RSI(14) MTF filter (resampled) + Trailing Exit
@@ -44,7 +44,7 @@ Railway variables:
   PAPER_BALANCE — starting balance per system (default: 2000)
 
 CHECKLIST — triple checked before push:
-  ✅ Version = v72 everywhere
+  ✅ Version = v73 everywhere
   ✅ RSI_PERIOD = 2
   ✅ RSI_ENTRY = 70
   ✅ RSI_EXIT = 55
@@ -60,7 +60,7 @@ CHECKLIST — triple checked before push:
   ✅ CANDLE_LIMIT = 300
   ✅ System 1 uses CFM candles only — no INTX
   ✅ System 2 uses INTX candles only — no CFM
-  ✅ System 3 uses CFM + INTX hybrid (CFM wins on overlap)
+  ✅ System 3 uses smart hybrid: XRP→INTX primary, XLM→CFM primary
   ✅ All 3 execute orders on CFM (entry/exit price = CFM candle open)
   ✅ All 3 completely isolated — separate state, positions, balance, locks
   ✅ Each system has own sim data file (/tmp/cb_sim_s1.json etc)
@@ -69,6 +69,7 @@ CHECKLIST — triple checked before push:
   ✅ Each system has own tax CSV
   ✅ hr_rsi computed BEFORE evaluate_signal
   ✅ MTF blocks trade when hr_rsi is None
+  ✅ Forming candle check: volume-based (not age-based) — INTX compatible
   ✅ Startup cache per system — only caches own source candles
   ✅ System 1 cache: pure CFM only
   ✅ System 2 cache: pure INTX only
@@ -78,12 +79,12 @@ CHECKLIST — triple checked before push:
   ✅ Exit at CFM candles[-2]["c"] (close of last completed candle)
   ✅ Skip cooldown = 0 (immediate re-entry allowed)
   ✅ Startup deferred to @app.before_request
-  ✅ State file = cb_state_v72_s{N}.json per system
+  ✅ State file = cb_state_v73_s{N}.json per system
   ✅ No 1hr strategy anywhere
   ✅ No dead code
   ✅ Dashboard shows all 3 systems side by side
   ✅ Separate sim-data endpoints per system
-  ✅ Dashboard version = v72
+  ✅ Dashboard version = v73
 """
 
 import time, os, json, csv, uuid, threading
@@ -143,7 +144,7 @@ class TradingSystem:
         # Files — unique per system
         self.data_file  = f"/tmp/cb_sim_s{sys_id}.json"
         self.diag_file  = f"/tmp/cb_diag_s{sys_id}.json"
-        self.state_file = f"/tmp/cb_state_v72_s{sys_id}.json"
+        self.state_file = f"/tmp/cb_state_v73_s{sys_id}.json"
         self.tax_file   = f"/tmp/cb_trades_s{sys_id}.csv"
 
         # Isolated state
@@ -408,8 +409,26 @@ class TradingSystem:
             if intx_candles and len(intx_candles) >= 100:
                 self.startup_cache[asset] = intx_candles[-CANDLE_LIMIT:]
 
-        else:  # hybrid
-            candles = merge_cfm_intx(cfm_candles, intx_candles)
+        else:  # hybrid — per-asset source preference
+            # XRP: INTX has 0 gaps, CFM has 2.73% — prefer INTX primary
+            # XLM: CFM has 10.3% gaps, INTX has 20.7% — prefer CFM primary
+            # Confirmed from gap_timing_analysis_v1.py Sep 7 2026
+            INTX_PREFERRED = {"XRP"}   # INTX has cleaner data for these
+            CFM_PREFERRED  = {"XLM"}   # CFM has cleaner data for these
+
+            if asset in INTX_PREFERRED:
+                # INTX primary, CFM fills INTX gaps
+                base    = intx_candles or []
+                filler  = cfm_candles  or []
+                im = {c["ts"]: c for c in base}
+                cm = {c["ts"]: c for c in filler}
+                # Keep INTX candle where both exist, fill gaps with CFM
+                merged_ts = sorted(set(im) | set(cm))
+                candles   = [im[t] if t in im else cm[t] for t in merged_ts]
+            else:
+                # CFM primary, INTX fills CFM gaps
+                candles = merge_cfm_intx(cfm_candles, intx_candles)
+
             # Fallback to startup cache if hybrid too thin
             if len(candles or []) < 100 and asset in self.startup_cache:
                 cached   = self.startup_cache[asset]
@@ -593,16 +612,22 @@ class TradingSystem:
                             cur_cfm = cfm_candles[-1]  # CFM candle for price reference
 
                             # ── FORMING CANDLE CHECK ───────────────────
-                            # Skip if last signal candle is still forming
-                            # (age < 60s means candle just opened, price not settled)
-                            # Confirmed fix: eliminates bad entries on unsettled prices
-                            last_sig_ts   = signal_candles[-1]["ts"]
-                            now_epoch_ms  = int(time.time()) * 1000
-                            candle_age_ms = now_epoch_ms - last_sig_ts
-                            if candle_age_ms < 60000:
+                            # Skip only if last candle is truly forming:
+                            # volume == 0 means no trades have occurred yet
+                            # high == low == open means price hasn't moved
+                            # Age-based check was over-triggering on INTX (which
+                            # publishes complete candles immediately at bucket open)
+                            last_sig    = signal_candles[-1]
+                            last_vol    = float(last_sig.get("v", 1))
+                            last_high   = float(last_sig.get("h", 0))
+                            last_low    = float(last_sig.get("l", 0))
+                            last_open   = float(last_sig.get("o", 0))
+                            is_forming  = (last_vol == 0 or
+                                          (last_high == last_low == last_open and last_vol < 0.01))
+                            if is_forming:
                                 self.save_sim_data(asset, current_bucket*1000, signal_candles,
-                                    {"reason": f"forming candle age={round(candle_age_ms/1000)}s"},
-                                    f"SKIP_FORMING:age={round(candle_age_ms/1000)}s")
+                                    {"reason": f"forming candle vol={last_vol} h={last_high} l={last_low}"},
+                                    f"SKIP_FORMING:vol={last_vol:.2f}")
                                 continue
 
                             # Skip cooldown after exit
@@ -939,7 +964,7 @@ def merge_cfm_intx(cfm, intx):
 # ══════════════════════════════════════════════════════════════════
 S1 = TradingSystem(1, "CFM only",  "cfm")
 S2 = TradingSystem(2, "INTX only", "intx")
-S3 = TradingSystem(3, "Hybrid",    "hybrid")
+S3 = TradingSystem(3, "SmartHybrid", "hybrid")
 SYSTEMS = [S1, S2, S3]
 
 # ══════════════════════════════════════════════════════════════════
@@ -1009,7 +1034,7 @@ def diag_sys(sid):
 @app.route("/")
 def dashboard():
     if request.cookies.get("auth") != "3757":
-        return """<!DOCTYPE html><html><head><title>CB Trader v72</title>
+        return """<!DOCTYPE html><html><head><title>CB Trader v73</title>
 <meta name=viewport content='width=device-width,initial-scale=1'>
 <style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -1020,7 +1045,7 @@ button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius
 cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
 h2{margin-bottom:20px}</style></head>
 <body><form method=post action=/login class=box>
-<h2>CB Trader v72</h2>
+<h2>CB Trader v73</h2>
 <input type=password name=pw placeholder='Password' autofocus>
 <button type=submit>Login</button>
 </form></body></html>"""
@@ -1199,7 +1224,7 @@ h2{margin-bottom:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v72</title>
+<title>CB Trader v73</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1233,7 +1258,7 @@ function show(id,el,prefix){{
 </head><body>
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px'>
   <div>
-    <div style='font-size:22px;font-weight:800'>CB Trader v72</div>
+    <div style='font-size:22px;font-weight:800'>CB Trader v73</div>
     <div style='font-size:12px;font-weight:700;color:{mode_color};margin-top:2px'>{mode_label}</div>
     <div style='font-size:11px;color:#4A5878;margin-top:2px'>3-System Candle Source Test</div>
   </div>
@@ -1262,7 +1287,7 @@ def startup():
         if _started: return
         _started = True
 
-    log("📡 CB Trader v72 — pre-loading candles for all 3 systems...")
+    log("📡 CB Trader v73 — pre-loading candles for all 3 systems...")
 
     # Shared candle fetch on startup — each system caches its own copy
     for asset in ASSET_NAMES:
@@ -1319,7 +1344,7 @@ def startup():
             log(f"  Startup preload {asset}: {e}")
 
     log("✅ Pre-load complete — all 3 systems ready")
-    log(f"🚀 CB Trader v72 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
+    log(f"🚀 CB Trader v73 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
     log(f"   Capital: ${PAPER_BALANCE:,.2f} per system (${PAPER_BALANCE*3:,.2f} total)")
