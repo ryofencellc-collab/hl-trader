@@ -473,13 +473,19 @@ class TradingSystem:
         contracts      = max_affordable
         side           = "BUY" if direction == "LONG" else "SELL"
 
-        oid, actual_cts = place_market_order(asset, side, contracts)
+        oid, actual_cts, fill_price = place_market_order(asset, side, contracts)
         if not oid:
             msg = f"S{self.sys_id} {asset} {side} {contracts}ct rejected"
             log(f"CRITICAL: {msg}")
             self.add_audit(asset, "ORDER REJECTED", msg)
             ntfy(f"ORDER REJECTED S{self.sys_id} {asset}", msg, priority="urgent")
             return
+
+        # Use actual fill price if available (live mode)
+        # Otherwise use the bid/ask price passed in (paper mode)
+        if fill_price and fill_price > 0:
+            entry_price = fill_price
+            log(f"[S{self.sys_id}] Using real fill price for entry: ${entry_price:.6f}")
 
         actual_size = actual_cts * cs
         rsi_info    = info or {}
@@ -519,21 +525,27 @@ class TradingSystem:
         pos = self.positions.get(asset)
         if not pos: return None
 
-        gross = round(
-            (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
-            else (pos["entry"] - exit_price) * pos["size"], 4)
-
-        entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
-        exit_fee  = round(exit_price   * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
-        total_fee = entry_fee + exit_fee
-        pnl       = round(gross - total_fee, 4)
-
         side = "SELL" if pos["direction"] == "LONG" else "BUY"
-        oid, _ = place_market_order(asset, side, pos["contracts"])
+        oid, _, fill_price = place_market_order(asset, side, pos["contracts"])
         if not oid and not PAPER_MODE:
             log(f"[S{self.sys_id}] EXIT FAILED {asset} — retrying next bucket")
             ntfy(f"⚠️ EXIT FAILED S{self.sys_id} {asset}", "Position preserved, will retry", priority="urgent")
             return None
+
+        # Use actual fill price if available (live mode)
+        # Otherwise use the bid/ask price passed in (paper mode)
+        if fill_price and fill_price > 0:
+            exit_price = fill_price
+            log(f"[S{self.sys_id}] Using real fill price for exit: ${exit_price:.6f}")
+
+        # Recalculate P&L with actual prices
+        gross = round(
+            (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
+            else (pos["entry"] - exit_price) * pos["size"], 4)
+        entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
+        exit_fee  = round(exit_price   * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
+        total_fee = entry_fee + exit_fee
+        pnl       = round(gross - total_fee, 4)
 
         self.record_tax(asset, pos["direction"], pos["entry"], exit_price, pos["size"], pnl, pos["entry_time"])
 
@@ -917,11 +929,16 @@ def fetch_with_retry(fn, asset, sys_id, retries=3):
     return None
 
 def place_market_order(asset, side, contracts):
-    """Paper mode: simulate. Live mode: real CFM order."""
+    """
+    Paper mode: simulate fill using real bid/ask price.
+    Live mode:  real CFM order, returns actual fill price from Coinbase.
+    Returns: (order_id, actual_contracts, actual_fill_price)
+    fill_price is None in paper mode — caller uses get_real_fill_price() result
+    """
     if PAPER_MODE:
         fake_oid = f"PAPER-{asset}-{int(time.time())}"
         log(f"📄 PAPER: {asset} {side} {contracts}ct → {fake_oid}")
-        return fake_oid, int(contracts)
+        return fake_oid, int(contracts), None
     try:
         client  = get_cb_client()
         product = ASSETS[asset]["perp"]
@@ -938,8 +955,22 @@ def place_market_order(asset, side, contracts):
             if order["success"]:
                 sr  = order["success_response"]
                 oid = sr["order_id"] if isinstance(sr, dict) else f"CB-{asset}-{int(time.time())}"
-                log(f"✅ CB order: {asset} {side} {size}ct → {oid}")
-                return oid, attempt
+                # Fetch actual fill price from order details
+                fill_price = None
+                try:
+                    time.sleep(0.3)  # brief wait for fill to settle
+                    filled = client.get_order(oid)
+                    fp = getattr(filled, "order", {})
+                    if isinstance(fp, dict):
+                        fill_price = float(fp.get("average_filled_price", 0) or 0) or None
+                    if fill_price:
+                        log(f"✅ CB order: {asset} {side} {size}ct → {oid} | fill=${fill_price:.6f}")
+                    else:
+                        log(f"✅ CB order: {asset} {side} {size}ct → {oid}")
+                except Exception as fe:
+                    log(f"⚠️ Could not fetch fill price for {oid}: {fe}")
+                    log(f"✅ CB order: {asset} {side} {size}ct → {oid}")
+                return oid, attempt, fill_price
             else:
                 err    = order["error_response"]
                 reason = err.get("preview_failure_reason", "") if isinstance(err, dict) else ""
@@ -947,12 +978,12 @@ def place_market_order(asset, side, contracts):
                     continue
                 log(f"⚠️ Order failed: {asset} {err}")
                 ntfy(f"⚠️ ORDER FAILED {asset}", str(err), priority="urgent")
-                return None, 0
-        return None, 0
+                return None, 0, None
+        return None, 0, None
     except Exception as e:
         log(f"❌ Order exception {asset}: {e}")
         ntfy(f"❌ ORDER EXCEPTION {asset}", str(e), priority="urgent")
-        return None, 0
+        return None, 0, None
 
 # ── Math ──────────────────────────────────────────────────────────
 def calc_rsi(closes, period=14):
