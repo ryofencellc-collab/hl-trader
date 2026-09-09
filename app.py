@@ -456,16 +456,14 @@ class TradingSystem:
         cs  = ASSETS[asset]["contract"]
         mr  = ASSETS[asset]["margin_rate"]
 
-        # Both paper and live use real Coinbase buying power for sizing
-        # This ensures contracts match what the account can actually afford
-        _fb = get_futures_balance()
-        if _fb and _fb["buying_power"] > 0:
-            current_bal = _fb["buying_power"]
-        elif not PAPER_MODE:
-            current_bal = get_real_balance() or self.total_usdc
-        else:
+        # Paper: uses internal $2,000 balance (grows/shrinks with trades)
+        # Live:  uses real Coinbase buying power
+        if PAPER_MODE:
             with self.lock:
                 current_bal = self.state["balance"]
+        else:
+            _fb = get_futures_balance()
+            current_bal = _fb["buying_power"] if _fb else get_real_balance() or self.total_usdc
 
         per_slot       = (current_bal * 0.70) / len(ASSET_NAMES)
         margin_per     = entry_price * cs * mr
@@ -582,19 +580,20 @@ class TradingSystem:
         Runs in its own daemon thread.
         Completely blind to other systems.
         """
-        # Both paper and live use real Coinbase buying power as starting balance
-        # This ensures paper tracks real account — no fake $2,000
-        _fb = get_futures_balance()
-        _real_bp = _fb["buying_power"] if _fb else None
-        _real_bal = get_real_balance()
-        _start = _real_bp or _real_bal or 2000.0
+        # Paper: $2,000 per system (fake money, real bid/ask prices)
+        # Live:  real Coinbase buying power
+        if PAPER_MODE:
+            _start = 2000.0
+        else:
+            _fb = get_futures_balance()
+            _start = _fb["buying_power"] if _fb else get_real_balance() or 2000.0
 
         self.state["balance"]      = _start
         self.state["buying_power"] = _start
         self.total_usdc            = _start
         self.load_state()
 
-        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | {'PAPER' if PAPER_MODE else 'LIVE'} | buying_power=${_start:,.2f}")
+        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | {'PAPER $2,000' if PAPER_MODE else f'LIVE ${_start:,.2f}'}")
         log(f"[S{self.sys_id}] Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
         log(f"[S{self.sys_id}] Source: {self.source}")
 
@@ -793,16 +792,22 @@ class TradingSystem:
                         _trades = self.state["total_trades"]
                         _errs   = self.state.get("loop_errors", 0)
 
-                    # Real Coinbase futures balance
-                    _fb = get_futures_balance()
-                    _bp   = f"${_fb['buying_power']:,.2f}"   if _fb else "N/A"
-                    _mgn  = f"${_fb['initial_margin']:,.2f}" if _fb else "N/A"
-                    _dpnl = f"${_fb['daily_pnl']:+,.2f}"     if _fb else "N/A"
-                    _unrl = f"${_fb['unrealized_pnl']:+,.2f}" if _fb else "N/A"
+                    # Account line — paper shows sim balance, live shows real Coinbase
+                    if PAPER_MODE:
+                        _bp   = f"${_bal:,.2f} (paper)"
+                        _mgn  = "N/A"
+                        _dpnl = f"${self.state.get('total_pnl',0):+,.2f}"
+                        _unrl = "N/A"
+                    else:
+                        _fb = get_futures_balance()
+                        _bp   = f"${_fb['buying_power']:,.2f}"    if _fb else "N/A"
+                        _mgn  = f"${_fb['initial_margin']:,.2f}"  if _fb else "N/A"
+                        _dpnl = f"${_fb['daily_pnl']:+,.2f}"      if _fb else "N/A"
+                        _unrl = f"${_fb['unrealized_pnl']:+,.2f}" if _fb else "N/A"
 
                     hb_lines = [
                         f"S{self.sys_id}({self.source}) | {bucket_dt} UTC | {'PAPER' if PAPER_MODE else 'LIVE'} | loop=ok | errors={_errs} | kill={os.environ.get('KILL_SWITCH','false')}",
-                        f"  Account: buying_power={_bp} | margin_used={_mgn} | daily_pnl={_dpnl} | unrealized={_unrl}",
+                        f"  Account: balance={_bp} | margin={_mgn} | pnl={_dpnl} | unrealized={_unrl}",
                     ]
 
                     for _a in ASSET_NAMES:
@@ -1161,21 +1166,22 @@ def get_futures_balance():
     try:
         client = get_cb_client()
         fb = client.get_futures_balance_summary()
-        bs = fb.get("balance_summary", {}) if isinstance(fb, dict) else              getattr(fb, "balance_summary", {})
+        # SDK returns object — access balance_summary as attribute
+        bs = getattr(fb, "balance_summary", None)
         if not bs: return None
 
         def _val(key):
-            v = bs.get(key, {})
+            v = getattr(bs, key, {})
             if isinstance(v, dict): return float(v.get("value", 0) or 0)
             return float(v or 0)
 
         return {
-            "buying_power":      round(_val("futures_buying_power"), 2),
-            "total_balance":     round(_val("total_usd_balance"), 2),
-            "unrealized_pnl":    round(_val("unrealized_pnl"), 2),
-            "daily_pnl":         round(_val("daily_realized_pnl"), 2),
-            "available_margin":  round(_val("available_margin"), 2),
-            "initial_margin":    round(_val("initial_margin"), 2),
+            "buying_power":     round(_val("futures_buying_power"), 2),
+            "total_balance":    round(_val("total_usd_balance"), 2),
+            "unrealized_pnl":   round(_val("unrealized_pnl"), 2),
+            "daily_pnl":        round(_val("daily_realized_pnl"), 2),
+            "available_margin": round(_val("available_margin"), 2),
+            "initial_margin":   round(_val("initial_margin"), 2),
         }
     except Exception as e:
         log(f"get_futures_balance error: {e}")
@@ -1580,9 +1586,12 @@ def startup():
     log(f"🚀 AP3X 1.0 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} | {'All 3 systems' if PAPER_MODE else 'S1 CFM only'}")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    _fb2 = get_futures_balance()
-    _bp2 = _fb2["buying_power"] if _fb2 else "N/A"
-    log(f"   Capital: ${_bp2} real Coinbase buying power per system")
+    if PAPER_MODE:
+        log(f"   Capital: $2,000.00 per system (paper) | $6,000.00 total")
+    else:
+        _fb2 = get_futures_balance()
+        _bp2 = _fb2["buying_power"] if _fb2 else "N/A"
+        log(f"   Capital: ${_bp2} real Coinbase buying power")
     _days = (datetime(2026,12,30,tzinfo=timezone.utc)-datetime.now(tz=timezone.utc)).days
     if _days < 60:
         log(f"   ⚠️  Contracts expire in {_days} days — update tickers before Dec 30 2026")
