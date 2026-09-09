@@ -891,7 +891,7 @@ class TradingSystem:
                         # Contract sizing
                         _cs  = ASSETS[_a]["contract"]
                         _mr  = ASSETS[_a]["margin_rate"]
-                        _bp_val = _fb["buying_power"] if _fb else _bal
+                        _bp_val = (_fb["buying_power"] if _fb else _bal) if not PAPER_MODE else _bal
                         _avail = _bp_val * 0.70 / len(ASSET_NAMES)
                         _mp    = float(_c[-1]["c"]) * _cs * _mr if _c else 0
                         _cts   = min(MAX_CONTRACTS, max(0, int(_avail / _mp))) if _mp > 0 else 0
