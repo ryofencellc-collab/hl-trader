@@ -1357,16 +1357,13 @@ def startup():
 
             hybrid = merge_cfm_intx(cfm, intx)
 
-            # Each system gets its own source candles
-            if cfm  and len(cfm)  >= 60: S1.startup_cache[asset] = cfm
-            if intx and len(intx) >= 60: S2.startup_cache[asset] = intx
-            if hybrid and len(hybrid) >= 60: S3.startup_cache[asset] = hybrid
+            # S1 CFM only — cache CFM candles
+            if cfm and len(cfm) >= 60:
+                S1.startup_cache[asset] = cfm
 
-            # Log hr_rsi per system
+            # Log candle counts
             hr1 = get_hr_rsi(asset, cfm)
-            hr2 = get_hr_rsi(asset, intx)
-            hr3 = get_hr_rsi(asset, hybrid)
-            log(f"  {asset}: CFM={len(cfm)} hr={hr1} | INTX={len(intx)} hr={hr2} | Hybrid={len(hybrid)} hr={hr3}")
+            log(f"  {asset}: CFM={len(cfm)} hr={hr1}")
 
             time.sleep(0.3)
         except Exception as e:
