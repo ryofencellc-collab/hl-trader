@@ -479,11 +479,14 @@ class TradingSystem:
             ntfy(f"ORDER REJECTED S{self.sys_id} {asset}", msg, priority="urgent")
             return
 
-        # Use actual fill price if available (live mode)
-        # Otherwise use the bid/ask price passed in (paper mode)
+        # Use actual fill price from Coinbase order response
+        # In live mode this should always be available — alert if missing
         if fill_price and fill_price > 0:
             entry_price = fill_price
-            log(f"[S{self.sys_id}] Using real fill price for entry: ${entry_price:.6f}")
+            log(f"[S{self.sys_id}] ✅ Real fill price entry: ${entry_price:.6f}")
+        elif not PAPER_MODE:
+            log(f"[S{self.sys_id}] ⚠️ {asset}: real fill price unavailable — using candle estimate")
+            ntfy(f"⚠️ FILL PRICE MISSING S{self.sys_id} {asset}", "Using candle estimate for entry — check Coinbase", priority="high")
 
         actual_size = actual_cts * cs
         rsi_info    = info or {}
@@ -531,19 +534,31 @@ class TradingSystem:
             ntfy(f"⚠️ EXIT FAILED S{self.sys_id} {asset}", "Position preserved, will retry", priority="urgent")
             return None
 
-        # Use actual fill price if available (live mode)
-        # Otherwise use the bid/ask price passed in (paper mode)
+        # Use actual fill price from Coinbase order response
+        # In live mode this should always be available — alert if missing
         if fill_price and fill_price > 0:
             exit_price = fill_price
-            log(f"[S{self.sys_id}] Using real fill price for exit: ${exit_price:.6f}")
+            log(f"[S{self.sys_id}] ✅ Real fill price exit: ${exit_price:.6f}")
+        elif not PAPER_MODE:
+            log(f"[S{self.sys_id}] ⚠️ {asset}: real fill price unavailable — using candle estimate")
+            ntfy(f"⚠️ FILL PRICE MISSING S{self.sys_id} {asset}", "Using candle estimate for exit — check Coinbase", priority="high")
 
         # Recalculate P&L with actual prices and actual fees
         gross = round(
             (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
             else (pos["entry"] - exit_price) * pos["size"], 4)
         # Use real Coinbase fees if available, otherwise calculate
-        entry_fee = pos.get("entry_fee") or round(pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
-        exit_fee  = fill_fee_exit        or round(exit_price   * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
+        # Fees — use real Coinbase fees, alert if missing in live mode
+        entry_fee = pos.get("entry_fee")
+        if not entry_fee:
+            entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
+            if not PAPER_MODE:
+                ntfy(f"⚠️ FEE MISSING S{self.sys_id} {asset}", "Using formula estimate for entry fee — check Coinbase", priority="high")
+        exit_fee = fill_fee_exit
+        if not exit_fee:
+            exit_fee = round(exit_price * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
+            if not PAPER_MODE:
+                ntfy(f"⚠️ FEE MISSING S{self.sys_id} {asset}", "Using formula estimate for exit fee — check Coinbase", priority="high")
         total_fee = round(entry_fee + exit_fee, 4)
         pnl       = round(gross - total_fee, 4)
 
@@ -689,12 +704,11 @@ class TradingSystem:
                             # ── EXIT CHECK ────────────────────────────
                             pos = self.positions.get(asset)
                             if pos:
-                                # Unrealized P&L uses real bid/ask midpoint for accuracy
-                                _bid_ask = get_real_fill_price(asset, "MID")
-                                if _bid_ask:
-                                    cur_close = _bid_ask
-                                else:
-                                    cur_close = float(signal_candles[-1]["c"])
+                                # Unrealized P&L uses real bid/ask midpoint
+                                # No fallback — if unavailable use last signal candle close
+                                # (unrealized is display only, not used for trade decisions)
+                                _mid = get_real_fill_price(asset, "MID")
+                                cur_close = _mid if _mid else float(signal_candles[-1]["c"])
                                 gross_u   = (cur_close - pos["entry"]) * pos["size"] if pos["direction"] == "LONG" \
                                             else (pos["entry"] - cur_close) * pos["size"]
                                 ef_u      = pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"]
@@ -704,9 +718,18 @@ class TradingSystem:
 
                                 if should_exit(pos, signal_candles):
                                     # Exit price — paper uses real bid/ask, live uses actual fill
+                                    # No fallback — if price unavailable hold position and alert
                                     if PAPER_MODE:
                                         _exit_side = "BUY" if pos["direction"] == "SHORT" else "SELL"
-                                        exit_price = get_real_fill_price(asset, _exit_side) or                                                      (float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"]))
+                                        exit_price = get_real_fill_price(asset, _exit_side)
+                                        if not exit_price:
+                                            log(f"[S{self.sys_id}] ⚠️ {asset}: bid/ask unavailable — holding position")
+                                            ntfy(f"⚠️ EXIT SKIPPED S{self.sys_id} {asset}", "bid/ask unavailable from Coinbase — holding position", priority="high")
+                                            self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
+                                                               "HOLD", position=dict(pos),
+                                                               balance_at_decision=self.state.get("balance",0),
+                                                               contracts_at_decision=pos.get("contracts",0))
+                                            continue
                                     else:
                                         exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                     pnl_net = self.exit_position(asset, exit_price, "RSI_EXIT", cur_cfm)
@@ -752,9 +775,14 @@ class TradingSystem:
                                                candle=cur_cfm, indicators=info)
 
                                 # Entry price — paper uses real bid/ask, live uses actual fill
+                                # No fallback — if price unavailable skip trade and alert
                                 if PAPER_MODE:
                                     _side = "SELL" if d == "SHORT" else "BUY"
-                                    entry_price = get_real_fill_price(asset, _side) or                                                   (float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"]))
+                                    entry_price = get_real_fill_price(asset, _side)
+                                    if not entry_price:
+                                        log(f"[S{self.sys_id}] ⚠️ {asset}: bid/ask unavailable — skipping entry")
+                                        ntfy(f"⚠️ ENTRY SKIPPED S{self.sys_id} {asset}", "bid/ask unavailable from Coinbase", priority="high")
+                                        continue
                                 else:
                                     entry_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                 self.enter_position(asset, d, entry_price, cur_cfm, info)
