@@ -318,8 +318,8 @@ class TradingSystem:
             if resp is None: return None
 
             candles = sorted([{
-                "ts": int(c.start) * 1000,
-                "dt": datetime.fromtimestamp(int(c.start), tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "ts": (int(c.start) // 900) * 900 * 1000,  # normalize to 15min bucket
+                "dt": datetime.fromtimestamp((int(c.start)//900)*900, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
                 "o": float(c.open), "h": float(c.high),
                 "l": float(c.low),  "c": float(c.close), "v": float(c.volume),
                 "source": "cfm",
@@ -352,8 +352,8 @@ class TradingSystem:
                 aggs = r.json().get("aggregations", [])
                 if aggs:
                     candles = sorted([{
-                        "ts":  int(datetime.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")
-                                   .replace(tzinfo=timezone.utc).timestamp() * 1000),
+                        "ts":  (int(datetime.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")
+                                   .replace(tzinfo=timezone.utc).timestamp()) // 900) * 900 * 1000,  # normalize
                         "dt":  c["start"],
                         "o":   float(c["open"]),  "h": float(c["high"]),
                         "l":   float(c["low"]),   "c": float(c["close"]),
@@ -418,11 +418,20 @@ class TradingSystem:
 
             if asset in INTX_PREFERRED:
                 # INTX primary, CFM fills INTX gaps
-                base    = intx_candles or []
-                filler  = cfm_candles  or []
-                im = {c["ts"]: c for c in base}
-                cm = {c["ts"]: c for c in filler}
-                # Keep INTX candle where both exist, fill gaps with CFM
+                # Normalize timestamps so same bucket matches correctly
+                base   = intx_candles or []
+                filler = cfm_candles  or []
+                im = {}
+                for c in base:
+                    bkt = normalize_ts(c["ts"])
+                    nc  = dict(c); nc["ts"] = bkt; nc["source"] = "intx"
+                    im[bkt] = nc
+                cm = {}
+                for c in filler:
+                    bkt = normalize_ts(c["ts"])
+                    nc  = dict(c); nc["ts"] = bkt; nc["source"] = "cfm"
+                    cm[bkt] = nc
+                # INTX wins on overlap, CFM fills gaps
                 merged_ts = sorted(set(im) | set(cm))
                 candles   = [im[t] if t in im else cm[t] for t in merged_ts]
             else:
@@ -683,8 +692,12 @@ class TradingSystem:
                                 pos["current_price"]  = cur_close
 
                                 if should_exit(pos, signal_candles):
-                                    # Exit price = CFM candles[-2]["c"] — last completed candle close
-                                    exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
+                                    # Exit price — paper uses real bid/ask, live uses actual fill
+                                    if PAPER_MODE:
+                                        _exit_side = "BUY" if pos["direction"] == "SHORT" else "SELL"
+                                        exit_price = get_real_fill_price(asset, _exit_side) or                                                      (float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"]))
+                                    else:
+                                        exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                     pnl_net = self.exit_position(asset, exit_price, "RSI_EXIT", cur_cfm)
                                     if pnl_net is not None:
                                         self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
@@ -727,8 +740,12 @@ class TradingSystem:
                                                f"hr={hr_rsi:.1f}",
                                                candle=cur_cfm, indicators=info)
 
-                                # Entry price = CFM candles[-2]["c"] — last completed candle close
-                                entry_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
+                                # Entry price — paper uses real bid/ask, live uses actual fill
+                                if PAPER_MODE:
+                                    _side = "SELL" if d == "SHORT" else "BUY"
+                                    entry_price = get_real_fill_price(asset, _side) or                                                   (float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"]))
+                                else:
+                                    entry_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                 self.enter_position(asset, d, entry_price, cur_cfm, info)
 
                                 if self.positions.get(asset):
@@ -998,21 +1015,43 @@ def should_exit(pos, candles):
             pos["exit_rsi"] = 100 - RSI_TRAIL_EXIT
         return cur_rsi > pos.get("exit_rsi", 100 - RSI_EXIT)
 
+def normalize_ts(ts):
+    """Normalize timestamp to 15-minute bucket boundary (floor to nearest 15min)"""
+    return (int(ts) // 900000) * 900000
+
 def merge_cfm_intx(cfm, intx):
+    """
+    Merge CFM and INTX candles. CFM always wins on overlap.
+    Timestamps are normalized to 15-min bucket boundaries before merging
+    to prevent INTX candles from appearing as separate buckets when they
+    are actually the same bucket as a CFM candle with a slightly different ts.
+    """
     if not cfm and not intx: return []
     if not cfm: return intx or []
     if not intx: return cfm
-    cm = {c["ts"]: c for c in cfm}
-    im = {c["ts"]: c for c in intx}
+    # Normalize all timestamps to bucket boundaries
+    cm = {}
+    for c in cfm:
+        bkt = normalize_ts(c["ts"])
+        nc  = dict(c); nc["ts"] = bkt; nc["source"] = "cfm"
+        cm[bkt] = nc
+    im = {}
+    for c in intx:
+        bkt = normalize_ts(c["ts"])
+        nc  = dict(c); nc["ts"] = bkt; nc["source"] = "intx"
+        im[bkt] = nc
+    # CFM wins on overlap
     return [cm[ts] if ts in cm else im[ts] for ts in sorted(set(cm) | set(im))]
 
 # ══════════════════════════════════════════════════════════════════
 # INSTANTIATE 3 SYSTEMS
 # ══════════════════════════════════════════════════════════════════
-# S1 CFM — confirmed winner from 44-hour live paper test
-# 83.8% WR | +$354.43 on $2,000 | XLM 93.8% WR | Sep 7-9 2026
-S1 = TradingSystem(1, "CFM only", "cfm")
-SYSTEMS = [S1]
+# All 3 systems — paper test with real bid/ask fills
+# Re-running comparison with accurate paper simulation
+S1 = TradingSystem(1, "CFM only",    "cfm")
+S2 = TradingSystem(2, "INTX only",   "intx")
+S3 = TradingSystem(3, "SmartHybrid", "hybrid")
+SYSTEMS = [S1, S2, S3]
 
 # ══════════════════════════════════════════════════════════════════
 # FLASK DASHBOARD
@@ -1041,6 +1080,27 @@ def get_real_balance():
                     return round(float(a.available_balance["value"]), 2)
     except Exception as e:
         log(f"Real balance fetch error: {e}")
+    return None
+
+def get_real_fill_price(asset, side):
+    """
+    Fetch real-time bid/ask from Coinbase and return realistic fill price.
+    BUY  fills at ASK (you pay more)
+    SELL fills at BID (you receive less)
+    Falls back to None if unavailable — caller uses candle close as fallback.
+    """
+    try:
+        client  = get_cb_client()
+        product = ASSETS[asset]["perp"]
+        book    = client.get_best_bid_ask(product_ids=[product])
+        if book and book.pricebooks:
+            pb  = book.pricebooks[0]
+            ask = float(pb.asks[0].price) if pb.asks else None
+            bid = float(pb.bids[0].price) if pb.bids else None
+            if side in ("BUY","LONG")   and ask: return round(ask, 6)
+            if side in ("SELL","SHORT") and bid: return round(bid, 6)
+    except Exception as e:
+        log(f"get_real_fill_price error {asset}: {e}")
     return None
 
 @app.route("/health")
@@ -1399,13 +1459,16 @@ def startup():
 
             hybrid = merge_cfm_intx(cfm, intx)
 
-            # S1 CFM only — cache CFM candles
-            if cfm and len(cfm) >= 60:
-                S1.startup_cache[asset] = cfm
+            # Each system gets its own source candles
+            if cfm    and len(cfm)    >= 60: S1.startup_cache[asset] = cfm
+            if intx   and len(intx)   >= 60: S2.startup_cache[asset] = intx
+            if hybrid and len(hybrid) >= 60: S3.startup_cache[asset] = hybrid
 
             # Log candle counts
             hr1 = get_hr_rsi(asset, cfm)
-            log(f"  {asset}: CFM={len(cfm)} hr={hr1}")
+            hr2 = get_hr_rsi(asset, intx)
+            hr3 = get_hr_rsi(asset, hybrid)
+            log(f"  {asset}: CFM={len(cfm)} hr={hr1} | INTX={len(intx)} hr={hr2} | Hybrid={len(hybrid)} hr={hr3}")
 
             time.sleep(0.3)
         except Exception as e:
@@ -1413,10 +1476,10 @@ def startup():
             ntfy(f"⚠️ STARTUP ERROR {asset}", str(e), priority="urgent")
 
     log("✅ Pre-load complete — all 3 systems ready")
-    log(f"🚀 AP3X 1.0 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} | System: S1 CFM only")
+    log(f"🚀 AP3X 1.0 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} | {'All 3 systems' if PAPER_MODE else 'S1 CFM only'}")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Capital: ${PAPER_BALANCE:,.2f}")
+    log(f"   Capital: ${PAPER_BALANCE:,.2f} per system (${PAPER_BALANCE*len(SYSTEMS):,.2f} total)")
     _days = (datetime(2026,12,30,tzinfo=timezone.utc)-datetime.now(tz=timezone.utc)).days
     if _days < 60:
         log(f"   ⚠️  Contracts expire in {_days} days — update tickers before Dec 30 2026")
