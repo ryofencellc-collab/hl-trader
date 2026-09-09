@@ -1389,6 +1389,7 @@ def startup():
         log(f"  ✅ S{sys.sys_id} ({sys.label}) thread started")
         time.sleep(0.1)
 
-@app.before_request
-def ensure_started():
-    startup()
+# Run startup in background so Flask responds immediately
+# Prevents Railway health check timeout during 14-second candle preload
+_startup_thread = threading.Thread(target=startup, daemon=True, name="startup")
+_startup_thread.start()
