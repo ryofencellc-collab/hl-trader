@@ -450,8 +450,13 @@ class TradingSystem:
         cs  = ASSETS[asset]["contract"]
         mr  = ASSETS[asset]["margin_rate"]
 
-        with self.lock:
-            current_bal = self.state["balance"]
+        # In live mode — use real Coinbase balance for sizing
+        # In paper mode — use simulated balance
+        if not PAPER_MODE:
+            current_bal = get_real_balance() or self.total_usdc
+        else:
+            with self.lock:
+                current_bal = self.state["balance"]
 
         per_slot       = (current_bal * 0.70) / len(ASSET_NAMES)
         margin_per     = entry_price * cs * mr
@@ -554,9 +559,13 @@ class TradingSystem:
         Runs in its own daemon thread.
         Completely blind to other systems.
         """
-        self.state["balance"]      = PAPER_BALANCE
-        self.state["buying_power"] = PAPER_BALANCE
-        self.total_usdc            = PAPER_BALANCE
+        # Live mode — use real Coinbase balance as starting point
+        # Paper mode — use PAPER_BALANCE
+        _start = get_real_balance() if not PAPER_MODE else PAPER_BALANCE
+        if _start is None: _start = PAPER_BALANCE
+        self.state["balance"]      = _start
+        self.state["buying_power"] = _start
+        self.total_usdc            = _start
         self.load_state()
 
         # In live mode — set starting balance to real Coinbase balance
@@ -744,7 +753,7 @@ class TradingSystem:
 
                     if skipped_assets:
                         log(f"[S{self.sys_id}] ⚠️ Skipped: {skipped_assets}")
-                    ntfy(f"⚠️ SKIPPED S{self.sys_id}", f"Assets skipped: {skipped_assets}", priority="high")
+                        ntfy(f"⚠️ SKIPPED S{self.sys_id}", f"Assets skipped: {skipped_assets}", priority="high")
 
                     if cycle_num % 10 == 0:
                         self.save_state()
@@ -809,7 +818,8 @@ class TradingSystem:
 
                     # Emergency stop
                     with self.lock: bal = self.state["balance"]
-                    if bal < PAPER_BALANCE * 0.5 and len(self.positions) == 0:
+                    _start_bal = self.total_usdc if not PAPER_MODE else PAPER_BALANCE
+                    if bal < _start_bal * 0.5 and len(self.positions) == 0:
                         ntfy(f"EMERGENCY S{self.sys_id}",
                              f"Balance ${bal:,.2f} below 50% of ${PAPER_BALANCE:,.2f}",
                              priority="urgent")
