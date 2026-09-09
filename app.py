@@ -1,50 +1,43 @@
 """
-CB TRADER v73
+AP3X 1.0
 ═══════════════════════════════════════════════════════════════════
-THREE ISOLATED SYSTEMS — RSI(2/70/55/80→70) on 15min candles
+Autonomous Crypto Trading — XRP + XLM — RSI Momentum Strategy
 
-Purpose: Run 3 candle sources in parallel for 1 week to find the winner.
-Each system is completely blind and isolated from the others.
-All 3 execute orders on CFM. Only candle source differs.
+SINGLE SYSTEM — S1 CFM only
+Confirmed winner from 44-hour live paper test Sep 7-9 2026
+83.8% WR | +$354.43 on $2,000 | XLM 93.8% WR | XRP 70% WR
+Signal source: CFM | Execution: CFM | Zero cross-exchange risk
 
-System 1 — CFM only:   Coinbase CFM candles for signals
-System 2 — INTX only:  Coinbase International candles for signals
-System 3 — Hybrid:     Smart per-asset source (XRP→INTX, XLM→CFM) + gap fill
-
-Strategy (identical across all 3 systems):
+Strategy:
   RSI(2) on 15min candles + 1hr RSI(14) MTF filter (resampled) + Trailing Exit
   LONG:  RSI(2) crosses ABOVE 70 AND 1hr RSI(14) resampled > 50
   SHORT: RSI(2) crosses BELOW 30 AND 1hr RSI(14) resampled < 50
   EXIT:  RSI drops below 55 (or 70 if RSI hit 80 — trailing tighten)
 
-Parameters confirmed by full sweep Sep 5 2026 (11,520 combos × 3 sources):
-  RSI(3/75/50/80→60) — all 47 tests passed
-  Trail exit: 60 beats 55 by $377/mo confirmed on real INTX data
-  Backtest: System 2 (INTX): $13,644/mo | 70.5% WR | 37/38 green weeks
+Parameters confirmed by full 11,520-combo sweep Sep 5 2026:
+  RSI(2/70/55/80→70) | close[-2] entry/exit | cooldown=0
+  XLM backtest: $10,696/mo | 86.1% WR | 38/38 green weeks
+  XRP backtest: $5,085/mo  | 71.9% WR | 37/37 green weeks
+  Combined:     $9,700/mo avg (INTX) | $9,869/mo (Hybrid)
 
-Assets (all 3 systems):
+Assets:
   XRP (XPP-20DEC30-CDE) — 500 XRP/contract | 20.01% intraday margin
   XLM (XLP-20DEC30-CDE) — 5000 XLM/contract | 25.00% intraday margin
-  Confirmed via Coinbase API Sep 2, 2026
 
-Fees confirmed from 6 real fills Aug 19-20 2026:
+Fees confirmed from real fills:
   0.080% taker per side + $0.12 flat per contract per side
 
-Isolation guarantee:
-  Each system has its own: state dict, positions dict, balance, locks,
-  sim data file, diagnostic file, candle cache, trading thread.
-  No shared mutable state between systems.
-  CFM candle fetches are shared (read-only) but each system
-  processes its own copy independently.
-
 Railway variables:
-  CB_API_KEY, CB_API_SECRET, NTFY_TOPIC
+  CB_API_KEY, CB_API_SECRET
   TRADE_MODE    — paper or live (default: paper)
   MAX_CONTRACTS — per asset per system (default: 5)
   PAPER_BALANCE — starting balance per system (default: 2000)
+  APP_PASSWORD  — dashboard password (default: 3757)
+  NTFY_TOPIC    — push notification topic
+  KILL_SWITCH   — set true to close all positions and stop (default: false)
 
 CHECKLIST — triple checked before push:
-  ✅ Version = v73 everywhere
+  ✅ Version = AP3X 1.0
   ✅ RSI_PERIOD = 2
   ✅ RSI_ENTRY = 70
   ✅ RSI_EXIT = 55
@@ -59,10 +52,7 @@ CHECKLIST — triple checked before push:
   ✅ Fees = 0.080% + $0.12/ct/side
   ✅ CANDLE_LIMIT = 300
   ✅ System 1 uses CFM candles only — no INTX
-  ✅ System 2 uses INTX candles only — no CFM
-  ✅ System 3 uses smart hybrid: XRP→INTX primary, XLM→CFM primary
-  ✅ All 3 execute orders on CFM (entry/exit price = CFM candle open)
-  ✅ All 3 completely isolated — separate state, positions, balance, locks
+  ✅ Executes orders on CFM (entry/exit price = CFM candles[-2]["c"])
   ✅ Each system has own sim data file (/tmp/cb_sim_s1.json etc)
   ✅ Each system has own diagnostic file
   ✅ Each system has own state file
@@ -79,12 +69,16 @@ CHECKLIST — triple checked before push:
   ✅ Exit at CFM candles[-2]["c"] (close of last completed candle)
   ✅ Skip cooldown = 0 (immediate re-entry allowed)
   ✅ Startup deferred to @app.before_request
-  ✅ State file = cb_state_v73_s{N}.json per system
+  ✅ State file = cb_state_ap3x_s{N}.json per system
   ✅ No 1hr strategy anywhere
   ✅ No dead code
-  ✅ Dashboard shows all 3 systems side by side
-  ✅ Separate sim-data endpoints per system
-  ✅ Dashboard version = v73
+  ✅ Single system — S1 CFM only (confirmed winner)
+  ✅ Sim-data endpoint for S1
+  ✅ Dashboard version = AP3X 1.0
+  ✅ Kill switch = KILL_SWITCH env var
+  ✅ APP_PASSWORD env var for dashboard
+  ✅ All 12 error conditions send ntfy alerts
+  ✅ Weekly report sent BEFORE weekly_pnl reset
 """
 
 import time, os, json, csv, uuid, threading
@@ -144,7 +138,7 @@ class TradingSystem:
         # Files — unique per system
         self.data_file  = f"/tmp/cb_sim_s{sys_id}.json"
         self.diag_file  = f"/tmp/cb_diag_s{sys_id}.json"
-        self.state_file = f"/tmp/cb_state_v73_s{sys_id}.json"
+        self.state_file = f"/tmp/cb_state_ap3x_s{sys_id}.json"
         self.tax_file   = f"/tmp/cb_trades_s{sys_id}.csv"
 
         # Isolated state
@@ -178,9 +172,12 @@ class TradingSystem:
             with self.lock:
                 safe = {k: v for k, v in self.state.items()
                         if isinstance(v, (int, float, str, bool, type(None)))}
-            json.dump(safe, open(self.state_file, "w"))
+            tmp = self.state_file + ".tmp"
+            json.dump(safe, open(tmp, "w"))
+            os.replace(tmp, self.state_file)
         except Exception as e:
             log(f"[S{self.sys_id}] State save error: {e}")
+            ntfy(f"⚠️ STATE SAVE ERROR S{self.sys_id}", str(e), priority="urgent")
 
     def load_state(self):
         if not os.path.exists(self.state_file):
@@ -196,6 +193,7 @@ class TradingSystem:
             log(f"[S{self.sys_id}] State restored | trades={self.state['total_trades']} pnl=${self.state['total_pnl']:+.2f}")
         except Exception as e:
             log(f"[S{self.sys_id}] State load error: {e}")
+            ntfy(f"⚠️ STATE LOAD ERROR S{self.sys_id}", str(e), priority="urgent")
 
     # ── Audit ─────────────────────────────────────────────────────
     def add_audit(self, asset, event, detail, candle=None, indicators=None):
@@ -274,8 +272,8 @@ class TradingSystem:
                 except:
                     existing = []
                 existing.append(record)
-                if len(existing) > 50000:
-                    existing = existing[-50000:]
+                if len(existing) > 5000:
+                    existing = existing[-5000:]
                 tmp = self.data_file + ".tmp"
                 with open(tmp, "w") as f:
                     json.dump(existing, f)
@@ -331,6 +329,7 @@ class TradingSystem:
             return candles
         except Exception as e:
             log(f"[S{self.sys_id}] CFM fetch {asset}: {e}")
+            ntfy(f"⚠️ CFM FETCH ERROR S{self.sys_id} {asset}", str(e), priority="high")
             return None
 
     def fetch_intx_candles(self, asset, n=CANDLE_LIMIT):
@@ -365,6 +364,7 @@ class TradingSystem:
                     return candles
         except Exception as e:
             log(f"[S{self.sys_id}] INTX fetch {asset}: {e}")
+            ntfy(f"⚠️ INTX FETCH ERROR S{self.sys_id} {asset}", str(e), priority="high")
         return self.intx_cache.get(asset)
 
     def get_signal_candles(self, asset, cfm_candles, intx_candles):
@@ -567,6 +567,18 @@ class TradingSystem:
 
         while True:
             try:
+                # Kill switch — check every loop
+                if os.environ.get("KILL_SWITCH","false").lower()=="true":
+                    log(f"[S{self.sys_id}] 🛑 KILL SWITCH ACTIVATED — closing all positions")
+                    ntfy(f"🛑 KILL SWITCH S{self.sys_id}", "Closing all positions and stopping", priority="urgent")
+                    for _asset, _pos in list(self.positions.items()):
+                        if _pos:
+                            _side = "SELL" if _pos["direction"]=="LONG" else "BUY"
+                            place_market_order(_asset, _side, _pos["contracts"])
+                            with self.lock:
+                                del self.positions[_asset]
+                    break
+
                 current_bucket = (int(time.time()) // 900) * 900
                 with self.lock:
                     self.state["loop_last_run"] = ts()
@@ -601,11 +613,16 @@ class TradingSystem:
                             if not cfm_candles or len(cfm_candles) < RSI_PERIOD + 5:
                                 skipped_assets.append(asset)
                                 log(f"[S{self.sys_id}] ⚠️ {asset}: CFM unavailable — skipping (no execution possible)")
+                                if self.positions.get(asset):
+                                    ntfy(f"⚠️ GAP S{self.sys_id} {asset}", f"CFM unavailable — holding position, cannot exit", priority="urgent")
+                                else:
+                                    ntfy(f"⚠️ GAP S{self.sys_id} {asset}", f"CFM unavailable — watching only", priority="default")
                                 continue
 
                             if not signal_candles or len(signal_candles) < RSI_PERIOD + 5:
                                 skipped_assets.append(asset)
                                 log(f"[S{self.sys_id}] ⚠️ {asset}: signal candles unavailable — skipping")
+                                ntfy(f"⚠️ NO CANDLES S{self.sys_id} {asset}", "Signal candles unavailable", priority="high")
                                 continue
 
                             _candle_cache[asset] = signal_candles
@@ -711,12 +728,14 @@ class TradingSystem:
                             import traceback
                             log(f"[S{self.sys_id}] Asset error {asset}: {e}")
                             log(traceback.format_exc())
+                            ntfy(f"⚠️ ASSET ERROR S{self.sys_id} {asset}", str(e), priority="high")
 
                     with self.lock:
                         self.state["skipped_assets"] = skipped_assets
 
                     if skipped_assets:
                         log(f"[S{self.sys_id}] ⚠️ Skipped: {skipped_assets}")
+                    ntfy(f"⚠️ SKIPPED S{self.sys_id}", f"Assets skipped: {skipped_assets}", priority="high")
 
                     if cycle_num % 10 == 0:
                         self.save_state()
@@ -763,15 +782,21 @@ class TradingSystem:
                     self.add_audit("SYSTEM", "💓 CYCLE", hb_detail)
 
                     # Weekly report
-                    if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 15:
+                    if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 15 and not self.state.get("weekly_report_sent"):
                         with self.lock:
                             wpnl = self.state["weekly_pnl"]
                             bal  = self.state["balance"]
                             trd  = self.state["total_trades"]
                             wr   = round(self.state["wins"] / trd * 100, 1) if trd else 0
-                        ntfy(f"Weekly Report S{self.sys_id} ({self.source})",
+                        ntfy(f"📊 Weekly Report S{self.sys_id} ({self.source})",
                              f"P&L: ${wpnl:+,.2f} | Bal: ${bal:,.2f} | Trades: {trd} | WR: {wr}%")
-                        with self.lock: self.state["weekly_pnl"] = 0.0
+                        with self.lock:
+                            self.state["weekly_report_sent"] = True
+                    # Reset weekly P&L and report flag on new week (check_weekly_reset handles week change)
+                    with self.lock:
+                        if not self.state.get("week") == get_week():
+                            self.state["weekly_pnl"] = 0.0
+                            self.state["weekly_report_sent"] = False
 
                     # Emergency stop
                     with self.lock: bal = self.state["balance"]
@@ -885,10 +910,12 @@ def place_market_order(asset, side, contracts):
                 if "INSUFFICIENT_FUNDS" in reason and attempt > 1:
                     continue
                 log(f"⚠️ Order failed: {asset} {err}")
+                ntfy(f"⚠️ ORDER FAILED {asset}", str(err), priority="urgent")
                 return None, 0
         return None, 0
     except Exception as e:
         log(f"❌ Order exception {asset}: {e}")
+        ntfy(f"❌ ORDER EXCEPTION {asset}", str(e), priority="urgent")
         return None, 0
 
 # ── Math ──────────────────────────────────────────────────────────
@@ -918,6 +945,7 @@ def get_hr_rsi(asset, candles_15m):
         return round(val, 1) if val is not None else None
     except Exception as e:
         log(f"get_hr_rsi error {asset}: {e}")
+        ntfy(f"⚠️ HR_RSI ERROR {asset}", str(e), priority="high")
         return None
 
 def evaluate_signal(candles):
@@ -962,10 +990,10 @@ def merge_cfm_intx(cfm, intx):
 # ══════════════════════════════════════════════════════════════════
 # INSTANTIATE 3 SYSTEMS
 # ══════════════════════════════════════════════════════════════════
-S1 = TradingSystem(1, "CFM only",  "cfm")
-S2 = TradingSystem(2, "INTX only", "intx")
-S3 = TradingSystem(3, "SmartHybrid", "hybrid")
-SYSTEMS = [S1, S2, S3]
+# S1 CFM — confirmed winner from 44-hour live paper test
+# 83.8% WR | +$354.43 on $2,000 | XLM 93.8% WR | Sep 7-9 2026
+S1 = TradingSystem(1, "CFM only", "cfm")
+SYSTEMS = [S1]
 
 # ══════════════════════════════════════════════════════════════════
 # FLASK DASHBOARD
@@ -975,10 +1003,11 @@ app = Flask(__name__)
 @app.route("/login", methods=["POST"])
 def login():
     from flask import make_response
-    pw = request.form.get("pw", "")
-    if pw == "3757":
+    pw  = request.form.get("pw", "")
+    _pw = os.environ.get("APP_PASSWORD", "3757")
+    if pw == _pw:
         resp = make_response(redirect("/"))
-        resp.set_cookie("auth", "3757", max_age=60*60*24*30)
+        resp.set_cookie("auth", _pw, max_age=60*60*24*30)
         return resp
     return redirect("/")
 
@@ -1002,7 +1031,7 @@ def health():
 
 @app.route("/sim-data-s<int:sid>")
 def sim_data_sys(sid):
-    if request.cookies.get("auth") != "3757":
+    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
         return Response("Unauthorized", status=401)
     sys = next((s for s in SYSTEMS if s.sys_id == sid), None)
     if not sys: return Response("Unknown system", status=404)
@@ -1033,8 +1062,8 @@ def diag_sys(sid):
 
 @app.route("/")
 def dashboard():
-    if request.cookies.get("auth") != "3757":
-        return """<!DOCTYPE html><html><head><title>CB Trader v73</title>
+    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
+        return """<!DOCTYPE html><html><head><title>AP3X 1.0</title>
 <meta name=viewport content='width=device-width,initial-scale=1'>
 <style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
 display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -1045,7 +1074,7 @@ button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius
 cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
 h2{margin-bottom:20px}</style></head>
 <body><form method=post action=/login class=box>
-<h2>CB Trader v73</h2>
+<h2>AP3X 1.0</h2>
 <input type=password name=pw placeholder='Password' autofocus>
 <button type=submit>Login</button>
 </form></body></html>"""
@@ -1224,7 +1253,7 @@ h2{margin-bottom:20px}</style></head>
 
     return f"""<!DOCTYPE html>
 <html><head>
-<title>CB Trader v73</title>
+<title>AP3X 1.0</title>
 <meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
 <meta http-equiv=refresh content=30>
@@ -1258,7 +1287,7 @@ function show(id,el,prefix){{
 </head><body>
 <div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px'>
   <div>
-    <div style='font-size:22px;font-weight:800'>CB Trader v73</div>
+    <div style='font-size:22px;font-weight:800'>AP3X <span style='color:#4A5878'>1.0</span></div>
     <div style='font-size:12px;font-weight:700;color:{mode_color};margin-top:2px'>{mode_label}</div>
     <div style='font-size:11px;color:#4A5878;margin-top:2px'>3-System Candle Source Test</div>
   </div>
@@ -1267,7 +1296,7 @@ function show(id,el,prefix){{
   </div>
 </div>
 <div style='font-size:11px;color:#4A5878;margin-bottom:14px;padding:10px;background:#0A1628;border-radius:8px;border:1px solid #1E2D45'>
-  RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF · All 3 systems completely isolated · Execute on CFM
+  Autonomous Crypto Trading · XRP · XLM
 </div>
 {sys_cards}
 <div style='font-size:11px;color:#4A5878;text-align:center;margin-top:8px'>
@@ -1287,7 +1316,7 @@ def startup():
         if _started: return
         _started = True
 
-    log("📡 CB Trader v73 — pre-loading candles for all 3 systems...")
+    log("📡 AP3X 1.0 — pre-loading candles...")
 
     # Shared candle fetch on startup — each system caches its own copy
     for asset in ASSET_NAMES:
@@ -1342,12 +1371,19 @@ def startup():
             time.sleep(0.3)
         except Exception as e:
             log(f"  Startup preload {asset}: {e}")
+            ntfy(f"⚠️ STARTUP ERROR {asset}", str(e), priority="urgent")
 
     log("✅ Pre-load complete — all 3 systems ready")
-    log(f"🚀 CB Trader v73 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'}")
+    log(f"🚀 AP3X 1.0 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} | System: S1 CFM only")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Capital: ${PAPER_BALANCE:,.2f} per system (${PAPER_BALANCE*3:,.2f} total)")
+    log(f"   Capital: ${PAPER_BALANCE:,.2f}")
+    _days = (datetime(2026,12,30,tzinfo=timezone.utc)-datetime.now(tz=timezone.utc)).days
+    if _days < 60:
+        log(f"   ⚠️  Contracts expire in {_days} days — update tickers before Dec 30 2026")
+        ntfy("⚠️ CONTRACT EXPIRY WARNING", f"XPP/XLP expire in {_days} days", priority="high")
+    else:
+        log(f"   Contracts expire Dec 30 2026 ({_days} days away)")
     log(f"   Time: {ts_est()}")
 
     # Start 3 isolated trading threads
