@@ -559,7 +559,16 @@ class TradingSystem:
         self.total_usdc            = PAPER_BALANCE
         self.load_state()
 
-        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | ${PAPER_BALANCE:,.2f}")
+        # In live mode — set starting balance to real Coinbase balance
+        if not PAPER_MODE:
+            real = get_real_balance()
+            if real:
+                self.total_usdc = real
+                log(f"[S{self.sys_id}] 🚀 Started — {self.label} | Real balance: ${real:,.2f}")
+            else:
+                log(f"[S{self.sys_id}] 🚀 Started — {self.label} | ${PAPER_BALANCE:,.2f} (could not fetch real balance)")
+        else:
+            log(f"[S{self.sys_id}] 🚀 Started — {self.label} | ${PAPER_BALANCE:,.2f}")
         log(f"[S{self.sys_id}] Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
         log(f"[S{self.sys_id}] Source: {self.source}")
 
@@ -1011,15 +1020,38 @@ def login():
         return resp
     return redirect("/")
 
+def get_real_balance():
+    """Fetch real USD balance from Coinbase — used in live mode"""
+    try:
+        client = get_cb_client()
+        accounts = client.get_accounts()
+        for a in accounts.accounts:
+            if isinstance(a.available_balance, dict):
+                if a.available_balance.get("currency") == "USD":
+                    return round(float(a.available_balance["value"]), 2)
+    except Exception as e:
+        log(f"Real balance fetch error: {e}")
+    return None
+
 @app.route("/health")
 def health():
+    # In live mode — fetch real Coinbase balance
+    real_bal = get_real_balance() if not PAPER_MODE else None
     out = {}
     for sys in SYSTEMS:
         with sys.lock: s = dict(sys.state)
         wr = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
+        # Live mode: show real balance + real P&L
+        # Paper mode: show simulated balance
+        if not PAPER_MODE and real_bal is not None:
+            display_bal = real_bal
+            display_pnl = round(real_bal - S1.total_usdc, 2)
+        else:
+            display_bal = s["balance"]
+            display_pnl = s["total_pnl"]
         out[f"S{sys.sys_id}_{sys.source}"] = {
-            "balance":    f"${s['balance']:,.2f}",
-            "total_pnl":  f"${s['total_pnl']:+,.2f}",
+            "balance":    f"${display_bal:,.2f}",
+            "total_pnl":  f"${display_pnl:+,.2f}",
             "weekly_pnl": f"${s['weekly_pnl']:+,.2f}",
             "trades":     s["total_trades"],
             "win_rate":   f"{wr}%",
@@ -1188,7 +1220,7 @@ h2{margin-bottom:20px}</style></head>
           <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px'>
             <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
               <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>BALANCE</div>
-              <div style='font-size:15px;font-weight:800'>${s["balance"]:,.2f}</div>
+              <div style='font-size:15px;font-weight:800'>${(get_real_balance() or s["balance"]) if not PAPER_MODE else s["balance"]:,.2f}</div>
             </div>
             <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
               <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>WEEK</div>
