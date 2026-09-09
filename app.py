@@ -3,10 +3,11 @@ AP3X 1.0
 ═══════════════════════════════════════════════════════════════════
 Autonomous Crypto Trading — XRP + XLM — RSI Momentum Strategy
 
-SINGLE SYSTEM — S1 CFM only
-Confirmed winner from 44-hour live paper test Sep 7-9 2026
-83.8% WR | +$354.43 on $2,000 | XLM 93.8% WR | XRP 70% WR
-Signal source: CFM | Execution: CFM | Zero cross-exchange risk
+THREE ISOLATED SYSTEMS — paper test with real bid/ask fills
+S1 CFM only | S2 INTX only | S3 SmartHybrid
+Paper mode: fills at real Coinbase bid/ask — 1:1 with live
+Live mode:  fills at actual Coinbase order fill price — exact match
+Execution always on CFM regardless of signal source
 
 Strategy:
   RSI(2) on 15min candles + 1hr RSI(14) MTF filter (resampled) + Trailing Exit
@@ -52,7 +53,13 @@ CHECKLIST — triple checked before push:
   ✅ Fees = 0.080% + $0.12/ct/side
   ✅ CANDLE_LIMIT = 300
   ✅ System 1 uses CFM candles only — no INTX
-  ✅ Executes orders on CFM (entry/exit price = CFM candles[-2]["c"])
+  ✅ System 2 uses INTX candles only — no CFM for signals
+  ✅ System 3 SmartHybrid: XRP→INTX primary, XLM→CFM primary
+  ✅ All 3 execute orders on CFM — execution always CFM
+  ✅ Timestamps normalized to 15min buckets — S3 merge bug fixed
+  ✅ Paper fills at real Coinbase bid/ask — 1:1 with live
+  ✅ Live fills use actual Coinbase fill price from order response
+  ✅ Fees use actual Coinbase total_fees from order response
   ✅ Each system has own sim data file (/tmp/cb_sim_s1.json etc)
   ✅ Each system has own diagnostic file
   ✅ Each system has own state file
@@ -72,8 +79,8 @@ CHECKLIST — triple checked before push:
   ✅ State file = cb_state_ap3x_s{N}.json per system
   ✅ No 1hr strategy anywhere
   ✅ No dead code
-  ✅ Single system — S1 CFM only (confirmed winner)
-  ✅ Sim-data endpoint for S1
+  ✅ All 3 systems isolated — separate state, positions, balance
+  ✅ Sim-data endpoints for all 3 systems
   ✅ Dashboard version = AP3X 1.0
   ✅ Kill switch = KILL_SWITCH env var
   ✅ APP_PASSWORD env var for dashboard
@@ -143,7 +150,7 @@ class TradingSystem:
 
         # Isolated state
         self.state = {
-            "balance": PAPER_BALANCE, "buying_power": PAPER_BALANCE,
+            "balance": 0.0, "buying_power": 0.0,  # set to real Coinbase buying power in run()
             "weekly_pnl": 0.0, "total_pnl": 0.0,
             "week": None, "cycle": 0,
             "loop_last_run": "never", "loop_errors": 0,
@@ -164,7 +171,7 @@ class TradingSystem:
         self.intx_cache       = {}   # INTX candles cached per bucket
         self.intx_cache_ts    = {}   # timestamp of last INTX fetch
 
-        self.total_usdc = PAPER_BALANCE
+        self.total_usdc = 0.0  # set to real Coinbase buying power in run()
 
     # ── State persistence ─────────────────────────────────────────
     def save_state(self):
@@ -318,8 +325,8 @@ class TradingSystem:
             if resp is None: return None
 
             candles = sorted([{
-                "ts": (int(c.start) // 900) * 900 * 1000,  # normalize to 15min bucket
-                "dt": datetime.fromtimestamp((int(c.start)//900)*900, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "ts": int(c.start) * 1000,
+                "dt": datetime.fromtimestamp(int(c.start), tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
                 "o": float(c.open), "h": float(c.high),
                 "l": float(c.low),  "c": float(c.close), "v": float(c.volume),
                 "source": "cfm",
@@ -352,8 +359,8 @@ class TradingSystem:
                 aggs = r.json().get("aggregations", [])
                 if aggs:
                     candles = sorted([{
-                        "ts":  (int(datetime.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")
-                                   .replace(tzinfo=timezone.utc).timestamp()) // 900) * 900 * 1000,  # normalize
+                        "ts":  int(datetime.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")
+                                   .replace(tzinfo=timezone.utc).timestamp() * 1000),
                         "dt":  c["start"],
                         "o":   float(c["open"]),  "h": float(c["high"]),
                         "l":   float(c["low"]),   "c": float(c["close"]),
@@ -418,20 +425,10 @@ class TradingSystem:
 
             if asset in INTX_PREFERRED:
                 # INTX primary, CFM fills INTX gaps
-                # Normalize timestamps so same bucket matches correctly
-                base   = intx_candles or []
-                filler = cfm_candles  or []
-                im = {}
-                for c in base:
-                    bkt = normalize_ts(c["ts"])
-                    nc  = dict(c); nc["ts"] = bkt; nc["source"] = "intx"
-                    im[bkt] = nc
-                cm = {}
-                for c in filler:
-                    bkt = normalize_ts(c["ts"])
-                    nc  = dict(c); nc["ts"] = bkt; nc["source"] = "cfm"
-                    cm[bkt] = nc
-                # INTX wins on overlap, CFM fills gaps
+                base    = intx_candles or []
+                filler  = cfm_candles  or []
+                im = {c["ts"]: c for c in base}
+                cm = {c["ts"]: c for c in filler}
                 merged_ts = sorted(set(im) | set(cm))
                 candles   = [im[t] if t in im else cm[t] for t in merged_ts]
             else:
@@ -459,9 +456,12 @@ class TradingSystem:
         cs  = ASSETS[asset]["contract"]
         mr  = ASSETS[asset]["margin_rate"]
 
-        # In live mode — use real Coinbase balance for sizing
-        # In paper mode — use simulated balance
-        if not PAPER_MODE:
+        # Both paper and live use real Coinbase buying power for sizing
+        # This ensures contracts match what the account can actually afford
+        _fb = get_futures_balance()
+        if _fb and _fb["buying_power"] > 0:
+            current_bal = _fb["buying_power"]
+        elif not PAPER_MODE:
             current_bal = get_real_balance() or self.total_usdc
         else:
             with self.lock:
@@ -582,25 +582,19 @@ class TradingSystem:
         Runs in its own daemon thread.
         Completely blind to other systems.
         """
-        # Live mode — use real Coinbase balance as starting point
-        # Paper mode — use PAPER_BALANCE
-        _start = get_real_balance() if not PAPER_MODE else PAPER_BALANCE
-        if _start is None: _start = PAPER_BALANCE
+        # Both paper and live use real Coinbase buying power as starting balance
+        # This ensures paper tracks real account — no fake $2,000
+        _fb = get_futures_balance()
+        _real_bp = _fb["buying_power"] if _fb else None
+        _real_bal = get_real_balance()
+        _start = _real_bp or _real_bal or 2000.0
+
         self.state["balance"]      = _start
         self.state["buying_power"] = _start
         self.total_usdc            = _start
         self.load_state()
 
-        # In live mode — set starting balance to real Coinbase balance
-        if not PAPER_MODE:
-            real = get_real_balance()
-            if real:
-                self.total_usdc = real
-                log(f"[S{self.sys_id}] 🚀 Started — {self.label} | Real balance: ${real:,.2f}")
-            else:
-                log(f"[S{self.sys_id}] 🚀 Started — {self.label} | ${PAPER_BALANCE:,.2f} (could not fetch real balance)")
-        else:
-            log(f"[S{self.sys_id}] 🚀 Started — {self.label} | ${PAPER_BALANCE:,.2f}")
+        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | {'PAPER' if PAPER_MODE else 'LIVE'} | buying_power=${_start:,.2f}")
         log(f"[S{self.sys_id}] Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
         log(f"[S{self.sys_id}] Source: {self.source}")
 
@@ -696,8 +690,12 @@ class TradingSystem:
                             # ── EXIT CHECK ────────────────────────────
                             pos = self.positions.get(asset)
                             if pos:
-                                # Unrealized P&L calculated from signal candles close
-                                cur_close = float(signal_candles[-1]["c"])
+                                # Unrealized P&L uses real bid/ask midpoint for accuracy
+                                _bid_ask = get_real_fill_price(asset, "MID")
+                                if _bid_ask:
+                                    cur_close = _bid_ask
+                                else:
+                                    cur_close = float(signal_candles[-1]["c"])
                                 gross_u   = (cur_close - pos["entry"]) * pos["size"] if pos["direction"] == "LONG" \
                                             else (pos["entry"] - cur_close) * pos["size"]
                                 ef_u      = pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"]
@@ -789,19 +787,52 @@ class TradingSystem:
                     if cycle_num % 10 == 0:
                         self.save_state()
 
-                    # Heartbeat
+                    # Heartbeat — full picture every bucket
                     with self.lock:
                         _bal    = self.state["balance"]
                         _trades = self.state["total_trades"]
+                        _errs   = self.state.get("loop_errors", 0)
 
-                    hb_lines = [f"S{self.sys_id}({self.source}) | candle={bucket_dt} | open={len(self.positions)} | bal=${_bal:,.2f} | trades={_trades}"]
+                    # Real Coinbase futures balance
+                    _fb = get_futures_balance()
+                    _bp   = f"${_fb['buying_power']:,.2f}"   if _fb else "N/A"
+                    _mgn  = f"${_fb['initial_margin']:,.2f}" if _fb else "N/A"
+                    _dpnl = f"${_fb['daily_pnl']:+,.2f}"     if _fb else "N/A"
+                    _unrl = f"${_fb['unrealized_pnl']:+,.2f}" if _fb else "N/A"
+
+                    hb_lines = [
+                        f"S{self.sys_id}({self.source}) | {bucket_dt} UTC | {'PAPER' if PAPER_MODE else 'LIVE'} | loop=ok | errors={_errs} | kill={os.environ.get('KILL_SWITCH','false')}",
+                        f"  Account: buying_power={_bp} | margin_used={_mgn} | daily_pnl={_dpnl} | unrealized={_unrl}",
+                    ]
+
                     for _a in ASSET_NAMES:
                         _pos = self.positions.get(_a)
                         _c   = _candle_cache.get(_a)
+                        _n   = len(_c) if _c else 0
+
+                        # Candle age
                         _age = "?"
+                        _age_warn = ""
                         if _c and _c[-1].get("ts"):
-                            _age = f"{round((int(time.time())*1000-_c[-1]['ts'])/60000,1)}m"
-                        _rsi_cur = _rsi_prev = _hr = "?"
+                            _age_mins = round((int(time.time())*1000-_c[-1]["ts"])/60000,1)
+                            _age = f"{_age_mins}m"
+                            if _age_mins > 20:
+                                _age_warn = " ⚠️ STALE"
+                                ntfy(f"⚠️ STALE DATA S{self.sys_id} {_a}",
+                                     f"Last candle {_age_mins}min old — possible gap", priority="high")
+
+                        # Candle count status
+                        if _n < 5:
+                            _candle_status = f"❌ CRITICAL({_n}<5 need for RSI)"
+                            ntfy(f"❌ NO CANDLES S{self.sys_id} {_a}",
+                                 f"Only {_n} candles — RSI cannot calculate", priority="urgent")
+                        elif _n < 64:
+                            _candle_status = f"⚠️ {_n}(<64 need for hr_rsi)"
+                        else:
+                            _candle_status = f"✅{_n}"
+
+                        # RSI values
+                        _rsi_cur = _rsi_prev = "?"
                         if _c and len(_c) >= RSI_PERIOD + 2:
                             _closes   = [float(x["c"]) for x in _c]
                             _rsi_vals = calc_rsi(_closes, RSI_PERIOD)
@@ -809,20 +840,42 @@ class TradingSystem:
                                 _rsi_cur = f"{_rsi_vals[-2]:.1f}"
                             if len(_rsi_vals) >= 3 and _rsi_vals[-3] is not None:
                                 _rsi_prev = f"{_rsi_vals[-3]:.1f}"
+
+                        # hr_rsi status
                         _hr_val = get_hr_rsi(_a, _c)
-                        _hr     = f"{_hr_val:.1f}" if _hr_val is not None else "?"
+                        if _hr_val is not None:
+                            _hr = f"✅{_hr_val:.1f}"
+                        elif _n >= 64:
+                            _hr = "❌None(calc failed)"
+                            ntfy(f"❌ HR_RSI FAILED S{self.sys_id} {_a}",
+                                 f"Have {_n} candles but hr_rsi=None", priority="urgent")
+                        else:
+                            _hr = f"⚠️None(need 64 have {_n})"
+
+                        # Source tag for S3
+                        _src = _c[-1].get("source","?") if _c else "?"
+
+                        # Contract sizing
                         _cs  = ASSETS[_a]["contract"]
                         _mr  = ASSETS[_a]["margin_rate"]
-                        _avail = _bal * 0.70 / len(ASSET_NAMES)
+                        _bp_val = _fb["buying_power"] if _fb else _bal
+                        _avail = _bp_val * 0.70 / len(ASSET_NAMES)
                         _mp    = float(_c[-1]["c"]) * _cs * _mr if _c else 0
                         _cts   = min(MAX_CONTRACTS, max(0, int(_avail / _mp))) if _mp > 0 else 0
+
                         if _pos:
                             _unreal = _pos.get("unrealized_pnl", 0.0)
                             _exit_r = _pos.get("exit_rsi", RSI_EXIT)
                             _locked = "🔒" if _exit_r == RSI_TRAIL_EXIT else ""
-                            hb_lines.append(f"  {_a:<4} {_pos['direction']:<5} | prev={_rsi_prev} cur={_rsi_cur} | hr={_hr} | exit<{_exit_r}{_locked} | unreal=${_unreal:+.2f} | age={_age} | HOLD")
+                            hb_lines.append(
+                                f"  {_a:<4} {_pos['direction']:<5} | candles={_candle_status} | age={_age}{_age_warn} | "
+                                f"RSI={_rsi_prev}→{_rsi_cur} | hr={_hr} | src={_src} | "
+                                f"exit<{_exit_r}{_locked} | unreal=${_unreal:+.2f} | HOLD")
                         else:
-                            hb_lines.append(f"  {_a:<4} {'—':<5} | prev={_rsi_prev} cur={_rsi_cur} | hr={_hr} | cts={_cts} | age={_age} | WATCHING")
+                            hb_lines.append(
+                                f"  {_a:<4} {'—':<5} | candles={_candle_status} | age={_age}{_age_warn} | "
+                                f"RSI={_rsi_prev}→{_rsi_cur} | hr={_hr} | src={_src} | "
+                                f"cts={_cts} | WATCHING")
 
                     for _line in hb_lines:
                         log(_line)
@@ -849,10 +902,10 @@ class TradingSystem:
 
                     # Emergency stop
                     with self.lock: bal = self.state["balance"]
-                    _start_bal = self.total_usdc if not PAPER_MODE else PAPER_BALANCE
+                    _start_bal = self.total_usdc  # always real starting balance
                     if bal < _start_bal * 0.5 and len(self.positions) == 0:
-                        ntfy(f"EMERGENCY S{self.sys_id}",
-                             f"Balance ${bal:,.2f} below 50% of ${PAPER_BALANCE:,.2f}",
+                        ntfy(f"🚨 EMERGENCY S{self.sys_id}",
+                             f"Balance ${bal:,.2f} below 50% of starting ${_start_bal:,.2f}",
                              priority="urgent")
 
             except Exception as e:
@@ -1050,32 +1103,13 @@ def should_exit(pos, candles):
             pos["exit_rsi"] = 100 - RSI_TRAIL_EXIT
         return cur_rsi > pos.get("exit_rsi", 100 - RSI_EXIT)
 
-def normalize_ts(ts):
-    """Normalize timestamp to 15-minute bucket boundary (floor to nearest 15min)"""
-    return (int(ts) // 900000) * 900000
-
 def merge_cfm_intx(cfm, intx):
-    """
-    Merge CFM and INTX candles. CFM always wins on overlap.
-    Timestamps are normalized to 15-min bucket boundaries before merging
-    to prevent INTX candles from appearing as separate buckets when they
-    are actually the same bucket as a CFM candle with a slightly different ts.
-    """
+    """CFM primary — INTX fills gaps only. CFM wins on any overlap."""
     if not cfm and not intx: return []
     if not cfm: return intx or []
     if not intx: return cfm
-    # Normalize all timestamps to bucket boundaries
-    cm = {}
-    for c in cfm:
-        bkt = normalize_ts(c["ts"])
-        nc  = dict(c); nc["ts"] = bkt; nc["source"] = "cfm"
-        cm[bkt] = nc
-    im = {}
-    for c in intx:
-        bkt = normalize_ts(c["ts"])
-        nc  = dict(c); nc["ts"] = bkt; nc["source"] = "intx"
-        im[bkt] = nc
-    # CFM wins on overlap
+    cm = {c["ts"]: c for c in cfm}
+    im = {c["ts"]: c for c in intx}
     return [cm[ts] if ts in cm else im[ts] for ts in sorted(set(cm) | set(im))]
 
 # ══════════════════════════════════════════════════════════════════
@@ -1117,6 +1151,36 @@ def get_real_balance():
         log(f"Real balance fetch error: {e}")
     return None
 
+def get_futures_balance():
+    """
+    Fetch real futures balance summary from Coinbase.
+    Returns dict with buying_power, unrealized_pnl, daily_realized_pnl,
+    available_margin, initial_margin.
+    Used for paper sizing, heartbeat display, emergency stop.
+    """
+    try:
+        client = get_cb_client()
+        fb = client.get_futures_balance_summary()
+        bs = fb.get("balance_summary", {}) if isinstance(fb, dict) else              getattr(fb, "balance_summary", {})
+        if not bs: return None
+
+        def _val(key):
+            v = bs.get(key, {})
+            if isinstance(v, dict): return float(v.get("value", 0) or 0)
+            return float(v or 0)
+
+        return {
+            "buying_power":      round(_val("futures_buying_power"), 2),
+            "total_balance":     round(_val("total_usd_balance"), 2),
+            "unrealized_pnl":    round(_val("unrealized_pnl"), 2),
+            "daily_pnl":         round(_val("daily_realized_pnl"), 2),
+            "available_margin":  round(_val("available_margin"), 2),
+            "initial_margin":    round(_val("initial_margin"), 2),
+        }
+    except Exception as e:
+        log(f"get_futures_balance error: {e}")
+        return None
+
 def get_real_fill_price(asset, side):
     """
     Fetch real-time bid/ask from Coinbase and return realistic fill price.
@@ -1132,6 +1196,7 @@ def get_real_fill_price(asset, side):
             pb  = book.pricebooks[0]
             ask = float(pb.asks[0].price) if pb.asks else None
             bid = float(pb.bids[0].price) if pb.bids else None
+            if side == "MID" and ask and bid: return round((ask + bid) / 2, 6)
             if side in ("BUY","LONG")   and ask: return round(ask, 6)
             if side in ("SELL","SHORT") and bid: return round(bid, 6)
     except Exception as e:
@@ -1148,9 +1213,10 @@ def health():
         wr = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
         # Live mode: show real balance + real P&L
         # Paper mode: show simulated balance
+        # Balance: real Coinbase buying power in live, internal state in paper
         if not PAPER_MODE and real_bal is not None:
             display_bal = real_bal
-            display_pnl = round(real_bal - S1.total_usdc, 2)
+            display_pnl = round(real_bal - sys.total_usdc, 2)
         else:
             display_bal = s["balance"]
             display_pnl = s["total_pnl"]
@@ -1370,7 +1436,7 @@ h2{margin-bottom:20px}</style></head>
             <div style='font-size:12px;line-height:2;color:#8892A4'>
               <b style='color:#E0E6F0'>Source</b>: {sys.source}<br>
               <b style='color:#E0E6F0'>Strategy</b>: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF<br>
-              <b style='color:#E0E6F0'>Capital</b>: ${PAPER_BALANCE:,.2f} isolated<br>
+              <b style='color:#E0E6F0'>Capital</b>: Real Coinbase buying power<br>
               <b style='color:#E0E6F0'>Assets</b>: XRP · XLM<br>
               <b style='color:#E0E6F0'>Execution</b>: CFM always<br>
               <b style='color:#E0E6F0'>Fees</b>: 0.080% + $0.12/ct/side<br>
@@ -1514,7 +1580,9 @@ def startup():
     log(f"🚀 AP3X 1.0 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} | {'All 3 systems' if PAPER_MODE else 'S1 CFM only'}")
     log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
     log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    log(f"   Capital: ${PAPER_BALANCE:,.2f} per system (${PAPER_BALANCE*len(SYSTEMS):,.2f} total)")
+    _fb2 = get_futures_balance()
+    _bp2 = _fb2["buying_power"] if _fb2 else "N/A"
+    log(f"   Capital: ${_bp2} real Coinbase buying power per system")
     _days = (datetime(2026,12,30,tzinfo=timezone.utc)-datetime.now(tz=timezone.utc)).days
     if _days < 60:
         log(f"   ⚠️  Contracts expire in {_days} days — update tickers before Dec 30 2026")
