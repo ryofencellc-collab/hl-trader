@@ -56,7 +56,7 @@ CHECKLIST — triple checked before push:
   ✅ System 2 uses INTX candles only — no CFM for signals
   ✅ System 3 SmartHybrid: XRP→INTX primary, XLM→CFM primary
   ✅ All 3 execute orders on CFM — execution always CFM
-  ✅ Timestamps normalized to 15min buckets — S3 merge bug fixed
+  ✅ S3 merge: CFM wins on overlap, INTX fills gaps only — confirmed zero P&L impact
   ✅ Paper fills at real Coinbase bid/ask — 1:1 with live
   ✅ Live fills use actual Coinbase fill price from order response
   ✅ Fees use actual Coinbase total_fees from order response
@@ -649,6 +649,7 @@ class TradingSystem:
 
                     for asset in ASSET_NAMES:
                         try:
+                            info = {}  # ensure info is always defined in this scope
                             # Always fetch both sources — system decides which to use
                             cfm_candles  = self.fetch_cfm_candles(asset, n=CANDLE_LIMIT)
                             intx_candles = self.fetch_intx_candles(asset, n=CANDLE_LIMIT)
@@ -725,10 +726,11 @@ class TradingSystem:
                                         if not exit_price:
                                             log(f"[S{self.sys_id}] ⚠️ {asset}: bid/ask unavailable — holding position")
                                             ntfy(f"⚠️ EXIT SKIPPED S{self.sys_id} {asset}", "bid/ask unavailable from Coinbase — holding position", priority="high")
+                                            _info_safe = info if isinstance(info, dict) else {}
                                             _skip_info = {
                                                 "hr_rsi":   pos.get("hr_rsi"),
-                                                "rsi_cur":  info.get("rsi_cur"),
-                                                "rsi_prev": info.get("rsi_prev"),
+                                                "rsi_cur":  _info_safe.get("rsi_cur"),
+                                                "rsi_prev": _info_safe.get("rsi_prev"),
                                             }
                                             self.save_sim_data(asset, current_bucket*1000, signal_candles, _skip_info,
                                                                "HOLD", position=dict(pos),
@@ -739,10 +741,11 @@ class TradingSystem:
                                         exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                     pnl_net = self.exit_position(asset, exit_price, "RSI_EXIT", cur_cfm)
                                     if pnl_net is not None:
+                                        _info_safe = info if isinstance(info, dict) else {}
                                         _exit_info = {
                                             "hr_rsi":   pos.get("hr_rsi"),
-                                            "rsi_cur":  info.get("rsi_cur"),
-                                            "rsi_prev": info.get("rsi_prev"),
+                                            "rsi_cur":  _info_safe.get("rsi_cur"),
+                                            "rsi_prev": _info_safe.get("rsi_prev"),
                                             "exit_rsi": pos.get("exit_rsi", RSI_EXIT),
                                         }
                                         self.save_sim_data(asset, current_bucket*1000, signal_candles, _exit_info,
@@ -751,10 +754,11 @@ class TradingSystem:
                                                            contracts_at_decision=pos.get("contracts",0))
                                     self.skip_entry[asset] = 0
                                 else:
+                                    _info_safe = info if isinstance(info, dict) else {}
                                     _hold_info = {
                                         "hr_rsi":   pos.get("hr_rsi"),
-                                        "rsi_cur":  info.get("rsi_cur"),
-                                        "rsi_prev": info.get("rsi_prev"),
+                                        "rsi_cur":  _info_safe.get("rsi_cur"),
+                                        "rsi_prev": _info_safe.get("rsi_prev"),
                                         "exit_rsi": pos.get("exit_rsi", RSI_EXIT),
                                     }
                                     self.save_sim_data(asset, current_bucket*1000, signal_candles, _hold_info,
@@ -1093,7 +1097,7 @@ def place_market_order(asset, side, contracts):
         return None, 0, None, None
 
 # ── Math ──────────────────────────────────────────────────────────
-def calc_rsi(closes, period=14):
+def calc_rsi(closes, period=RSI_PERIOD):
     if len(closes) < period + 1: return [None] * len(closes)
     out    = [None] * period
     gains  = [max(0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
