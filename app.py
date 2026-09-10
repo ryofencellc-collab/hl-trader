@@ -725,7 +725,12 @@ class TradingSystem:
                                         if not exit_price:
                                             log(f"[S{self.sys_id}] ⚠️ {asset}: bid/ask unavailable — holding position")
                                             ntfy(f"⚠️ EXIT SKIPPED S{self.sys_id} {asset}", "bid/ask unavailable from Coinbase — holding position", priority="high")
-                                            self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
+                                            _skip_info = {
+                                                "hr_rsi":   pos.get("hr_rsi"),
+                                                "rsi_cur":  info.get("rsi_cur"),
+                                                "rsi_prev": info.get("rsi_prev"),
+                                            }
+                                            self.save_sim_data(asset, current_bucket*1000, signal_candles, _skip_info,
                                                                "HOLD", position=dict(pos),
                                                                balance_at_decision=self.state.get("balance",0),
                                                                contracts_at_decision=pos.get("contracts",0))
@@ -734,13 +739,25 @@ class TradingSystem:
                                         exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
                                     pnl_net = self.exit_position(asset, exit_price, "RSI_EXIT", cur_cfm)
                                     if pnl_net is not None:
-                                        self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
+                                        _exit_info = {
+                                            "hr_rsi":   pos.get("hr_rsi"),
+                                            "rsi_cur":  info.get("rsi_cur"),
+                                            "rsi_prev": info.get("rsi_prev"),
+                                            "exit_rsi": pos.get("exit_rsi", RSI_EXIT),
+                                        }
+                                        self.save_sim_data(asset, current_bucket*1000, signal_candles, _exit_info,
                                                            "EXIT_RSI", position=dict(pos), pnl_net=pnl_net,
                                                            balance_at_decision=self.state.get("balance",0),
                                                            contracts_at_decision=pos.get("contracts",0))
                                     self.skip_entry[asset] = 0
                                 else:
-                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, {},
+                                    _hold_info = {
+                                        "hr_rsi":   pos.get("hr_rsi"),
+                                        "rsi_cur":  info.get("rsi_cur"),
+                                        "rsi_prev": info.get("rsi_prev"),
+                                        "exit_rsi": pos.get("exit_rsi", RSI_EXIT),
+                                    }
+                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, _hold_info,
                                                        "HOLD", position=dict(pos),
                                                        balance_at_decision=self.state.get("balance",0),
                                                        contracts_at_decision=pos.get("contracts",0))
@@ -891,7 +908,7 @@ class TradingSystem:
                         # Contract sizing
                         _cs  = ASSETS[_a]["contract"]
                         _mr  = ASSETS[_a]["margin_rate"]
-                        _bp_val = (_fb["buying_power"] if _fb else _bal) if not PAPER_MODE else _bal
+                        _bp_val = _bal if PAPER_MODE else (_fb["buying_power"] if _fb else _bal)
                         _avail = _bp_val * 0.70 / len(ASSET_NAMES)
                         _mp    = float(_c[-1]["c"]) * _cs * _mr if _c else 0
                         _cts   = min(MAX_CONTRACTS, max(0, int(_avail / _mp))) if _mp > 0 else 0
