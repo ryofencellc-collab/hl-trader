@@ -1,976 +1,116 @@
 """
-AP3X 1.0
+AP3X 2.0
 ═══════════════════════════════════════════════════════════════════
-Autonomous Crypto Trading — XRP + XLM — RSI Momentum Strategy
+Grid Trading — XRP + SOL — Paper Mode
+Two completely independent grid systems
 
-THREE ISOLATED SYSTEMS — paper test with real bid/ask fills
-S1 CFM only | S2 INTX only | S3 SmartHybrid
-Paper mode: fills at real Coinbase bid/ask — 1:1 with live
-Live mode:  fills at actual Coinbase order fill price — exact match
-Execution always on CFM regardless of signal source
+S4 — XRP Grid  | XPP-20DEC30-CDE | $0.15 spacing | 50 levels
+S5 — SOL Grid  | SLP-20DEC30-CDE | $7.00 spacing | 40 levels
 
-Strategy:
-  RSI(2) on 15min candles + 1hr RSI(14) MTF filter (resampled) + Trailing Exit
-  LONG:  RSI(2) crosses ABOVE 70 AND 1hr RSI(14) resampled > 50
-  SHORT: RSI(2) crosses BELOW 30 AND 1hr RSI(14) resampled < 50
-  EXIT:  RSI drops below 55 (or 70 if RSI hit 80 — trailing tighten)
+Each system:
+  - Completely isolated state, fills, candles, logs
+  - Buys at grid level, sells at EXACT next level (no holding)
+  - Recenters on price breakout (closes all positions at market)
+  - Trend bias: 3x contracts (strong up), 2x (moderate), 1x (neutral/down)
+  - 1hr EMA20/50/200 for trend detection
+  - 300 hourly candles kept for EMA warmup
 
-Parameters confirmed by full 11,520-combo sweep Sep 5 2026:
-  RSI(2/70/55/80→70) | close[-2] entry/exit | cooldown=0
-  XLM backtest: $10,696/mo | 86.1% WR | 38/38 green weeks
-  XRP backtest: $5,085/mo  | 71.9% WR | 37/37 green weeks
-  Combined:     $9,700/mo avg (INTX) | $9,869/mo (Hybrid)
+Contract specs (verified from Coinbase live API):
+  XRP:  500 XRP/contract | 20.01% intraday margin | XPP-20DEC30-CDE
+  SOL:  5 SOL/contract   | 20.00% intraday margin | SLP-20DEC30-CDE
 
-Assets:
-  XRP (XPP-20DEC30-CDE) — 500 XRP/contract | 20.01% intraday margin
-  XLM (XLP-20DEC30-CDE) — 5000 XLM/contract | 25.00% intraday margin
-
-Fees confirmed from real fills:
+Fees (confirmed from real Coinbase fills):
   0.080% taker per side + $0.12 flat per contract per side
 
-Railway variables:
-  CB_API_KEY, CB_API_SECRET
-  TRADE_MODE    — paper or live (default: paper)
-  MAX_CONTRACTS — per asset per system (default: 5)
-  PAPER_BALANCE — starting balance per system (default: 2000)
-  APP_PASSWORD  — dashboard password (default: 3757)
-  NTFY_TOPIC    — push notification topic
-  KILL_SWITCH   — set true to close all positions and stop (default: false)
+Files saved per system (all in /tmp):
+  grid_state_s{N}.json   — live state (balance, pnl, grid, open buys)
+  grid_fills_s{N}.json   — every fill ever (permanent record for sim analysis)
+  grid_candles_s{N}.json — 300 1hr close prices (EMA history)
+  grid_log_s{N}.txt      — full text log of every event
 
-CHECKLIST — triple checked before push:
-  ✅ Version = AP3X 1.0
-  ✅ RSI_PERIOD = 2
-  ✅ RSI_ENTRY = 70
-  ✅ RSI_EXIT = 55
-  ✅ RSI_TRAIL_TRIG = 80
-  ✅ RSI_TRAIL_EXIT = 70 (optimal from 11,520-combo sweep)
-  ✅ SHORT entry: RSI crosses BELOW 30 (100-RSI_ENTRY)
-  ✅ SHORT trail: tighten when RSI < 20 (100-RSI_TRAIL_TRIG)
-  ✅ SHORT trail exit: RSI rises above 30 (100-RSI_TRAIL_EXIT)
-  ✅ SHORT standard exit: RSI rises above 45 (100-RSI_EXIT)
-  ✅ XRP margin = 0.2001
-  ✅ XLM margin = 0.2500
-  ✅ Fees = 0.080% + $0.12/ct/side
-  ✅ CANDLE_LIMIT = 300
-  ✅ System 1 uses CFM candles only — no INTX
-  ✅ System 2 uses INTX candles only — no CFM for signals
-  ✅ System 3 SmartHybrid: XRP→INTX primary, XLM→CFM primary
-  ✅ All 3 execute orders on CFM — execution always CFM
-  ✅ S3 merge: CFM wins on overlap, INTX fills gaps only — confirmed zero P&L impact
-  ✅ Paper fills at real Coinbase bid/ask — 1:1 with live
-  ✅ Live fills use actual Coinbase fill price from order response
-  ✅ Fees use actual Coinbase total_fees from order response
-  ✅ Each system has own sim data file (/tmp/cb_sim_s1.json etc)
-  ✅ Each system has own diagnostic file
-  ✅ Each system has own state file
-  ✅ Each system has own tax CSV
-  ✅ hr_rsi computed BEFORE evaluate_signal
-  ✅ MTF blocks trade when hr_rsi is None
-  ✅ Forming candle check: volume-based (not age-based) — INTX compatible
-  ✅ Startup cache per system — only caches own source candles
-  ✅ System 1 cache: pure CFM only
-  ✅ System 2 cache: pure INTX only
-  ✅ System 3 cache: hybrid (CFM+INTX merged, CFM wins)
-  ✅ pnl saved = NET after fees
-  ✅ Entry at CFM candles[-2]["c"] (close of last completed candle)
-  ✅ Exit at CFM candles[-2]["c"] (close of last completed candle)
-  ✅ Skip cooldown = 0 (immediate re-entry allowed)
-  ✅ Startup deferred to @app.before_request
-  ✅ State file = cb_state_ap3x_s{N}.json per system
-  ✅ No 1hr strategy anywhere
-  ✅ No dead code
-  ✅ All 3 systems isolated — separate state, positions, balance
-  ✅ Sim-data endpoints for all 3 systems
-  ✅ Dashboard version = AP3X 1.0
-  ✅ Kill switch = KILL_SWITCH env var
-  ✅ APP_PASSWORD env var for dashboard
-  ✅ All 12 error conditions send ntfy alerts
-  ✅ Weekly report sent BEFORE weekly_pnl reset
+Routes:
+  /                       — dashboard (password protected)
+  /health                 — health JSON
+  /grid-state-s{4,5}     — live state JSON
+  /grid-fills-s{4,5}     — all fills JSON
+  /grid-candles-s{4,5}   — 1hr price history JSON
+  /grid-log-s{4,5}       — log tail
+
+Railway env vars:
+  CB_API_KEY, CB_API_SECRET  — Coinbase API credentials
+  PAPER_BALANCE              — starting capital per system (default: 2000)
+  APP_PASSWORD               — dashboard password (default: 3757)
+  NTFY_TOPIC                 — push notification topic
+
+CHECKLIST — verified before push:
+  ✅ S4 = XRP | XPP-20DEC30-CDE | 500 XRP | 20.01% margin | $0.15 spacing | 50 levels
+  ✅ S5 = SOL | SLP-20DEC30-CDE | 5 SOL   | 20.00% margin | $7.00 spacing | 40 levels
+  ✅ Fee = 0.080% per side + $0.12 flat per contract per side
+  ✅ Exit at EXACT next grid level — not market price
+  ✅ Breakout close at market — recenter grid
+  ✅ Trend bias from EMA20/50/200 on 1hr candles
+  ✅ 300 1hr candles kept — enough for EMA200 warmup
+  ✅ Every fill appended to grid_fills_s{N}.json immediately
+  ✅ State saved after every action
+  ✅ Candles saved every hour
+  ✅ Completely isolated — S4 never touches S5 files or state
+  ✅ Separate threading locks per system
+  ✅ Separate Coinbase price fetches per system
+  ✅ All files unique paths — no shared /tmp files
+  ✅ Dashboard shows both systems side by side
+  ✅ Monthly P&L tracked and shown
+  ✅ Weekly P&L tracked and shown
+  ✅ Loop errors counted and shown
+  ✅ ntfy alerts on every fill and error
+  ✅ Health endpoint returns JSON status for Railway monitoring
+  ✅ No RSI code — completely removed from v1
+  ✅ No S1/S2/S3 — completely removed from v1
 """
 
-import time, os, json, csv, uuid, threading
+import time, os, json, threading
 from datetime import datetime, timezone, timedelta
 from flask import Flask, Response, request, redirect
 import requests as req
 
 # ══════════════════════════════════════════════════════════════════
-# SHARED CONFIG — same across all 3 systems
+# CONFIG
 # ══════════════════════════════════════════════════════════════════
-TRADE_MODE  = os.environ.get("TRADE_MODE", "paper").lower().strip()
-PAPER_MODE  = (TRADE_MODE != "live")
+CB_API_KEY  = os.environ.get("CB_API_KEY", "")
+CB_API_SEC  = os.environ.get("CB_API_SECRET", "")
+if not CB_API_KEY or not CB_API_SEC:
+    raise RuntimeError("CB_API_KEY and CB_API_SECRET must be set in Railway env vars")
+
 NTFY_TOPIC  = os.environ.get("NTFY_TOPIC", "hl-trader-lunchm0ney")
 NTFY_URL    = f"https://ntfy.sh/{NTFY_TOPIC}"
-
-CB_API_KEY = os.environ.get("CB_API_KEY", "")
-CB_API_SEC = os.environ.get("CB_API_SECRET", "")
-if not CB_API_KEY or not CB_API_SEC:
-    raise RuntimeError("CB_API_KEY and CB_API_SECRET must be set")
-
-ASSETS = {
-    "XRP": {"perp": "XPP-20DEC30-CDE", "intx": "XRP-PERP", "contract": 500.0,  "margin_rate": 0.2001},
-    "XLM": {"perp": "XLP-20DEC30-CDE", "intx": "XLM-PERP", "contract": 5000.0, "margin_rate": 0.2500},
-}
-ASSET_NAMES = list(ASSETS.keys())
-
-FEE_PCT   = 0.00080
-FEE_FLAT  = 0.12
-
-MAX_CONTRACTS = int(os.environ.get("MAX_CONTRACTS", "5"))
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "3757")
 PAPER_BALANCE = float(os.environ.get("PAPER_BALANCE", "2000"))
 
-RSI_PERIOD     = 2
-RSI_ENTRY      = 70
-RSI_EXIT       = 55
-RSI_TRAIL_TRIG = 80
-RSI_TRAIL_EXIT = 70   # optimal from full 11,520-combo sweep Sep 5 2026
-
-CANDLE_TF    = "FIFTEEN_MINUTE"
-CANDLE_LIMIT = 300
-
-# ══════════════════════════════════════════════════════════════════
-# SYSTEM CLASS — one instance per candle source
-# Each instance is completely isolated from the others.
-# ══════════════════════════════════════════════════════════════════
-class TradingSystem:
-    def __init__(self, sys_id, label, source):
-        """
-        sys_id: 1, 2, or 3
-        label:  "CFM only", "INTX only", "Hybrid"
-        source: "cfm", "intx", "hybrid"
-        """
-        self.sys_id = sys_id
-        self.label  = label
-        self.source = source  # "cfm", "intx", "hybrid"
-
-        # Files — unique per system
-        self.data_file  = f"/tmp/cb_sim_s{sys_id}.json"
-        self.diag_file  = f"/tmp/cb_diag_s{sys_id}.json"
-        self.state_file = f"/tmp/cb_state_ap3x_s{sys_id}.json"
-        self.tax_file   = f"/tmp/cb_trades_s{sys_id}.csv"
-
-        # Isolated state
-        self.state = {
-            "balance": 0.0, "buying_power": 0.0,  # set to real Coinbase buying power in run()
-            "weekly_pnl": 0.0, "total_pnl": 0.0,
-            "week": None, "cycle": 0,
-            "loop_last_run": "never", "loop_errors": 0,
-            "wins": 0, "total_trades": 0, "entries": 0,
-            "skipped_assets": [], "audit": [],
-        }
-
-        # Isolated positions and skip counters
-        self.positions   = {}
-        self.skip_entry  = {}
-
-        # Isolated locks
-        self.lock     = threading.Lock()
-        self.sim_lock = threading.Lock()
-
-        # Isolated candle cache
-        self.startup_cache    = {}   # pre-loaded candles on startup
-        self.intx_cache       = {}   # INTX candles cached per bucket
-        self.intx_cache_ts    = {}   # timestamp of last INTX fetch
-
-        self.total_usdc = 0.0  # set to real Coinbase buying power in run()
-
-    # ── State persistence ─────────────────────────────────────────
-    def save_state(self):
-        try:
-            with self.lock:
-                safe = {k: v for k, v in self.state.items()
-                        if isinstance(v, (int, float, str, bool, type(None)))}
-            tmp = self.state_file + ".tmp"
-            json.dump(safe, open(tmp, "w"))
-            os.replace(tmp, self.state_file)
-        except Exception as e:
-            log(f"[S{self.sys_id}] State save error: {e}")
-            ntfy(f"⚠️ STATE SAVE ERROR S{self.sys_id}", str(e), priority="urgent")
-
-    def load_state(self):
-        if not os.path.exists(self.state_file):
-            return
-        try:
-            data = json.load(open(self.state_file))
-            with self.lock:
-                for k, v in data.items():
-                    if k in self.state:
-                        self.state[k] = v
-            log(f"[S{self.sys_id}] State restored | trades={self.state['total_trades']} pnl=${self.state['total_pnl']:+.2f}")
-        except Exception as e:
-            log(f"[S{self.sys_id}] State load error: {e}")
-            ntfy(f"⚠️ STATE LOAD ERROR S{self.sys_id}", str(e), priority="urgent")
-
-    # ── Audit ─────────────────────────────────────────────────────
-    def add_audit(self, asset, event, detail, candle=None, indicators=None):
-        entry = {"time": ts(), "asset": asset, "event": event, "detail": detail, "sys": self.sys_id}
-        if candle:     entry["candle"]     = candle
-        if indicators: entry["indicators"] = indicators
-        with self.lock:
-            self.state["audit"].insert(0, entry)
-            if len(self.state["audit"]) > 1000:
-                self.state["audit"] = self.state["audit"][:1000]
-        try:
-            data = json.load(open(self.diag_file)) if os.path.exists(self.diag_file) else []
-            data.insert(0, entry)
-            if len(data) > 3000: data = data[:3000]
-            json.dump(data, open(self.diag_file, "w"))
-        except:
-            pass
-        if not any(n in event for n in ["NO_SIGNAL", "CYCLE"]):
-            log(f"[S{self.sys_id}:{asset}] {event} — {detail[:80]}")
-
-    def check_weekly_reset(self):
-        wk = get_week()
-        with self.lock:
-            if self.state["week"] != wk:
-                self.state["week"] = wk
-                self.state["weekly_pnl"] = 0.0
-
-    # ── Sim data saver ────────────────────────────────────────────
-    def save_sim_data(self, asset, bucket_ts, candles, indicators, decision,
-                      position=None, pnl_net=None,
-                      balance_at_decision=None, contracts_at_decision=None):
-        try:
-            now_ms = int(time.time()) * 1000
-            age    = round((now_ms - candles[-1]["ts"]) / 60000, 1) if candles else None
-            rsi_cur  = indicators.get("rsi_cur")  if isinstance(indicators, dict) else None
-            rsi_prev = indicators.get("rsi_prev") if isinstance(indicators, dict) else None
-            hr_rsi   = indicators.get("hr_rsi")   if isinstance(indicators, dict) else None
-
-            if (rsi_cur is None or rsi_prev is None) and candles and len(candles) >= RSI_PERIOD + 3:
-                rsi_vals = calc_rsi([float(c["c"]) for c in candles[-50:]], RSI_PERIOD)
-                if len(rsi_vals) >= 2 and rsi_vals[-2] is not None:
-                    rsi_cur = round(rsi_vals[-2], 2)
-                if len(rsi_vals) >= 3 and rsi_vals[-3] is not None:
-                    rsi_prev = round(rsi_vals[-3], 2)
-
-            record = {
-                "ts":       bucket_ts,
-                "dt":       datetime.fromtimestamp(bucket_ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "asset":    asset,
-                "system":   self.sys_id,
-                "source":   self.source,
-                "decision": decision,
-                "candles":  candles[-50:] if isinstance(candles, list) else [],
-                "rsi_cur":  rsi_cur,
-                "rsi_prev": rsi_prev,
-                "hr_rsi":   hr_rsi,
-                "candle_age_min":        age,
-                "balance_at_decision":   balance_at_decision if balance_at_decision is not None else self.state.get("balance", 0),
-                "contracts_at_decision": contracts_at_decision,
-                "indicators": indicators if isinstance(indicators, dict) else {},
-                "position": {
-                    "direction":  position.get("direction"),
-                    "entry":      position.get("entry"),
-                    "contracts":  position.get("contracts"),
-                    "size":       position.get("size"),
-                    "exit_rsi":   position.get("exit_rsi", RSI_EXIT),
-                    "entry_time": position.get("entry_time"),
-                } if isinstance(position, dict) else None,
-                "pnl": pnl_net,  # NET after fees
-            }
-
-            with self.sim_lock:
-                try:
-                    existing = json.load(open(self.data_file))
-                    if not isinstance(existing, list): existing = []
-                except:
-                    existing = []
-                existing.append(record)
-                if len(existing) > 5000:
-                    existing = existing[-5000:]
-                tmp = self.data_file + ".tmp"
-                with open(tmp, "w") as f:
-                    json.dump(existing, f)
-                os.replace(tmp, self.data_file)
-        except Exception as e:
-            log(f"[S{self.sys_id}] sim_data error: {e}")
-
-    def record_tax(self, asset, direction, entry_p, exit_p, size, pnl, entry_time):
-        try:
-            tax = round(pnl * 0.35, 4) if pnl > 0 else 0.0
-            row = {
-                "exit_time": ts(), "entry_time": entry_time, "asset": asset,
-                "system": self.sys_id, "source": self.source,
-                "direction": direction,
-                "entry_price": f"{entry_p:.6f}", "exit_price": f"{exit_p:.6f}",
-                "size": f"{size}", "gross_pnl": f"{pnl:.4f}",
-                "tax_35pct": f"{tax:.4f}", "net_pnl": f"{pnl - tax:.4f}",
-            }
-            write_header = not os.path.exists(self.tax_file)
-            with open(self.tax_file, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=row.keys())
-                if write_header: w.writeheader()
-                w.writerow(row)
-        except Exception as e:
-            log(f"[S{self.sys_id}] Tax error: {e}")
-
-    # ── Candle fetching ───────────────────────────────────────────
-    def fetch_cfm_candles(self, asset, n=CANDLE_LIMIT):
-        """Fetch CFM candles. Always tagged source='cfm'."""
-        try:
-            client     = get_cb_client()
-            product_id = ASSETS[asset]["perp"]
-            end        = int(time.time())
-            start      = end - n * 900
-
-            def _do():
-                r = client.get_candles(product_id, start=str(start), end=str(end), granularity=CANDLE_TF)
-                if not r.candles: raise ValueError("0 candles")
-                return r
-
-            resp = fetch_with_retry(_do, asset, self.sys_id)
-            if resp is None: return None
-
-            candles = sorted([{
-                "ts": int(c.start) * 1000,
-                "dt": datetime.fromtimestamp(int(c.start), tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "o": float(c.open), "h": float(c.high),
-                "l": float(c.low),  "c": float(c.close), "v": float(c.volume),
-                "source": "cfm",
-            } for c in resp.candles], key=lambda x: x["ts"])[-n:]
-
-            if not candles or candles[-1]["c"] == 0: return None
-            return candles
-        except Exception as e:
-            log(f"[S{self.sys_id}] CFM fetch {asset}: {e}")
-            ntfy(f"⚠️ CFM FETCH ERROR S{self.sys_id} {asset}", str(e), priority="high")
-            return None
-
-    def fetch_intx_candles(self, asset, n=CANDLE_LIMIT):
-        """Fetch INTX candles. Cached per bucket. Tagged source='intx'."""
-        now = int(time.time())
-        if asset in self.intx_cache_ts and now - self.intx_cache_ts[asset] < 840:
-            return self.intx_cache.get(asset)
-
-        sym = ASSETS[asset]["intx"]
-        try:
-            end_dt   = datetime.fromtimestamp(now, tz=timezone.utc)
-            start_dt = datetime.fromtimestamp(now - n * 900, tz=timezone.utc)
-            r = req.get(
-                f"https://api.international.coinbase.com/api/v1/instruments/{sym}/candles",
-                params={"granularity": "FIFTEEN_MINUTE",
-                        "start": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "end":   end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")},
-                timeout=8)
-            if r.status_code == 200:
-                aggs = r.json().get("aggregations", [])
-                if aggs:
-                    candles = sorted([{
-                        "ts":  int(datetime.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")
-                                   .replace(tzinfo=timezone.utc).timestamp() * 1000),
-                        "dt":  c["start"],
-                        "o":   float(c["open"]),  "h": float(c["high"]),
-                        "l":   float(c["low"]),   "c": float(c["close"]),
-                        "v":   float(c["volume"]), "source": "intx",
-                    } for c in aggs], key=lambda x: x["ts"])[-n:]
-                    self.intx_cache[asset]    = candles
-                    self.intx_cache_ts[asset] = now
-                    return candles
-        except Exception as e:
-            log(f"[S{self.sys_id}] INTX fetch {asset}: {e}")
-            ntfy(f"⚠️ INTX FETCH ERROR S{self.sys_id} {asset}", str(e), priority="high")
-        return self.intx_cache.get(asset)
-
-    def get_signal_candles(self, asset, cfm_candles, intx_candles):
-        """
-        Return the correct candle set for this system's signal calculation.
-        System 1: CFM only
-        System 2: INTX only
-        System 3: Hybrid (CFM primary, INTX fills gaps)
-
-        Cache update: only update startup cache with own source candles.
-        System 1: cache from pure CFM
-        System 2: cache from pure INTX
-        System 3: cache from hybrid merge
-        """
-        if self.source == "cfm":
-            candles = cfm_candles
-            # Fallback to startup cache if CFM too thin
-            if len(candles or []) < 100 and asset in self.startup_cache:
-                cached   = self.startup_cache[asset]
-                combined = merge_cfm_intx(cached, candles or [])
-                if len(combined) > len(candles or []):
-                    candles = combined
-            # Update cache with pure CFM only
-            if cfm_candles and len(cfm_candles) >= 100:
-                self.startup_cache[asset] = cfm_candles[-CANDLE_LIMIT:]
-
-        elif self.source == "intx":
-            candles = intx_candles
-            # Fallback to startup cache if INTX too thin
-            if len(candles or []) < 100 and asset in self.startup_cache:
-                cached   = self.startup_cache[asset]
-                if candles:
-                    im = {c["ts"]: c for c in candles}
-                    cm = {c["ts"]: c for c in cached}
-                    all_ts = sorted(set(im) | set(cm))
-                    combined = [im[t] if t in im else cm[t] for t in all_ts]
-                else:
-                    combined = cached
-                if len(combined) > len(candles or []):
-                    candles = combined
-            # Update cache with pure INTX only
-            if intx_candles and len(intx_candles) >= 100:
-                self.startup_cache[asset] = intx_candles[-CANDLE_LIMIT:]
-
-        else:  # hybrid — per-asset source preference
-            # XRP: INTX has 0 gaps, CFM has 2.73% — prefer INTX primary
-            # XLM: CFM has 10.3% gaps, INTX has 20.7% — prefer CFM primary
-            # Confirmed from gap_timing_analysis_v1.py Sep 7 2026
-            INTX_PREFERRED = {"XRP"}   # INTX has cleaner data for these
-            CFM_PREFERRED  = {"XLM"}   # CFM has cleaner data for these
-
-            if asset in INTX_PREFERRED:
-                # INTX primary, CFM fills INTX gaps
-                base    = intx_candles or []
-                filler  = cfm_candles  or []
-                im = {c["ts"]: c for c in base}
-                cm = {c["ts"]: c for c in filler}
-                merged_ts = sorted(set(im) | set(cm))
-                candles   = [im[t] if t in im else cm[t] for t in merged_ts]
-            else:
-                # CFM primary, INTX fills CFM gaps
-                candles = merge_cfm_intx(cfm_candles, intx_candles)
-
-            # Fallback to startup cache if hybrid too thin
-            if len(candles or []) < 100 and asset in self.startup_cache:
-                cached   = self.startup_cache[asset]
-                combined = merge_cfm_intx(cached, candles or [])
-                if len(combined) > len(candles or []):
-                    candles = combined
-            # Update cache with hybrid (merged)
-            if candles and len(candles) >= 100:
-                self.startup_cache[asset] = candles[-CANDLE_LIMIT:]
-
-        return candles
-
-    # ── Enter / Exit ──────────────────────────────────────────────
-    def enter_position(self, asset, direction, entry_price, candle, info=None):
-        """
-        Enter position. Entry price always = CFM candle open.
-        Sizing: 70% of own balance / N assets / margin rate.
-        """
-        cs  = ASSETS[asset]["contract"]
-        mr  = ASSETS[asset]["margin_rate"]
-
-        # Paper: uses internal $2,000 balance (grows/shrinks with trades)
-        # Live:  uses real Coinbase buying power
-        if PAPER_MODE:
-            with self.lock:
-                current_bal = self.state["balance"]
-        else:
-            _fb = get_futures_balance()
-            current_bal = _fb["buying_power"] if _fb else get_real_balance() or self.total_usdc
-
-        per_slot       = (current_bal * 0.70) / len(ASSET_NAMES)
-        margin_per     = entry_price * cs * mr
-        max_affordable = min(MAX_CONTRACTS, max(1, int(per_slot / margin_per))) if margin_per > 0 else 1
-        contracts      = max_affordable
-        side           = "BUY" if direction == "LONG" else "SELL"
-
-        oid, actual_cts, fill_price, fill_fee_entry = place_market_order(asset, side, contracts)
-        if not oid:
-            msg = f"S{self.sys_id} {asset} {side} {contracts}ct rejected"
-            log(f"CRITICAL: {msg}")
-            self.add_audit(asset, "ORDER REJECTED", msg)
-            ntfy(f"ORDER REJECTED S{self.sys_id} {asset}", msg, priority="urgent")
-            return
-
-        # Use actual fill price from Coinbase order response
-        # In live mode this should always be available — alert if missing
-        if fill_price and fill_price > 0:
-            entry_price = fill_price
-            log(f"[S{self.sys_id}] ✅ Real fill price entry: ${entry_price:.6f}")
-        elif not PAPER_MODE:
-            log(f"[S{self.sys_id}] ⚠️ {asset}: real fill price unavailable — using candle estimate")
-            ntfy(f"⚠️ FILL PRICE MISSING S{self.sys_id} {asset}", "Using candle estimate for entry — check Coinbase", priority="high")
-
-        actual_size = actual_cts * cs
-        rsi_info    = info or {}
-        self.positions[asset] = {
-            "direction":      direction,
-            "entry":          entry_price,
-            "contracts":      actual_cts,
-            "size":           actual_size,
-            "strategy":       "RSI-Mom",
-            "entry_time":     ts(),
-            "rsi_entry":      rsi_info.get("rsi_cur", 0),
-            "exit_rsi":       RSI_EXIT,
-            "hr_rsi":         rsi_info.get("hr_rsi", None),
-            "paper":          PAPER_MODE,
-            "unrealized_pnl": 0.0,
-            "current_price":  entry_price,
-            "entry_fee":      fill_fee_entry,  # real Coinbase fee or None
-        }
-        with self.lock:
-            self.state["entries"] = self.state.get("entries", 0) + 1
-            self.state["buying_power"] = self.state.get("buying_power", self.state["balance"]) - entry_price * actual_size * mr
-
-        mode_label = "PAPER" if PAPER_MODE else "LIVE"
-        self.add_audit(asset, f"📊 ENTER {direction}",
-                       f"S{self.sys_id}({self.source}) | entry=${entry_price:,.4f} | "
-                       f"rsi={rsi_info.get('rsi_cur',0):.1f} | {actual_cts}ct | "
-                       f"hr={rsi_info.get('hr_rsi','?')} | {mode_label}",
-                       candle=candle)
-        ntfy(f"{'📄' if PAPER_MODE else '📊'} ENTER {direction} {asset} [S{self.sys_id}]",
-             f"{self.source} | entry=${entry_price:,.4f} | RSI={rsi_info.get('rsi_cur',0):.1f} | {actual_cts}ct",
-             priority="default")
-
-    def exit_position(self, asset, exit_price, exit_reason, candle):
-        """
-        Exit position. Exit price always = CFM candle open.
-        Returns net P&L (gross minus fees) for sim recording.
-        """
-        pos = self.positions.get(asset)
-        if not pos: return None
-
-        side = "SELL" if pos["direction"] == "LONG" else "BUY"
-        oid, _, fill_price, fill_fee_exit = place_market_order(asset, side, pos["contracts"])
-        if not oid and not PAPER_MODE:
-            log(f"[S{self.sys_id}] EXIT FAILED {asset} — retrying next bucket")
-            ntfy(f"⚠️ EXIT FAILED S{self.sys_id} {asset}", "Position preserved, will retry", priority="urgent")
-            return None
-
-        # Use actual fill price from Coinbase order response
-        # In live mode this should always be available — alert if missing
-        if fill_price and fill_price > 0:
-            exit_price = fill_price
-            log(f"[S{self.sys_id}] ✅ Real fill price exit: ${exit_price:.6f}")
-        elif not PAPER_MODE:
-            log(f"[S{self.sys_id}] ⚠️ {asset}: real fill price unavailable — using candle estimate")
-            ntfy(f"⚠️ FILL PRICE MISSING S{self.sys_id} {asset}", "Using candle estimate for exit — check Coinbase", priority="high")
-
-        # Recalculate P&L with actual prices and actual fees
-        gross = round(
-            (exit_price - pos["entry"]) * pos["size"] if pos["direction"] == "LONG"
-            else (pos["entry"] - exit_price) * pos["size"], 4)
-        # Use real Coinbase fees if available, otherwise calculate
-        # Fees — use real Coinbase fees, alert if missing in live mode
-        entry_fee = pos.get("entry_fee")
-        if not entry_fee:
-            entry_fee = round(pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
-            if not PAPER_MODE:
-                ntfy(f"⚠️ FEE MISSING S{self.sys_id} {asset}", "Using formula estimate for entry fee — check Coinbase", priority="high")
-        exit_fee = fill_fee_exit
-        if not exit_fee:
-            exit_fee = round(exit_price * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"], 4)
-            if not PAPER_MODE:
-                ntfy(f"⚠️ FEE MISSING S{self.sys_id} {asset}", "Using formula estimate for exit fee — check Coinbase", priority="high")
-        total_fee = round(entry_fee + exit_fee, 4)
-        pnl       = round(gross - total_fee, 4)
-
-        self.record_tax(asset, pos["direction"], pos["entry"], exit_price, pos["size"], pnl, pos["entry_time"])
-
-        with self.lock:
-            self.state["total_pnl"]    = round(self.state["total_pnl"] + pnl, 4)
-            self.state["weekly_pnl"]   = round(self.state["weekly_pnl"] + pnl, 4)
-            self.state["balance"]      = round(self.state["balance"] + pnl, 4)
-            self.state["total_trades"] += 1
-            if pnl >= 0: self.state["wins"] += 1
-
-        del self.positions[asset]
-
-        emoji = "✅" if pnl >= 0 else "❌"
-        self.add_audit(asset, f"{emoji} EXIT {exit_reason}",
-                       f"S{self.sys_id} {pos['direction']} ${pos['entry']:,.4f}→${exit_price:,.4f} | "
-                       f"gross=${gross:+,.4f} | fees=${total_fee:.4f} | net=${pnl:+,.4f}",
-                       candle=candle)
-        ntfy(f"{emoji} EXIT {asset} [S{self.sys_id}]",
-             f"{pos['direction']} | ${pos['entry']:,.4f}→${exit_price:,.4f} | net=${pnl:+,.2f} | {exit_reason}",
-             priority="default" if pnl >= 0 else "high")
-
-        if PAPER_MODE:
-            log(f"[S{self.sys_id}] Paper balance: ${self.state['balance']:,.2f}")
-
-        self.save_state()
-        return pnl
-
-    # ── Trading loop ──────────────────────────────────────────────
-    def run(self):
-        """
-        Main trading loop for this system.
-        Runs in its own daemon thread.
-        Completely blind to other systems.
-        """
-        # Paper: $2,000 per system (fake money, real bid/ask prices)
-        # Live:  real Coinbase buying power
-        if PAPER_MODE:
-            _start = 2000.0
-        else:
-            _fb = get_futures_balance()
-            _start = _fb["buying_power"] if _fb else get_real_balance() or 2000.0
-
-        self.state["balance"]      = _start
-        self.state["buying_power"] = _start
-        self.total_usdc            = _start
-        self.load_state()
-
-        _display_bal = self.state["balance"]
-        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | {'PAPER' if PAPER_MODE else 'LIVE'} ${_display_bal:,.2f}")
-        log(f"[S{self.sys_id}] Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
-        log(f"[S{self.sys_id}] Source: {self.source}")
-
-        last_bucket = (int(time.time()) // 900) * 900
-
-        while True:
-            try:
-                # Kill switch — check every loop
-                if os.environ.get("KILL_SWITCH","false").lower()=="true":
-                    log(f"[S{self.sys_id}] 🛑 KILL SWITCH ACTIVATED — closing all positions")
-                    ntfy(f"🛑 KILL SWITCH S{self.sys_id}", "Closing all positions and stopping", priority="urgent")
-                    for _asset, _pos in list(self.positions.items()):
-                        if _pos:
-                            _side = "SELL" if _pos["direction"]=="LONG" else "BUY"
-                            place_market_order(_asset, _side, _pos["contracts"])
-                            with self.lock:
-                                del self.positions[_asset]
-                    break
-
-                current_bucket = (int(time.time()) // 900) * 900
-                with self.lock:
-                    self.state["loop_last_run"] = ts()
-                    self.state["cycle"] = self.state.get("cycle", 0) + 1
-
-                self.check_weekly_reset()
-
-                if current_bucket != last_bucket:
-                    last_bucket   = current_bucket
-                    bucket_dt     = datetime.fromtimestamp(current_bucket, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-                    bucket_dt_obj = datetime.fromtimestamp(current_bucket, tz=timezone.utc)
-                    hour_utc      = bucket_dt_obj.hour
-
-                    log(f"[S{self.sys_id}] 🕐 {bucket_dt} UTC | open={len(self.positions)} | bal=${self.state['balance']:,.2f}")
-
-                    skipped_assets = []
-                    _candle_cache  = {}
-                    cycle_num = self.state.get("cycle", 0)
-
-                    for asset in ASSET_NAMES:
-                        try:
-                            info = {}  # ensure info is always defined in this scope
-                            # Always fetch both sources — system decides which to use
-                            cfm_candles  = self.fetch_cfm_candles(asset, n=CANDLE_LIMIT)
-                            intx_candles = self.fetch_intx_candles(asset, n=CANDLE_LIMIT)
-
-                            # Get signal candles for this system's source
-                            # Also handles startup cache fallback and cache update
-                            signal_candles = self.get_signal_candles(asset, cfm_candles, intx_candles)
-
-                            # CFM candles used for entry/exit price — always
-                            # If CFM is unavailable, skip this asset
-                            if not cfm_candles or len(cfm_candles) < RSI_PERIOD + 5:
-                                skipped_assets.append(asset)
-                                log(f"[S{self.sys_id}] ⚠️ {asset}: CFM unavailable — skipping (no execution possible)")
-                                if self.positions.get(asset):
-                                    ntfy(f"⚠️ GAP S{self.sys_id} {asset}", f"CFM unavailable — holding position, cannot exit", priority="urgent")
-                                else:
-                                    ntfy(f"⚠️ GAP S{self.sys_id} {asset}", f"CFM unavailable — watching only", priority="default")
-                                continue
-
-                            if not signal_candles or len(signal_candles) < RSI_PERIOD + 5:
-                                skipped_assets.append(asset)
-                                log(f"[S{self.sys_id}] ⚠️ {asset}: signal candles unavailable — skipping")
-                                ntfy(f"⚠️ NO CANDLES S{self.sys_id} {asset}", "Signal candles unavailable", priority="high")
-                                continue
-
-                            _candle_cache[asset] = signal_candles
-                            cur_cfm = cfm_candles[-1]  # CFM candle for price reference
-
-                            # ── FORMING CANDLE CHECK ───────────────────
-                            # Skip only if last candle is truly forming:
-                            # volume == 0 means no trades have occurred yet
-                            # high == low == open means price hasn't moved
-                            # Age-based check was over-triggering on INTX (which
-                            # publishes complete candles immediately at bucket open)
-                            last_sig    = signal_candles[-1]
-                            last_vol    = float(last_sig.get("v", 1))
-                            last_high   = float(last_sig.get("h", 0))
-                            last_low    = float(last_sig.get("l", 0))
-                            last_open   = float(last_sig.get("o", 0))
-                            is_forming  = (last_vol == 0 or
-                                          (last_high == last_low == last_open and last_vol < 0.01))
-                            if is_forming:
-                                self.save_sim_data(asset, current_bucket*1000, signal_candles,
-                                    {"reason": f"forming candle vol={last_vol} h={last_high} l={last_low}"},
-                                    f"SKIP_FORMING:vol={last_vol:.2f}")
-                                continue
-
-                            # Skip cooldown after exit
-                            if self.skip_entry.get(asset, 0) > 0:
-                                self.skip_entry[asset] -= 1
-                                continue
-
-                            # ── EXIT CHECK ────────────────────────────
-                            pos = self.positions.get(asset)
-                            if pos:
-                                # Unrealized P&L uses real bid/ask midpoint
-                                # No fallback — if unavailable use last signal candle close
-                                # (unrealized is display only, not used for trade decisions)
-                                _mid = get_real_fill_price(asset, "MID")
-                                cur_close = _mid if _mid else float(signal_candles[-1]["c"])
-                                gross_u   = (cur_close - pos["entry"]) * pos["size"] if pos["direction"] == "LONG" \
-                                            else (pos["entry"] - cur_close) * pos["size"]
-                                ef_u      = pos["entry"] * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"]
-                                xf_u      = cur_close   * pos["size"] * FEE_PCT + FEE_FLAT * pos["contracts"]
-                                pos["unrealized_pnl"] = round(gross_u - ef_u - xf_u, 4)
-                                pos["current_price"]  = cur_close
-
-                                if should_exit(pos, signal_candles):
-                                    # Exit price — paper uses real bid/ask, live uses actual fill
-                                    # No fallback — if price unavailable hold position and alert
-                                    if PAPER_MODE:
-                                        _exit_side = "BUY" if pos["direction"] == "SHORT" else "SELL"
-                                        exit_price = get_real_fill_price(asset, _exit_side)
-                                        if not exit_price:
-                                            log(f"[S{self.sys_id}] ⚠️ {asset}: bid/ask unavailable — holding position")
-                                            ntfy(f"⚠️ EXIT SKIPPED S{self.sys_id} {asset}", "bid/ask unavailable from Coinbase — holding position", priority="high")
-                                            _info_safe = info if isinstance(info, dict) else {}
-                                            _skip_info = {
-                                                "hr_rsi":   pos.get("hr_rsi"),
-                                                "rsi_cur":  _info_safe.get("rsi_cur"),
-                                                "rsi_prev": _info_safe.get("rsi_prev"),
-                                            }
-                                            self.save_sim_data(asset, current_bucket*1000, signal_candles, _skip_info,
-                                                               "HOLD", position=dict(pos),
-                                                               balance_at_decision=self.state.get("balance",0),
-                                                               contracts_at_decision=pos.get("contracts",0))
-                                            continue
-                                    else:
-                                        exit_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
-                                    pnl_net = self.exit_position(asset, exit_price, "RSI_EXIT", cur_cfm)
-                                    if pnl_net is not None:
-                                        _info_safe = info if isinstance(info, dict) else {}
-                                        _exit_info = {
-                                            "hr_rsi":   pos.get("hr_rsi"),
-                                            "rsi_cur":  _info_safe.get("rsi_cur"),
-                                            "rsi_prev": _info_safe.get("rsi_prev"),
-                                            "exit_rsi": pos.get("exit_rsi", RSI_EXIT),
-                                        }
-                                        self.save_sim_data(asset, current_bucket*1000, signal_candles, _exit_info,
-                                                           "EXIT_RSI", position=dict(pos), pnl_net=pnl_net,
-                                                           balance_at_decision=self.state.get("balance",0),
-                                                           contracts_at_decision=pos.get("contracts",0))
-                                    self.skip_entry[asset] = 0
-                                else:
-                                    _info_safe = info if isinstance(info, dict) else {}
-                                    _hold_info = {
-                                        "hr_rsi":   pos.get("hr_rsi"),
-                                        "rsi_cur":  _info_safe.get("rsi_cur"),
-                                        "rsi_prev": _info_safe.get("rsi_prev"),
-                                        "exit_rsi": pos.get("exit_rsi", RSI_EXIT),
-                                    }
-                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, _hold_info,
-                                                       "HOLD", position=dict(pos),
-                                                       balance_at_decision=self.state.get("balance",0),
-                                                       contracts_at_decision=pos.get("contracts",0))
-                                continue
-
-                            # ── ENTRY SIGNAL ──────────────────────────
-                            # hr_rsi computed BEFORE evaluate_signal
-                            hr_rsi = get_hr_rsi(asset, signal_candles)
-
-                            d, _, _, info = evaluate_signal(signal_candles)
-                            info["hr_rsi"] = round(hr_rsi, 1) if hr_rsi is not None else None
-
-                            if d:
-                                # MTF filter
-                                if hr_rsi is None:
-                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, info,
-                                                       "NO_SIGNAL:MTF_not_ready")
-                                    continue
-                                if d == "LONG" and hr_rsi < 50:
-                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, info,
-                                                       f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}<50)")
-                                    continue
-                                if d == "SHORT" and hr_rsi > 50:
-                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, info,
-                                                       f"NO_SIGNAL:MTF_filter (1hr_RSI={hr_rsi:.1f}>50)")
-                                    continue
-
-                                self.add_audit(asset, f"🚨 RSI-Mom {d}",
-                                               f"S{self.sys_id}({self.source}) | "
-                                               f"prev={info.get('rsi_prev',0):.1f} cur={info.get('rsi_cur',0):.1f} | "
-                                               f"hr={hr_rsi:.1f}",
-                                               candle=cur_cfm, indicators=info)
-
-                                # Entry price — paper uses real bid/ask, live uses actual fill
-                                # No fallback — if price unavailable skip trade and alert
-                                if PAPER_MODE:
-                                    _side = "SELL" if d == "SHORT" else "BUY"
-                                    entry_price = get_real_fill_price(asset, _side)
-                                    if not entry_price:
-                                        log(f"[S{self.sys_id}] ⚠️ {asset}: bid/ask unavailable — skipping entry")
-                                        ntfy(f"⚠️ ENTRY SKIPPED S{self.sys_id} {asset}", "bid/ask unavailable from Coinbase", priority="high")
-                                        continue
-                                else:
-                                    entry_price = float(cfm_candles[-2]["c"]) if len(cfm_candles) >= 2 else float(cfm_candles[-1]["o"])
-                                self.enter_position(asset, d, entry_price, cur_cfm, info)
-
-                                if self.positions.get(asset):
-                                    _pos = self.positions[asset]
-                                    self.save_sim_data(asset, current_bucket*1000, signal_candles, info,
-                                                       f"ENTER_{d}", position=dict(_pos),
-                                                       balance_at_decision=self.state.get("balance",0),
-                                                       contracts_at_decision=_pos.get("contracts",0))
-                            else:
-                                self.save_sim_data(asset, current_bucket*1000, signal_candles, info,
-                                                   f"NO_SIGNAL:{info.get('fail','?')}",
-                                                   balance_at_decision=self.state.get("balance",0))
-
-                        except Exception as e:
-                            import traceback
-                            log(f"[S{self.sys_id}] Asset error {asset}: {e}")
-                            log(traceback.format_exc())
-                            ntfy(f"⚠️ ASSET ERROR S{self.sys_id} {asset}", str(e), priority="high")
-
-                    with self.lock:
-                        self.state["skipped_assets"] = skipped_assets
-
-                    if skipped_assets:
-                        log(f"[S{self.sys_id}] ⚠️ Skipped: {skipped_assets}")
-                        ntfy(f"⚠️ SKIPPED S{self.sys_id}", f"Assets skipped: {skipped_assets}", priority="high")
-
-                    if cycle_num % 10 == 0:
-                        self.save_state()
-
-                    # Heartbeat — full picture every bucket
-                    with self.lock:
-                        _bal    = self.state["balance"]
-                        _trades = self.state["total_trades"]
-                        _errs   = self.state.get("loop_errors", 0)
-
-                    # Account line — paper shows sim balance, live shows real Coinbase
-                    if PAPER_MODE:
-                        _bp   = f"${_bal:,.2f} (paper)"
-                        _mgn  = "N/A"
-                        _dpnl = f"${self.state.get('total_pnl',0):+,.2f}"
-                        _unrl = "N/A"
-                    else:
-                        _fb = get_futures_balance()
-                        _bp   = f"${_fb['buying_power']:,.2f}"    if _fb else "N/A"
-                        _mgn  = f"${_fb['initial_margin']:,.2f}"  if _fb else "N/A"
-                        _dpnl = f"${_fb['daily_pnl']:+,.2f}"      if _fb else "N/A"
-                        _unrl = f"${_fb['unrealized_pnl']:+,.2f}" if _fb else "N/A"
-
-                    hb_lines = [
-                        f"S{self.sys_id}({self.source}) | {bucket_dt} UTC | {'PAPER' if PAPER_MODE else 'LIVE'} | loop=ok | errors={_errs} | kill={os.environ.get('KILL_SWITCH','false')}",
-                        f"  Account: balance={_bp} | margin={_mgn} | pnl={_dpnl} | unrealized={_unrl}",
-                    ]
-
-                    for _a in ASSET_NAMES:
-                        _pos = self.positions.get(_a)
-                        _c   = _candle_cache.get(_a)
-                        _n   = len(_c) if _c else 0
-
-                        # Candle age
-                        _age = "?"
-                        _age_warn = ""
-                        if _c and _c[-1].get("ts"):
-                            _age_mins = round((int(time.time())*1000-_c[-1]["ts"])/60000,1)
-                            _age = f"{_age_mins}m"
-                            if _age_mins > 20:
-                                _age_warn = " ⚠️ STALE"
-                                ntfy(f"⚠️ STALE DATA S{self.sys_id} {_a}",
-                                     f"Last candle {_age_mins}min old — possible gap", priority="high")
-
-                        # Candle count status
-                        if _n < 5:
-                            _candle_status = f"❌ CRITICAL({_n}<5 need for RSI)"
-                            ntfy(f"❌ NO CANDLES S{self.sys_id} {_a}",
-                                 f"Only {_n} candles — RSI cannot calculate", priority="urgent")
-                        elif _n < 64:
-                            _candle_status = f"⚠️ {_n}(<64 need for hr_rsi)"
-                        else:
-                            _candle_status = f"✅{_n}"
-
-                        # RSI values
-                        _rsi_cur = _rsi_prev = "?"
-                        if _c and len(_c) >= RSI_PERIOD + 2:
-                            _closes   = [float(x["c"]) for x in _c]
-                            _rsi_vals = calc_rsi(_closes, RSI_PERIOD)
-                            if _rsi_vals[-2] is not None:
-                                _rsi_cur = f"{_rsi_vals[-2]:.1f}"
-                            if len(_rsi_vals) >= 3 and _rsi_vals[-3] is not None:
-                                _rsi_prev = f"{_rsi_vals[-3]:.1f}"
-
-                        # hr_rsi status
-                        _hr_val = get_hr_rsi(_a, _c)
-                        if _hr_val is not None:
-                            _hr = f"✅{_hr_val:.1f}"
-                        elif _n >= 64:
-                            _hr = "❌None(calc failed)"
-                            ntfy(f"❌ HR_RSI FAILED S{self.sys_id} {_a}",
-                                 f"Have {_n} candles but hr_rsi=None", priority="urgent")
-                        else:
-                            _hr = f"⚠️None(need 64 have {_n})"
-
-                        # Source tag for S3
-                        _src = _c[-1].get("source","?") if _c else "?"
-
-                        # Contract sizing
-                        _cs  = ASSETS[_a]["contract"]
-                        _mr  = ASSETS[_a]["margin_rate"]
-                        _bp_val = _bal if PAPER_MODE else (_fb["buying_power"] if _fb else _bal)
-                        _avail = _bp_val * 0.70 / len(ASSET_NAMES)
-                        _mp    = float(_c[-1]["c"]) * _cs * _mr if _c else 0
-                        _cts   = min(MAX_CONTRACTS, max(0, int(_avail / _mp))) if _mp > 0 else 0
-
-                        if _pos:
-                            _unreal = _pos.get("unrealized_pnl", 0.0)
-                            _exit_r = _pos.get("exit_rsi", RSI_EXIT)
-                            _locked = "🔒" if _exit_r == RSI_TRAIL_EXIT else ""
-                            hb_lines.append(
-                                f"  {_a:<4} {_pos['direction']:<5} | candles={_candle_status} | age={_age}{_age_warn} | "
-                                f"RSI={_rsi_prev}→{_rsi_cur} | hr={_hr} | src={_src} | "
-                                f"exit<{_exit_r}{_locked} | unreal=${_unreal:+.2f} | HOLD")
-                        else:
-                            hb_lines.append(
-                                f"  {_a:<4} {'—':<5} | candles={_candle_status} | age={_age}{_age_warn} | "
-                                f"RSI={_rsi_prev}→{_rsi_cur} | hr={_hr} | src={_src} | "
-                                f"cts={_cts} | WATCHING")
-
-                    for _line in hb_lines:
-                        log(_line)
-
-                    hb_detail = "\n".join(hb_lines)
-                    self.add_audit("SYSTEM", "💓 CYCLE", hb_detail)
-
-                    # Weekly report
-                    if bucket_dt_obj.weekday() == 0 and hour_utc == 9 and bucket_dt_obj.minute < 15 and not self.state.get("weekly_report_sent"):
-                        with self.lock:
-                            wpnl = self.state["weekly_pnl"]
-                            bal  = self.state["balance"]
-                            trd  = self.state["total_trades"]
-                            wr   = round(self.state["wins"] / trd * 100, 1) if trd else 0
-                        ntfy(f"📊 Weekly Report S{self.sys_id} ({self.source})",
-                             f"P&L: ${wpnl:+,.2f} | Bal: ${bal:,.2f} | Trades: {trd} | WR: {wr}%")
-                        with self.lock:
-                            self.state["weekly_report_sent"] = True
-                    # Reset weekly P&L and report flag on new week (check_weekly_reset handles week change)
-                    with self.lock:
-                        if not self.state.get("week") == get_week():
-                            self.state["weekly_pnl"] = 0.0
-                            self.state["weekly_report_sent"] = False
-
-                    # Emergency stop
-                    with self.lock: bal = self.state["balance"]
-                    _start_bal = self.total_usdc  # always real starting balance
-                    if bal < _start_bal * 0.5 and len(self.positions) == 0:
-                        ntfy(f"🚨 EMERGENCY S{self.sys_id}",
-                             f"Balance ${bal:,.2f} below 50% of starting ${_start_bal:,.2f}",
-                             priority="urgent")
-
-            except Exception as e:
-                with self.lock:
-                    self.state["loop_errors"] = self.state.get("loop_errors", 0) + 1
-                    errs = self.state["loop_errors"]
-                log(f"[S{self.sys_id}] Loop error {errs}: {e}")
-                if errs in (3, 10, 25):
-                    ntfy(f"CRITICAL S{self.sys_id} loop errors: {errs}",
-                         str(e)[:100], priority="urgent" if errs >= 10 else "high")
-
-            time.sleep(30)
+FEE_PCT  = 0.00080   # 0.080% taker per side — confirmed from real Coinbase fills
+FEE_FLAT = 0.12      # $0.12 flat per contract per side — confirmed from real Coinbase fills
+
+# Grid system configurations — verified from live Coinbase API Sep 15 2026
+GRID_CONFIGS = {
+    4: {
+        "label":      "XRP Grid",
+        "product_id": "XPP-20DEC30-CDE",
+        "contract":   500.0,    # 500 XRP per contract
+        "margin":     0.2001,   # 20.01% intraday margin
+        "spacing":    0.15,     # $0.15 between grid levels
+        "n_grids":    50,       # 25 below + 25 above center
+        "capital":    PAPER_BALANCE,
+        "color":      "#00B4D8",
+    },
+    5: {
+        "label":      "SOL Grid",
+        "product_id": "SLP-20DEC30-CDE",
+        "contract":   5.0,      # 5 SOL per contract
+        "margin":     0.20,     # 20.00% intraday margin
+        "spacing":    7.0,      # $7.00 between grid levels
+        "n_grids":    40,       # 20 below + 20 above center
+        "capital":    PAPER_BALANCE,
+        "color":      "#9B5DE5",
+    },
+}
 
 # ══════════════════════════════════════════════════════════════════
 # SHARED UTILITIES
@@ -979,18 +119,18 @@ def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def ts_est():
-    utc_now = datetime.now(timezone.utc)
-    offset  = -4 if 4 <= utc_now.month <= 10 else -5
-    est     = utc_now + timedelta(hours=offset)
-    suffix  = "EDT" if offset == -4 else "EST"
-    return est.strftime(f"%Y-%m-%d %H:%M {suffix}")
+    utc  = datetime.now(timezone.utc)
+    off  = -4 if 4 <= utc.month <= 10 else -5
+    est  = utc + timedelta(hours=off)
+    sfx  = "EDT" if off == -4 else "EST"
+    return est.strftime(f"%Y-%m-%d %H:%M {sfx}")
 
 def log(msg):
     print(f"[{ts()}] {msg}", flush=True)
 
 def get_week():
-    now = datetime.now(timezone.utc)
-    return f"{now.year}-W{now.isocalendar()[1]:02d}"
+    n = datetime.now(timezone.utc)
+    return f"{n.year}-W{n.isocalendar()[1]:02d}"
 
 def ntfy(title, body, priority="default"):
     try:
@@ -1002,7 +142,7 @@ def ntfy(title, body, priority="default"):
     except Exception as e:
         log(f"ntfy error: {e}")
 
-# ── Coinbase client (shared, read-only candle fetches) ────────────
+# Shared Coinbase client — lazy init, thread-safe
 _cb_client      = None
 _cb_client_lock = threading.Lock()
 
@@ -1013,779 +153,130 @@ def get_cb_client():
             if _cb_client is None:
                 from coinbase.rest import RESTClient
                 _cb_client = RESTClient(api_key=CB_API_KEY, api_secret=CB_API_SEC)
+                # Apply 10s timeout to all requests
                 if hasattr(_cb_client, "session"):
                     _orig = _cb_client.session.request
                     def _req_with_timeout(method, url, **kwargs):
                         kwargs.setdefault("timeout", 10)
                         return _orig(method, url, **kwargs)
                     _cb_client.session.request = _req_with_timeout
-                    log("✅ Coinbase client: 10s timeout applied")
+                log("✅ Coinbase client ready (10s timeout)")
     return _cb_client
 
-def fetch_with_retry(fn, asset, sys_id, retries=3):
-    import random
-    for attempt in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            if attempt < retries - 1:
-                delay = (2 ** attempt) + random.uniform(0, 1)
-                log(f"[S{sys_id}] {asset} attempt {attempt+1}/{retries} failed: {e} — retrying in {delay:.1f}s")
-                time.sleep(delay)
-            else:
-                raise e
-    return None
-
-def place_market_order(asset, side, contracts):
-    """
-    Paper mode: simulate fill using real bid/ask price.
-    Live mode:  real CFM order, returns actual fill price from Coinbase.
-    Returns: (order_id, actual_contracts, actual_fill_price)
-    fill_price is None in paper mode — caller uses get_real_fill_price() result
-    """
-    if PAPER_MODE:
-        fake_oid = f"PAPER-{asset}-{int(time.time())}"
-        log(f"📄 PAPER: {asset} {side} {contracts}ct → {fake_oid}")
-        return fake_oid, int(contracts), None, None
-    try:
-        client  = get_cb_client()
-        product = ASSETS[asset]["perp"]
-        for attempt in range(max(1, int(contracts)), 0, -1):
-            size = str(attempt)
-            if side in ("BUY", "LONG"):
-                order = client.market_order_buy(
-                    client_order_id=str(uuid.uuid4()),
-                    product_id=product, base_size=size)
-            else:
-                order = client.market_order_sell(
-                    client_order_id=str(uuid.uuid4()),
-                    product_id=product, base_size=size)
-            if order["success"]:
-                sr  = order["success_response"]
-                oid = sr["order_id"] if isinstance(sr, dict) else f"CB-{asset}-{int(time.time())}"
-                # Fetch actual fill price AND fee from order details
-                fill_price = None
-                fill_fee   = None
-                try:
-                    time.sleep(0.3)  # brief wait for fill to settle
-                    filled = client.get_order(oid)
-                    fp = getattr(filled, "order", {})
-                    if isinstance(fp, dict):
-                        fill_price = float(fp.get("average_filled_price", 0) or 0) or None
-                        fill_fee   = float(fp.get("total_fees", 0) or 0) or None
-                    if fill_price:
-                        log(f"✅ CB order: {asset} {side} {size}ct → {oid} | fill=${fill_price:.6f} fee=${fill_fee:.4f}")
-                    else:
-                        log(f"✅ CB order: {asset} {side} {size}ct → {oid}")
-                except Exception as fe:
-                    log(f"⚠️ Could not fetch fill details for {oid}: {fe}")
-                    log(f"✅ CB order: {asset} {side} {size}ct → {oid}")
-                return oid, attempt, fill_price, fill_fee
-            else:
-                err    = order["error_response"]
-                reason = err.get("preview_failure_reason", "") if isinstance(err, dict) else ""
-                if "INSUFFICIENT_FUNDS" in reason and attempt > 1:
-                    continue
-                log(f"⚠️ Order failed: {asset} {err}")
-                ntfy(f"⚠️ ORDER FAILED {asset}", str(err), priority="urgent")
-                return None, 0, None, None
-        return None, 0, None, None
-    except Exception as e:
-        log(f"❌ Order exception {asset}: {e}")
-        ntfy(f"❌ ORDER EXCEPTION {asset}", str(e), priority="urgent")
-        return None, 0, None, None
-
-# ── Math ──────────────────────────────────────────────────────────
-def calc_rsi(closes, period=RSI_PERIOD):
-    if len(closes) < period + 1: return [None] * len(closes)
-    out    = [None] * period
-    gains  = [max(0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
-    losses = [max(0, closes[i-1] - closes[i]) for i in range(1, len(closes))]
-    ag = sum(gains[:period])  / period
-    al = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        ag = (ag * (period-1) + gains[i]) / period
-        al = (al * (period-1) + losses[i]) / period
-        rs = ag / al if al > 0 else 100
-        out.append(100 - 100 / (1 + rs))
-    while len(out) < len(closes):
-        out.append(out[-1])
-    return out
-
-def get_hr_rsi(asset, candles_15m):
-    if not candles_15m or len(candles_15m) < 60: return None
-    try:
-        c1h   = [float(candles_15m[i+3]["c"]) for i in range(0, len(candles_15m)-3, 4)]
-        if len(c1h) < 16: return None
-        rsi1h = calc_rsi(c1h, 14)
-        val   = rsi1h[-2] if len(rsi1h) >= 2 and rsi1h[-2] is not None else None
-        return round(val, 1) if val is not None else None
-    except Exception as e:
-        log(f"get_hr_rsi error {asset}: {e}")
-        ntfy(f"⚠️ HR_RSI ERROR {asset}", str(e), priority="high")
-        return None
-
-def evaluate_signal(candles):
-    if not candles or len(candles) < RSI_PERIOD + 2:
-        return None, None, None, {"fail": "not enough candles"}
-    closes = [float(c["c"]) for c in candles]
-    rsi    = calc_rsi(closes, RSI_PERIOD)
-    i      = len(rsi) - 2
-    if rsi[i] is None or rsi[i-1] is None:
-        return None, None, None, {"fail": "RSI not ready"}
-    cur  = rsi[i]
-    prev = rsi[i-1]
-    if prev < RSI_ENTRY and cur >= RSI_ENTRY:
-        return "LONG", None, None, {"strategy":"RSI-Mom+MTF","rsi_prev":round(prev,2),"rsi_cur":round(cur,2)}
-    elif prev > (100-RSI_ENTRY) and cur <= (100-RSI_ENTRY):
-        return "SHORT", None, None, {"strategy":"RSI-Mom+MTF","rsi_prev":round(prev,2),"rsi_cur":round(cur,2)}
-    return None, None, None, {"fail": f"no cross (RSI prev={prev:.1f} cur={cur:.1f}) threshold={RSI_ENTRY}"}
-
-def should_exit(pos, candles):
-    if not candles or len(candles) < RSI_PERIOD + 2: return False
-    closes  = [float(c["c"]) for c in candles]
-    rsi     = calc_rsi(closes, RSI_PERIOD)
-    cur_rsi = rsi[-2] if rsi[-2] is not None else rsi[-1]
-    if cur_rsi is None: return False
-    if pos["direction"] == "LONG":
-        if cur_rsi > RSI_TRAIL_TRIG:
-            pos["exit_rsi"] = RSI_TRAIL_EXIT
-        return cur_rsi < pos.get("exit_rsi", RSI_EXIT)
-    else:
-        if cur_rsi < (100 - RSI_TRAIL_TRIG):
-            pos["exit_rsi"] = 100 - RSI_TRAIL_EXIT
-        return cur_rsi > pos.get("exit_rsi", 100 - RSI_EXIT)
-
-def merge_cfm_intx(cfm, intx):
-    """CFM primary — INTX fills gaps only. CFM wins on any overlap."""
-    if not cfm and not intx: return []
-    if not cfm: return intx or []
-    if not intx: return cfm
-    cm = {c["ts"]: c for c in cfm}
-    im = {c["ts"]: c for c in intx}
-    return [cm[ts] if ts in cm else im[ts] for ts in sorted(set(cm) | set(im))]
-
 # ══════════════════════════════════════════════════════════════════
-# INSTANTIATE 3 SYSTEMS
+# GRID SYSTEM CLASS
+# One instance per grid bot. Completely self-contained.
 # ══════════════════════════════════════════════════════════════════
-# All 3 systems — paper test with real bid/ask fills
-# Re-running comparison with accurate paper simulation
-S1 = TradingSystem(1, "CFM only",    "cfm")
-S2 = TradingSystem(2, "INTX only",   "intx")
-S3 = TradingSystem(3, "SmartHybrid", "hybrid")
-SYSTEMS = [S1, S2, S3]
-
-# ══════════════════════════════════════════════════════════════════
-# FLASK DASHBOARD
-# ══════════════════════════════════════════════════════════════════
-app = Flask(__name__)
-
-@app.route("/login", methods=["POST"])
-def login():
-    from flask import make_response
-    pw  = request.form.get("pw", "")
-    _pw = os.environ.get("APP_PASSWORD", "3757")
-    if pw == _pw:
-        resp = make_response(redirect("/"))
-        resp.set_cookie("auth", _pw, max_age=60*60*24*30)
-        return resp
-    return redirect("/")
-
-def get_real_balance():
-    """Fetch real USD balance from Coinbase — used in live mode"""
-    try:
-        client = get_cb_client()
-        accounts = client.get_accounts()
-        for a in accounts.accounts:
-            if isinstance(a.available_balance, dict):
-                if a.available_balance.get("currency") == "USD":
-                    return round(float(a.available_balance["value"]), 2)
-    except Exception as e:
-        log(f"Real balance fetch error: {e}")
-    return None
-
-def get_futures_balance():
-    """
-    Fetch real futures balance summary from Coinbase.
-    Returns dict with buying_power, unrealized_pnl, daily_realized_pnl,
-    available_margin, initial_margin.
-    Used for paper sizing, heartbeat display, emergency stop.
-    """
-    try:
-        client = get_cb_client()
-        fb = client.get_futures_balance_summary()
-        # SDK returns object — access balance_summary as attribute
-        bs = getattr(fb, "balance_summary", None)
-        if not bs: return None
-
-        def _val(key):
-            v = getattr(bs, key, {})
-            if isinstance(v, dict): return float(v.get("value", 0) or 0)
-            return float(v or 0)
-
-        return {
-            "buying_power":     round(_val("futures_buying_power"), 2),
-            "total_balance":    round(_val("total_usd_balance"), 2),
-            "unrealized_pnl":   round(_val("unrealized_pnl"), 2),
-            "daily_pnl":        round(_val("daily_realized_pnl"), 2),
-            "available_margin": round(_val("available_margin"), 2),
-            "initial_margin":   round(_val("initial_margin"), 2),
-        }
-    except Exception as e:
-        log(f"get_futures_balance error: {e}")
-        return None
-
-def get_real_fill_price(asset, side):
-    """
-    Fetch real-time bid/ask from Coinbase and return realistic fill price.
-    BUY  fills at ASK (you pay more)
-    SELL fills at BID (you receive less)
-    Falls back to None if unavailable — caller uses candle close as fallback.
-    """
-    try:
-        client  = get_cb_client()
-        product = ASSETS[asset]["perp"]
-        book    = client.get_best_bid_ask(product_ids=[product])
-        if book and book.pricebooks:
-            pb  = book.pricebooks[0]
-            ask = float(pb.asks[0].price) if pb.asks else None
-            bid = float(pb.bids[0].price) if pb.bids else None
-            if side == "MID" and ask and bid: return round((ask + bid) / 2, 6)
-            if side in ("BUY","LONG")   and ask: return round(ask, 6)
-            if side in ("SELL","SHORT") and bid: return round(bid, 6)
-    except Exception as e:
-        log(f"get_real_fill_price error {asset}: {e}")
-    return None
-
-@app.route("/health")
-def health():
-    # In live mode — fetch real Coinbase balance
-    real_bal = get_real_balance() if not PAPER_MODE else None
-    out = {}
-    for sys in SYSTEMS:
-        with sys.lock: s = dict(sys.state)
-        wr = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
-        # Live mode: show real balance + real P&L
-        # Paper mode: show simulated balance
-        # Balance: real Coinbase buying power in live, internal state in paper
-        if not PAPER_MODE and real_bal is not None:
-            display_bal = real_bal
-            display_pnl = round(real_bal - sys.total_usdc, 2)
-        else:
-            display_bal = s["balance"]
-            display_pnl = s["total_pnl"]
-        out[f"S{sys.sys_id}_{sys.source}"] = {
-            "balance":    f"${display_bal:,.2f}",
-            "total_pnl":  f"${display_pnl:+,.2f}",
-            "weekly_pnl": f"${s['weekly_pnl']:+,.2f}",
-            "trades":     s["total_trades"],
-            "win_rate":   f"{wr}%",
-            "open":       list(sys.positions.keys()),
-            "errors":     s.get("loop_errors", 0),
-            "last_run":   s["loop_last_run"],
-        }
-    return Response(json.dumps(out, indent=2), mimetype="application/json")
-
-@app.route("/sim-data-s<int:sid>")
-def sim_data_sys(sid):
-    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
-        return Response("Unauthorized", status=401)
-    sys = next((s for s in SYSTEMS if s.sys_id == sid), None)
-    if not sys: return Response("Unknown system", status=404)
-    try:
-        return Response(open(sys.data_file).read(), mimetype="application/json",
-                        headers={"Content-Disposition": f"attachment;filename=cb_sim_s{sid}.json"})
-    except:
-        return Response("[]", mimetype="application/json")
-
-@app.route("/tax-s<int:sid>")
-def tax_sys(sid):
-    sys = next((s for s in SYSTEMS if s.sys_id == sid), None)
-    if not sys: return Response("Unknown system", status=404)
-    try:
-        return Response(open(sys.tax_file).read(), mimetype="text/csv",
-                        headers={"Content-Disposition": f"attachment;filename=cb_trades_s{sid}.csv"})
-    except:
-        return Response("No trades yet", mimetype="text/plain")
-
-@app.route("/diag-s<int:sid>")
-def diag_sys(sid):
-    sys = next((s for s in SYSTEMS if s.sys_id == sid), None)
-    if not sys: return Response("Unknown system", status=404)
-    try:
-        return Response(open(sys.diag_file).read(), mimetype="application/json")
-    except:
-        return Response("[]", mimetype="application/json")
-
-@app.route("/")
-def dashboard():
-    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
-        return """<!DOCTYPE html><html><head><title>AP3X 1.0</title>
-<meta name=viewport content='width=device-width,initial-scale=1'>
-<style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{text-align:center;padding:40px;background:#0A1628;border:1px solid #1E2D45;border-radius:12px}
-input{background:#060D1A;border:1px solid #1E2D45;color:#E0E6F0;padding:12px;
-border-radius:8px;margin:10px 0;width:200px;font-size:16px;display:block}
-button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius:8px;
-cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
-h2{margin-bottom:20px}</style></head>
-<body><form method=post action=/login class=box>
-<h2>AP3X 1.0</h2>
-<input type=password name=pw placeholder='Password' autofocus>
-<button type=submit>Login</button>
-</form></body></html>"""
-
-    # Build system cards
-    sys_colors = {"1": "#00D68F", "2": "#7B61FF", "3": "#FFB800"}
-    sys_cards  = ""
-    for sys in SYSTEMS:
-        with sys.lock:
-            s   = dict(sys.state)
-            pos = dict(sys.positions)
-        wr  = round(s["wins"]/s["total_trades"]*100,1) if s["total_trades"] else 0
-        col = sys_colors.get(str(sys.sys_id), "#E0E6F0")
-        wk_col  = "#00D68F" if s["weekly_pnl"] >= 0 else "#FF4757"
-        tot_col = "#00D68F" if s["total_pnl"]  >= 0 else "#FF4757"
-
-        # Position rows
-        pos_rows = ""
-        for asset, p in pos.items():
-            unreal    = p.get("unrealized_pnl", 0.0)
-            pnl_col   = "#00D68F" if unreal >= 0 else "#FF4757"
-            dir_col   = "#00D68F" if p["direction"] == "LONG" else "#FF4757"
-            exit_rsi  = p.get("exit_rsi", RSI_EXIT)
-            locked    = "🔒" if exit_rsi == RSI_TRAIL_EXIT else ""
-            cur_price = p.get("current_price", p.get("entry", 0))
-            entry_fee = round(p["entry"]   * p["size"] * FEE_PCT + FEE_FLAT * p["contracts"], 4)
-            exit_fee  = round(cur_price * p["size"] * FEE_PCT + FEE_FLAT * p["contracts"], 4)
-            pos_rows += f"""<div style='background:#060D1A;border-radius:8px;padding:10px;margin-bottom:8px;border:1px solid #1E2D45'>
-              <div style='display:flex;justify-content:space-between;margin-bottom:6px'>
-                <b>{asset}</b>
-                <span style='color:{dir_col};font-weight:700'>{p["direction"]}</span>
-                <span style='color:{pnl_col};font-weight:700'>${unreal:+,.2f}</span>
-              </div>
-              <div style='font-size:11px;color:#4A5878'>
-                entry=${p["entry"]:,.4f} | cur=${cur_price:,.4f} | exit RSI&lt;{exit_rsi}{locked} | hr={p.get("hr_rsi","?")} | {p.get("contracts",1)}ct | fees≈${entry_fee+exit_fee:.4f}
-              </div>
-            </div>"""
-        if not pos_rows:
-            pos_rows = "<div style='color:#4A5878;font-size:12px;padding:8px'>No open positions</div>"
-
-        # Journal rows
-        try:    audit_data = json.load(open(sys.diag_file)) if os.path.exists(sys.diag_file) else []
-        except: audit_data = []
-
-        journal_rows = ""; j_shown = 0
-        heartbeat_rows = ""; hb_built = False
-        error_rows = ""; error_count = 0
-
-        error_kw  = ["⚠️","WARNING","ERROR","CRITICAL","FAILED","failed","timeout","Skipped"]
-        trade_evt = ["ENTER","EXIT","HOLD","NO_SIGNAL","CYCLE","RSI-Mom","📊","📄","✅ EXIT","❌ EXIT"]
-
-        for a in audit_data:
-            evt = a.get("event","")
-
-            if "CYCLE" in evt and not hb_built:
-                hb_built = True
-                detail = a.get("detail","")
-                lines  = detail.split("\n")
-                heartbeat_rows += f"<div style='font-size:12px;font-weight:700;color:#E0E6F0;padding:6px 0;border-bottom:1px solid #1E2D45;margin-bottom:8px'>{lines[0] if lines else detail}</div>"
-                for line in lines[1:]:
-                    line = line.strip()
-                    if not line: continue
-                    css = "hb-hold" if "HOLD" in line else "hb-skip" if "❌" in line else "hb-watch"
-                    heartbeat_rows += f"<div class='hb-row {css}'>{line}</div>"
-                heartbeat_rows += f"<div style='font-size:10px;color:#4A5878;margin-top:8px'>Updated: {a.get('time','?')}</div>"
-
-            if j_shown < 50 and "CYCLE" not in evt:
-                j_shown += 1
-                jcol = "#00D68F" if "ENTER" in evt else "#FF4757" if "EXIT" in evt else "#E0E6F0"
-                journal_rows += f"""<div class=j-trade style='border-color:{jcol}'>
-                  <div style='font-size:10px;color:#4A5878'>{a["time"]} · {a.get("asset","SYS")}</div>
-                  <div style='font-size:12px;font-weight:700;color:{jcol}'>{evt}</div>
-                  <div style='font-size:11px;color:#8892A4'>{a.get("detail","")[:120]}</div>
-                </div>"""
-
-            if not any(te in evt for te in trade_evt):
-                if any(kw in evt or kw in a.get("detail","") for kw in error_kw) and "CYCLE" not in evt:
-                    error_count += 1
-                    error_rows += f"""<div style='border-left:3px solid #FFB800;padding:8px 12px;margin-bottom:6px;background:#060D1A;border-radius:0 8px 8px 0'>
-                      <div style='font-size:10px;color:#4A5878'>{a["time"]} · {a.get("asset","SYS")}</div>
-                      <div style='font-size:11px;color:#8892A4;font-family:monospace'>{evt}: {a.get("detail","")[:150]}</div>
-                    </div>"""
-
-        if not journal_rows:   journal_rows   = "<div style='color:#4A5878;padding:20px;text-align:center;font-size:13px'>No trades yet</div>"
-        if not heartbeat_rows: heartbeat_rows = "<div style='color:#4A5878;padding:20px;text-align:center;font-size:13px'>No heartbeat yet</div>"
-        if not error_rows:     error_rows     = "<div style='color:#4A5878;padding:20px;text-align:center;font-size:13px'>✅ No errors</div>"
-
-        err_badge = f" <span style='background:#FF4757;color:#fff;border-radius:10px;padding:1px 5px;font-size:10px'>{error_count}</span>" if error_count else ""
-
-        # Markets rows
-        markets_rows = ""
-        for a_name in ASSET_NAMES:
-            is_open = a_name in pos
-            sc = "#00D68F" if is_open else "#4A5878"
-            markets_rows += f"""<div style='display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1E2D45;font-size:12px'>
-              <b>{a_name}</b>
-              <span style='color:#4A5878'>{ASSETS[a_name]["perp"]}</span>
-              <span style='color:#4A5878'>{ASSETS[a_name]["margin_rate"]*100:.0f}% margin</span>
-              <span style='color:{sc};font-weight:600'>{"● OPEN" if is_open else "○ READY"}</span>
-            </div>"""
-
-        sid = sys.sys_id
-        sys_cards += f"""<div class='sys-card' style='background:#0A1628;border:2px solid {col};border-radius:12px;padding:16px;margin-bottom:20px'>
-          <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
-            <div>
-              <span style='font-size:16px;font-weight:800;color:{col}'>S{sid}</span>
-              <span style='font-size:13px;color:#8892A4;margin-left:8px'>{sys.label}</span>
-            </div>
-            <span style='font-size:11px;color:#4A5878;background:#060D1A;padding:3px 8px;border-radius:20px'>{sys.source}</span>
-          </div>
-          <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px'>
-            <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
-              <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>BALANCE</div>
-              <div style='font-size:15px;font-weight:800'>${(get_real_balance() or s["balance"]) if not PAPER_MODE else s["balance"]:,.2f}</div>
-            </div>
-            <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
-              <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>WEEK</div>
-              <div style='font-size:15px;font-weight:800;color:{wk_col}'>${s["weekly_pnl"]:+,.2f}</div>
-            </div>
-            <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
-              <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>TOTAL P&L</div>
-              <div style='font-size:15px;font-weight:800;color:{tot_col}'>${s["total_pnl"]:+,.2f}</div>
-            </div>
-            <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
-              <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>WR</div>
-              <div style='font-size:15px;font-weight:800'>{wr}%</div>
-            </div>
-          </div>
-          <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px;font-size:12px'>
-            <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
-              <div style='color:#4A5878;font-size:10px'>TRADES</div><div style='font-weight:700'>{s["total_trades"]}</div>
-            </div>
-            <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
-              <div style='color:#4A5878;font-size:10px'>OPEN</div>
-              <div style='font-weight:700;color:{"#00D68F" if len(pos)>0 else "#4A5878"}'>{len(pos)}</div>
-            </div>
-            <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
-              <div style='color:#4A5878;font-size:10px'>ERRORS</div>
-              <div style='font-weight:700;color:{"#FF4757" if s.get("loop_errors",0)>0 else "#4A5878"}'>{s.get("loop_errors",0)}</div>
-            </div>
-          </div>
-          <div class=tabs>
-            <span class='tab on' onclick="show('s{sid}pos',this,'s{sid}')">Positions</span>
-            <span class=tab onclick="show('s{sid}jrn',this,'s{sid}')">Journal</span>
-            <span class=tab onclick="show('s{sid}hb',this,'s{sid}')">Heartbeat</span>
-            <span class=tab onclick="show('s{sid}err',this,'s{sid}')">Errors{err_badge}</span>
-            <span class=tab onclick="show('s{sid}mkt',this,'s{sid}')">Markets</span>
-            <span class=tab onclick="show('s{sid}inf',this,'s{sid}')">Info</span>
-          </div>
-          <div id='s{sid}pos' class='panel on'>{pos_rows}</div>
-          <div id='s{sid}jrn' class=panel>{journal_rows}</div>
-          <div id='s{sid}hb'  class=panel>{heartbeat_rows}</div>
-          <div id='s{sid}err' class=panel>{error_rows}</div>
-          <div id='s{sid}mkt' class=panel>{markets_rows}</div>
-          <div id='s{sid}inf' class=panel>
-            <div style='font-size:12px;line-height:2;color:#8892A4'>
-              <b style='color:#E0E6F0'>Source</b>: {sys.source}<br>
-              <b style='color:#E0E6F0'>Strategy</b>: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF<br>
-              <b style='color:#E0E6F0'>Capital</b>: Real Coinbase buying power<br>
-              <b style='color:#E0E6F0'>Assets</b>: XRP · XLM<br>
-              <b style='color:#E0E6F0'>Execution</b>: CFM always<br>
-              <b style='color:#E0E6F0'>Fees</b>: 0.080% + $0.12/ct/side<br>
-              <div style='margin-top:8px'>
-                <a href='/sim-data-s{sid}' style='color:#4A5878'>Sim Data</a> &nbsp;·&nbsp;
-                <a href='/tax-s{sid}' style='color:#4A5878'>Tax CSV</a> &nbsp;·&nbsp;
-                <a href='/diag-s{sid}' style='color:#4A5878'>Diagnostic</a>
-              </div>
-            </div>
-          </div>
-        </div>"""
-
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    now_est = ts_est()
-    mode_color = "#FFB800" if PAPER_MODE else "#00D68F"
-    mode_label = "📄 PAPER" if PAPER_MODE else "🔴 LIVE"
-
-    return f"""<!DOCTYPE html>
-<html><head>
-<title>AP3X 1.0</title>
-<meta charset=utf-8>
-<meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
-<meta http-equiv=refresh content=30>
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{background:#060D1A;color:#E0E6F0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;
-       padding:14px;max-width:640px;margin:0 auto;padding-bottom:40px}}
-  a{{color:#8892A4;text-decoration:none}}
-  .tabs{{display:flex;gap:4px;margin-bottom:0;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}}
-  .tabs::-webkit-scrollbar{{display:none}}
-  .tab{{flex-shrink:0;padding:10px 14px;cursor:pointer;border-radius:8px 8px 0 0;font-size:12px;font-weight:600;
-        background:#060D1A;color:#4A5878;border:1px solid #1E2D45;border-bottom:none;
-        min-height:40px;display:flex;align-items:center;touch-action:manipulation}}
-  .tab.on{{background:#0A1628;color:#E0E6F0}}
-  .panel{{display:none;background:#0A1628;border:1px solid #1E2D45;
-          border-radius:0 10px 10px 10px;padding:12px;min-height:80px}}
-  .panel.on{{display:block}}
-  .hb-row{{font-family:monospace;font-size:11px;padding:5px 0;border-bottom:1px solid #060D1A;word-break:break-all}}
-  .hb-hold{{color:#00D68F}}.hb-watch{{color:#4A5878}}.hb-skip{{color:#FF4757}}
-  .j-trade{{border-left:3px solid;padding:8px 12px;margin-bottom:6px;background:#060D1A;border-radius:0 8px 8px 0}}
-</style>
-<script>
-function show(id,el,prefix){{
-  var card=el.closest('.sys-card');
-  card.querySelectorAll('.panel').forEach(function(p){{p.classList.remove('on')}});
-  card.querySelectorAll('.tab').forEach(function(t){{t.classList.remove('on')}});
-  document.getElementById(id).classList.add('on');
-  el.classList.add('on');
-}}
-</script>
-</head><body>
-<div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px'>
-  <div>
-    <div style='font-size:22px;font-weight:800'>AP3X <span style='color:#4A5878'>1.0</span></div>
-    <div style='font-size:12px;font-weight:700;color:{mode_color};margin-top:2px'>{mode_label}</div>
-    <div style='font-size:11px;color:#4A5878;margin-top:2px'>3-System Candle Source Test</div>
-  </div>
-  <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
-    {now_utc}<br>{now_est}
-  </div>
-</div>
-<div style='font-size:11px;color:#4A5878;margin-bottom:14px;padding:10px;background:#0A1628;border-radius:8px;border:1px solid #1E2D45'>
-  Autonomous Crypto Trading · XRP · XLM
-</div>
-{sys_cards}
-<div style='font-size:11px;color:#4A5878;text-align:center;margin-top:8px'>
-  <a href='/health'>Health JSON</a>
-</div>
-</body></html>"""
-
-# ══════════════════════════════════════════════════════════════════
-# STARTUP — deferred to first request (gunicorn compatible)
-# ══════════════════════════════════════════════════════════════════
-_started    = False
-_start_lock = threading.Lock()
-
-def startup():
-    global _started
-    with _start_lock:
-        if _started: return
-        _started = True
-
-    log("📡 AP3X 1.0 — pre-loading candles...")
-
-    # Shared candle fetch on startup — each system caches its own copy
-    for asset in ASSET_NAMES:
-        try:
-            # Fetch both sources once
-            end   = int(time.time())
-            start = end - CANDLE_LIMIT * 900
-
-            # CFM
-            client = get_cb_client()
-            r = client.get_candles(ASSETS[asset]["perp"], start=str(start), end=str(end), granularity=CANDLE_TF)
-            cfm = sorted([{
-                "ts": int(c.start)*1000,
-                "dt": datetime.fromtimestamp(int(c.start),tz=timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "o": float(c.open), "h": float(c.high),
-                "l": float(c.low),  "c": float(c.close), "v": float(c.volume),
-                "source": "cfm",
-            } for c in r.candles], key=lambda x: x["ts"])[-CANDLE_LIMIT:] if r.candles else []
-
-            # INTX
-            sym      = ASSETS[asset]["intx"]
-            start_dt = datetime.fromtimestamp(end - CANDLE_LIMIT*900, tz=timezone.utc)
-            end_dt   = datetime.fromtimestamp(end, tz=timezone.utc)
-            ri = req.get(f"https://api.international.coinbase.com/api/v1/instruments/{sym}/candles",
-                         params={"granularity":"FIFTEEN_MINUTE",
-                                 "start":start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                 "end":end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")}, timeout=10)
-            intx = []
-            if ri.status_code == 200:
-                aggs = ri.json().get("aggregations",[])
-                intx = sorted([{
-                    "ts": int(datetime.strptime(c["start"],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()*1000),
-                    "dt": c["start"],
-                    "o": float(c["open"]), "h": float(c["high"]),
-                    "l": float(c["low"]),  "c": float(c["close"]), "v": float(c["volume"]),
-                    "source": "intx",
-                } for c in aggs], key=lambda x: x["ts"])[-CANDLE_LIMIT:]
-
-            hybrid = merge_cfm_intx(cfm, intx)
-
-            # Each system gets its own source candles
-            if cfm    and len(cfm)    >= 60: S1.startup_cache[asset] = cfm
-            if intx   and len(intx)   >= 60: S2.startup_cache[asset] = intx
-            if hybrid and len(hybrid) >= 60: S3.startup_cache[asset] = hybrid
-
-            # Log candle counts
-            hr1 = get_hr_rsi(asset, cfm)
-            hr2 = get_hr_rsi(asset, intx)
-            hr3 = get_hr_rsi(asset, hybrid)
-            log(f"  {asset}: CFM={len(cfm)} hr={hr1} | INTX={len(intx)} hr={hr2} | Hybrid={len(hybrid)} hr={hr3}")
-
-            time.sleep(0.3)
-        except Exception as e:
-            log(f"  Startup preload {asset}: {e}")
-            ntfy(f"⚠️ STARTUP ERROR {asset}", str(e), priority="urgent")
-
-    log("✅ Pre-load complete — all 3 systems ready")
-    log(f"🚀 AP3X 1.0 | Mode: {'📄 PAPER' if PAPER_MODE else '🔴 LIVE'} | {'All 3 systems' if PAPER_MODE else 'S1 CFM only'}")
-    log(f"   Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
-    log(f"   Assets: {', '.join(ASSET_NAMES)}")
-    if PAPER_MODE:
-        log(f"   Capital: $2,000.00 per system (paper) | $6,000.00 total")
-    else:
-        _fb2 = get_futures_balance()
-        _bp2 = _fb2["buying_power"] if _fb2 else "N/A"
-        log(f"   Capital: ${_bp2} real Coinbase buying power")
-    _days = (datetime(2026,12,30,tzinfo=timezone.utc)-datetime.now(tz=timezone.utc)).days
-    if _days < 60:
-        log(f"   ⚠️  Contracts expire in {_days} days — update tickers before Dec 30 2026")
-        ntfy("⚠️ CONTRACT EXPIRY WARNING", f"XPP/XLP expire in {_days} days", priority="high")
-    else:
-        log(f"   Contracts expire Dec 30 2026 ({_days} days away)")
-    log(f"   Time: {ts_est()}")
-
-    # Start 3 isolated trading threads
-    for sys in SYSTEMS:
-        threading.Thread(target=sys.run, daemon=True, name=f"S{sys.sys_id}-{sys.source}").start()
-        log(f"  ✅ S{sys.sys_id} ({sys.label}) thread started")
-        time.sleep(0.1)
-
-# Run startup in background so Flask responds immediately
-# Prevents Railway health check timeout during 14-second candle preload
-_startup_thread = threading.Thread(target=startup, daemon=True, name="startup")
-_startup_thread.start()
-
-# ══════════════════════════════════════════════════════════════════
-# GRID SYSTEMS — S4 (XRP) and S5 (SOL)
-# Completely independent from S1/S2/S3 RSI systems
-# Each has own state file, log, fills, P&L tracking
-# Paper mode only — simulates fills at real live bid/ask
-# ══════════════════════════════════════════════════════════════════
-
-GRID_CONFIGS = {
-    4: {
-        "label":      "XRP Grid",
-        "product_id": "XPP-20DEC30-CDE",
-        "contract":   500.0,
-        "margin":     0.2001,
-        "spacing":    0.15,
-        "n_grids":    50,
-        "capital":    float(os.environ.get("PAPER_BALANCE", "2000")),
-        "color":      "#00B4D8",
-    },
-    5: {
-        "label":      "SOL Grid",
-        "product_id": "SLP-20DEC30-CDE",
-        "contract":   5.0,
-        "margin":     0.20,
-        "spacing":    7.0,
-        "n_grids":    40,
-        "capital":    float(os.environ.get("PAPER_BALANCE", "2000")),
-        "color":      "#9B5DE5",
-    },
-}
-
 class GridSystem:
-    """
-    Fully self-contained grid bot.
-    Runs as a daemon thread.
-    Completely isolated from RSI systems S1/S2/S3.
-    State persists to /tmp/grid_state_s{N}.json
-    Candle history saved to /tmp/grid_candles_s{N}.json
-    All fills saved to /tmp/grid_fills_s{N}.json
-    """
 
     def __init__(self, sys_id):
         cfg = GRID_CONFIGS[sys_id]
         self.sys_id     = sys_id
         self.label      = cfg["label"]
         self.product_id = cfg["product_id"]
-        self.cs         = cfg["contract"]
-        self.mr         = cfg["margin"]
-        self.spacing    = cfg["spacing"]
-        self.n_grids    = cfg["n_grids"]
-        self.capital    = cfg["capital"]
-        self.color      = cfg["color"]
+        self.cs         = cfg["contract"]   # units per contract
+        self.mr         = cfg["margin"]     # intraday margin rate
+        self.spacing    = cfg["spacing"]    # $ between grid levels
+        self.n_grids    = cfg["n_grids"]    # total levels
+        self.capital    = cfg["capital"]    # starting capital
+        self.color      = cfg["color"]      # dashboard color
 
-        # Files — all unique, never shared with RSI systems
+        # All files unique to this system — never shared
         self.state_file   = f"/tmp/grid_state_s{sys_id}.json"
-        self.fills_file   = f"/tmp/grid_fills_s{sys_id}.json"   # every fill saved
-        self.candles_file = f"/tmp/grid_candles_s{sys_id}.json" # 1hr price history
+        self.fills_file   = f"/tmp/grid_fills_s{sys_id}.json"
+        self.candles_file = f"/tmp/grid_candles_s{sys_id}.json"
         self.log_file     = f"/tmp/grid_log_s{sys_id}.txt"
 
         self.lock = threading.Lock()
 
-        # Live state
-        self.state = self._load_state()
-        self.price_history_1h = self._load_candles()  # list of close prices, 1hr
+        # Load persisted state or start fresh
+        self.state            = self._load_state()
+        self.price_history_1h = self._load_candles()
 
     # ── Persistence ──────────────────────────────────────────────
 
-    def _load_state(self):
-        default = {
-            "balance":      self.capital,
-            "total_pnl":    0.0,
-            "total_fills":  0,
+    def _default_state(self):
+        return {
+            "balance":         self.capital,
+            "total_pnl":       0.0,
+            "total_fills":     0,
             "total_breakouts": 0,
-            "grid_center":  None,
-            "grid_levels":  [],
-            "open_buys":    {},       # str(level) → entry_price
-            "start_time":   datetime.now(timezone.utc).isoformat(),
-            "last_price":   None,
-            "last_update":  None,
-            "monthly_pnl":  {},       # "YYYY-MM" → float
-            "weekly_pnl":   0.0,
-            "week":         None,
-            "loop_errors":  0,
+            "grid_center":     None,
+            "grid_levels":     [],
+            "open_buys":       {},        # str(level) → entry_price
+            "start_time":      datetime.now(timezone.utc).isoformat(),
+            "last_price":      None,
+            "last_update":     None,
+            "monthly_pnl":     {},        # "YYYY-MM" → cumulative float
+            "weekly_pnl":      0.0,
+            "week":            None,
+            "loop_errors":     0,
         }
+
+    def _load_state(self):
+        state = self._default_state()
         if os.path.exists(self.state_file):
             try:
                 saved = json.load(open(self.state_file))
-                default.update(saved)
+                state.update(saved)
+                self._syslog(f"State loaded: balance=${state['balance']:.2f} "
+                             f"pnl=${state['total_pnl']:+.2f} fills={state['total_fills']}")
             except Exception as e:
-                self._log(f"State load error: {e} — using fresh state")
-        return default
+                self._syslog(f"State load error: {e} — starting fresh")
+        return state
 
     def _save_state(self):
         try:
             self.state["last_update"] = datetime.now(timezone.utc).isoformat()
-            json.dump(self.state, open(self.state_file, "w"), indent=2)
+            tmp = self.state_file + ".tmp"
+            json.dump(self.state, open(tmp, "w"), indent=2)
+            os.replace(tmp, self.state_file)
         except Exception as e:
-            self._log(f"State save error: {e}")
+            self._syslog(f"State save error: {e}")
 
     def _load_candles(self):
         if os.path.exists(self.candles_file):
             try:
-                return json.load(open(self.candles_file))
-            except:
-                pass
+                data = json.load(open(self.candles_file))
+                self._syslog(f"Candle history loaded: {len(data)} 1hr prices")
+                return data
+            except Exception as e:
+                self._syslog(f"Candle load error: {e}")
         return []
 
     def _save_candles(self):
         try:
-            # Keep last 300 1hr prices — enough for EMA200
-            json.dump(self.price_history_1h[-300:], open(self.candles_file, "w"))
+            # Keep exactly 300 — enough for EMA200 warmup
+            to_save = self.price_history_1h[-300:]
+            tmp = self.candles_file + ".tmp"
+            json.dump(to_save, open(tmp, "w"))
+            os.replace(tmp, self.candles_file)
         except Exception as e:
-            self._log(f"Candle save error: {e}")
+            self._syslog(f"Candle save error: {e}")
 
-    def _save_fill(self, fill):
-        """Append every fill to fills_file for permanent record + sim analysis"""
+    def _append_fill(self, fill):
+        """
+        Append fill to fills_file permanently.
+        This is the permanent record used for sim analysis.
+        Fields: time, type, buy_level, sell_level, entry, exit, cts, bias, pnl, balance
+        """
         try:
             fills = []
             if os.path.exists(self.fills_file):
-                fills = json.load(open(self.fills_file))
+                try:
+                    fills = json.load(open(self.fills_file))
+                except:
+                    fills = []
             fills.append(fill)
-            json.dump(fills, open(self.fills_file, "w"), indent=2)
+            tmp = self.fills_file + ".tmp"
+            json.dump(fills, open(tmp, "w"), indent=2)
+            os.replace(tmp, self.fills_file)
         except Exception as e:
-            self._log(f"Fill save error: {e}")
+            self._syslog(f"Fill save error: {e}")
 
-    def _log(self, msg):
-        line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} [S{self.sys_id}/{self.label}] {msg}"
-        log(line)  # shared app log
+    def _syslog(self, msg):
+        line = f"[{ts()}] [S{self.sys_id}/{self.label}] {msg}"
+        log(line)
         try:
             with open(self.log_file, "a") as f:
                 f.write(line + "\n")
@@ -1795,7 +286,7 @@ class GridSystem:
     # ── Price feed ───────────────────────────────────────────────
 
     def get_bid_ask(self):
-        """Fetch live bid/ask from Coinbase — retries 3x"""
+        """Fetch live bid/ask — 3 retries with backoff"""
         for attempt in range(3):
             try:
                 client = get_cb_client()
@@ -1807,33 +298,34 @@ class GridSystem:
                         if bid and ask:
                             return bid, ask, (bid + ask) / 2.0
             except Exception as e:
-                self._log(f"Price fetch attempt {attempt+1}/3: {e}")
-                time.sleep(2)
+                self._syslog(f"Price fetch attempt {attempt+1}/3 failed: {e}")
+                time.sleep(3 * (attempt + 1))
         return None, None, None
 
     # ── EMA trend bias ───────────────────────────────────────────
 
-    def _ema(self, prices, period):
+    def _ema_val(self, prices, period):
         if len(prices) < period:
             return None
-        k = 2.0 / (period + 1)
+        k   = 2.0 / (period + 1)
         val = sum(prices[:period]) / period
         for p in prices[period:]:
             val = p * k + val * (1 - k)
         return val
 
-    def get_trend_bias(self):
+    def trend_bias(self):
         """
-        Uses 1hr candle history for EMA20/50/200 trend filter.
-        Returns 3x (strong uptrend), 2x (moderate), 1x (neutral/down).
-        Needs 200+ candles — falls back to 1x while building history.
+        EMA20/50/200 on 1hr closes.
+        Returns 3.0 (strong uptrend), 2.0 (moderate), 1.0 (neutral/down).
+        Falls back to 1.0 while building 200-candle history (first ~8 days).
         """
-        if len(self.price_history_1h) < 200:
+        ph = self.price_history_1h
+        if len(ph) < 200:
             return 1.0
-        e20  = self._ema(self.price_history_1h, 20)
-        e50  = self._ema(self.price_history_1h, 50)
-        e200 = self._ema(self.price_history_1h, 200)
-        cp   = self.price_history_1h[-1]
+        e20  = self._ema_val(ph, 20)
+        e50  = self._ema_val(ph, 50)
+        e200 = self._ema_val(ph, 200)
+        cp   = ph[-1]
         if e20 and e50 and e200:
             if cp > e20 > e50 > e200:
                 return 3.0
@@ -1841,201 +333,248 @@ class GridSystem:
                 return 2.0
         return 1.0
 
-    # ── Grid logic ───────────────────────────────────────────────
+    # ── Grid helpers ─────────────────────────────────────────────
+
+    def _round_lvl(self, price):
+        """Round to same precision as spacing"""
+        if self.spacing < 1:
+            return round(price, 4)
+        return round(price, 2)
 
     def build_grid(self, center):
-        return [round(center + (i - self.n_grids // 2) * self.spacing,
-                      6 if self.spacing < 1 else 2)
+        return [self._round_lvl(center + (i - self.n_grids // 2) * self.spacing)
                 for i in range(self.n_grids + 1)]
 
-    def fee_rt(self, price, contracts):
-        """Round-trip fee for N contracts at given price"""
-        sz = contracts * self.cs
-        return round((price * sz * FEE_PCT + FEE_FLAT * contracts) * 2, 4)
+    def calc_pnl(self, entry, exit_p, contracts):
+        """
+        Net P&L after fees for one round-trip fill.
+        Entry: long at ask. Exit: sell at exact next grid level (bid proxy).
+        Fee: 0.080% × notional + $0.12 flat, each side.
+        """
+        sz         = contracts * self.cs
+        gross      = (exit_p - entry) * sz
+        fee_entry  = entry  * sz * FEE_PCT + FEE_FLAT * contracts
+        fee_exit   = exit_p * sz * FEE_PCT + FEE_FLAT * contracts
+        return round(gross - fee_entry - fee_exit, 4)
 
-    def net_pnl(self, entry, exit_p, contracts):
-        sz = contracts * self.cs
-        gross = (exit_p - entry) * sz
-        fee = self.fee_rt(entry, contracts) / 2 + self.fee_rt(exit_p, contracts) / 2
-        # More precise: fee each side separately
-        fee = (entry * sz * FEE_PCT + FEE_FLAT * contracts) + \
-              (exit_p * sz * FEE_PCT + FEE_FLAT * contracts)
-        return round(gross - fee, 4)
-
-    def contracts_for_level(self, price, bias=1.0):
-        cpg = self.state["balance"] / self.n_grids
-        margin_per_ct = price * self.cs * self.mr
-        if margin_per_ct <= 0:
+    def contracts_for(self, price, bias=1.0):
+        """How many contracts to open at this grid level"""
+        cpg        = self.state["balance"] / self.n_grids
+        margin_ct  = price * self.cs * self.mr
+        if margin_ct <= 0:
             return 1
-        return max(1, min(10, int(cpg * bias / margin_per_ct)))
-
-    # ── Weekly reset ─────────────────────────────────────────────
+        return max(1, min(10, int(cpg * bias / margin_ct)))
 
     def check_weekly_reset(self):
         wk = get_week()
         if self.state.get("week") != wk:
+            if self.state.get("week"):   # not first run
+                self._syslog(f"Weekly reset: week={self.state['week']} "
+                             f"pnl=${self.state['weekly_pnl']:+.2f}")
+                ntfy(f"S{self.sys_id} {self.label} Weekly",
+                     f"Week {self.state['week']}: ${self.state['weekly_pnl']:+.2f}",
+                     priority="default")
             self.state["weekly_pnl"] = 0.0
             self.state["week"] = wk
 
     # ── Main loop ────────────────────────────────────────────────
 
     def run(self):
-        self._log(f"Started | product={self.product_id} spacing=${self.spacing} "
-                  f"grids={self.n_grids} capital=${self.capital}")
+        self._syslog(
+            f"STARTED | product={self.product_id} "
+            f"contract={self.cs} margin={self.mr*100:.2f}% "
+            f"spacing=${self.spacing} levels={self.n_grids} "
+            f"capital=${self.capital:.2f}")
         last_1h_ts = 0
 
         while True:
             try:
                 bid, ask, mid = self.get_bid_ask()
                 if not bid or not ask or not mid:
+                    self._syslog("Price fetch failed — retrying in 15s")
                     time.sleep(15)
                     continue
 
                 now = datetime.now(timezone.utc)
-                self.state["last_price"] = mid
+                self.state["last_price"] = round(mid, 6)
                 self.check_weekly_reset()
 
-                # ── Update 1hr candle history ─────────────────
+                # ── 1hr candle update ─────────────────────────
                 ts_now = int(time.time())
                 if ts_now - last_1h_ts >= 3600:
-                    self.price_history_1h.append(mid)
+                    self.price_history_1h.append(round(mid, 6))
                     if len(self.price_history_1h) > 300:
                         self.price_history_1h.pop(0)
                     self._save_candles()
                     last_1h_ts = ts_now
-                    self._log(f"1hr candle added: price=${mid:.4f} history={len(self.price_history_1h)} candles")
+                    self._syslog(
+                        f"1hr candle: price=${mid:.4f} "
+                        f"history={len(self.price_history_1h)}/300 "
+                        f"bias={self.trend_bias()}x")
 
-                bias = self.get_trend_bias()
+                bias = self.trend_bias()
 
-                # ── Initialize grid ───────────────────────────
+                # ── Initialize grid on first run ──────────────
                 if not self.state["grid_center"] or not self.state["grid_levels"]:
                     self.state["grid_center"] = mid
                     self.state["grid_levels"] = self.build_grid(mid)
-                    self._log(f"Grid initialized: center=${mid:.4f} "
-                              f"lo=${self.state['grid_levels'][0]:.4f} "
-                              f"hi=${self.state['grid_levels'][-1]:.4f}")
+                    lo = self.state["grid_levels"][0]
+                    hi = self.state["grid_levels"][-1]
+                    self._syslog(
+                        f"GRID INIT: center=${mid:.4f} "
+                        f"range=${lo:.4f}-${hi:.4f} "
+                        f"levels={self.n_grids}")
                     self._save_state()
 
                 grid_lo = self.state["grid_levels"][0]
                 grid_hi = self.state["grid_levels"][-1]
 
-                # ── Breakout — close all, recenter ────────────
+                # ── Breakout: close all open buys, recenter ───
                 if mid < grid_lo or mid > grid_hi:
-                    self._log(f"BREAKOUT: price=${mid:.4f} grid=${grid_lo:.4f}-${grid_hi:.4f} "
-                              f"open_buys={len(self.state['open_buys'])}")
-                    for lvl_str, entry_p in list(self.state["open_buys"].items()):
-                        cts  = self.contracts_for_level(entry_p)
-                        pnl  = self.net_pnl(entry_p, mid, cts)
-                        mo   = now.strftime("%Y-%m")
-                        self.state["total_pnl"]        += pnl
-                        self.state["weekly_pnl"]       += pnl
-                        self.state["balance"]          += pnl
-                        self.state["monthly_pnl"][mo]   = round(
-                            self.state["monthly_pnl"].get(mo, 0) + pnl, 4)
-                        fill = {
-                            "time":    now.isoformat(),
-                            "type":    "BREAKOUT_CLOSE",
-                            "level":   float(lvl_str),
-                            "entry":   entry_p,
-                            "exit":    mid,
-                            "cts":     cts,
-                            "pnl":     pnl,
-                            "balance": round(self.state["balance"], 4),
-                        }
-                        self._save_fill(fill)
-                        direction = "up" if mid > grid_hi else "down"
-                        self._log(f"  Breakout close ({direction}): "
-                                  f"entry=${entry_p:.4f} exit=${mid:.4f} "
-                                  f"cts={cts} pnl=${pnl:+.4f}")
+                    direction = "UP" if mid > grid_hi else "DOWN"
+                    self._syslog(
+                        f"BREAKOUT {direction}: price=${mid:.4f} "
+                        f"grid=${grid_lo:.4f}-${grid_hi:.4f} "
+                        f"open_buys={len(self.state['open_buys'])}")
 
+                    for lvl_str, entry_p in list(self.state["open_buys"].items()):
+                        cts = self.contracts_for(entry_p)
+                        pnl = self.calc_pnl(entry_p, mid, cts)
+                        mo  = now.strftime("%Y-%m")
+                        self.state["total_pnl"]   += pnl
+                        self.state["weekly_pnl"]  += pnl
+                        self.state["balance"]     += pnl
+                        self.state["monthly_pnl"][mo] = round(
+                            self.state["monthly_pnl"].get(mo, 0.0) + pnl, 4)
+                        fill = {
+                            "time":      now.isoformat(),
+                            "type":      "BREAKOUT_CLOSE",
+                            "direction": direction,
+                            "level":     float(lvl_str),
+                            "entry":     entry_p,
+                            "exit":      round(mid, 6),
+                            "cts":       cts,
+                            "bias":      bias,
+                            "pnl":       pnl,
+                            "balance":   round(self.state["balance"], 4),
+                        }
+                        self._append_fill(fill)
+                        self._syslog(
+                            f"  CLOSE level=${float(lvl_str):.4f} "
+                            f"entry=${entry_p:.4f} exit=${mid:.4f} "
+                            f"cts={cts} pnl=${pnl:+.4f}")
+
+                    n_closed = len(self.state["open_buys"])
                     self.state["open_buys"] = {}
-                    self.state["total_breakouts"] = self.state.get("total_breakouts", 0) + 1
+                    self.state["total_breakouts"] = \
+                        self.state.get("total_breakouts", 0) + 1
                     self.state["grid_center"] = mid
                     self.state["grid_levels"] = self.build_grid(mid)
-                    self._log(f"Recentered: new grid ${self.state['grid_levels'][0]:.4f}"
-                              f"-${self.state['grid_levels'][-1]:.4f}")
+                    self._syslog(
+                        f"RECENTERED: closed={n_closed} positions "
+                        f"new_range=${self.state['grid_levels'][0]:.4f}"
+                        f"-${self.state['grid_levels'][-1]:.4f} "
+                        f"total_pnl=${self.state['total_pnl']:+.2f}")
+                    if n_closed:
+                        ntfy(f"S{self.sys_id} {self.label} Breakout {direction}",
+                             f"Closed {n_closed} positions | "
+                             f"Total: ${self.state['total_pnl']:+.2f}",
+                             priority="default")
                     self._save_state()
                     time.sleep(5)
                     continue
 
                 # ── Check every grid level ─────────────────────
                 for lvl in self.state["grid_levels"]:
-                    lvl_str  = str(round(lvl, 6 if self.spacing < 1 else 2))
-                    sell_lvl = round(lvl + self.spacing,
-                                     6 if self.spacing < 1 else 2)
+                    lvl_key  = str(self._round_lvl(lvl))
+                    sell_lvl = self._round_lvl(lvl + self.spacing)
 
-                    # BUY: ask has dropped to this level
-                    if lvl_str not in self.state["open_buys"]:
+                    # BUY: ask has dropped to or below this level
+                    if lvl_key not in self.state["open_buys"]:
                         if ask <= lvl:
-                            cts = self.contracts_for_level(ask, bias)
-                            self.state["open_buys"][lvl_str] = ask
-                            self._log(f"BUY @ ${ask:.4f} level=${lvl:.4f} "
-                                      f"cts={cts} bias={bias}x "
-                                      f"open={len(self.state['open_buys'])}")
+                            cts = self.contracts_for(ask, bias)
+                            self.state["open_buys"][lvl_key] = round(ask, 6)
+                            self._syslog(
+                                f"BUY  level=${lvl:.4f} ask=${ask:.4f} "
+                                f"cts={cts} bias={bias}x "
+                                f"open={len(self.state['open_buys'])}")
                             self._save_state()
 
-                    # SELL: bid has risen to sell level (EXACT grid level exit)
-                    if lvl_str in self.state["open_buys"]:
+                    # SELL: bid has risen to or above the sell level
+                    # Exit at EXACT next grid level — not market price
+                    if lvl_key in self.state["open_buys"]:
                         if bid >= sell_lvl:
-                            entry_p = self.state["open_buys"][lvl_str]
-                            cts     = self.contracts_for_level(entry_p, bias)
-                            pnl     = self.net_pnl(entry_p, sell_lvl, cts)
+                            entry_p = self.state["open_buys"][lvl_key]
+                            cts     = self.contracts_for(entry_p, bias)
+                            pnl     = self.calc_pnl(entry_p, sell_lvl, cts)
                             mo      = now.strftime("%Y-%m")
 
-                            self.state["total_pnl"]       += pnl
-                            self.state["weekly_pnl"]      += pnl
-                            self.state["balance"]         += pnl
-                            self.state["total_fills"]     += 1
-                            self.state["monthly_pnl"][mo]  = round(
-                                self.state["monthly_pnl"].get(mo, 0) + pnl, 4)
+                            self.state["total_pnl"]   += pnl
+                            self.state["weekly_pnl"]  += pnl
+                            self.state["balance"]     += pnl
+                            self.state["total_fills"] += 1
+                            self.state["monthly_pnl"][mo] = round(
+                                self.state["monthly_pnl"].get(mo, 0.0) + pnl, 4)
 
                             fill = {
-                                "time":      now.isoformat(),
-                                "type":      "GRID_FILL",
-                                "buy_level": lvl,
-                                "sell_level":sell_lvl,
-                                "entry":     entry_p,
-                                "exit":      sell_lvl,
-                                "cts":       cts,
-                                "bias":      bias,
-                                "pnl":       pnl,
-                                "balance":   round(self.state["balance"], 4),
+                                "time":       now.isoformat(),
+                                "type":       "GRID_FILL",
+                                "buy_level":  lvl,
+                                "sell_level": sell_lvl,
+                                "entry":      entry_p,
+                                "exit":       sell_lvl,  # exact grid level
+                                "cts":        cts,
+                                "bias":       bias,
+                                "pnl":        pnl,
+                                "balance":    round(self.state["balance"], 4),
                             }
-                            self._save_fill(fill)
-                            del self.state["open_buys"][lvl_str]
-                            self._log(f"FILL #{self.state['total_fills']}: "
-                                      f"buy=${entry_p:.4f} sell=${sell_lvl:.4f} "
-                                      f"cts={cts} bias={bias}x pnl=${pnl:+.4f} "
-                                      f"total=${self.state['total_pnl']:+.2f}")
-                            if pnl > 0:
-                                ntfy(f"S{self.sys_id} {self.label} Fill",
-                                     f"${pnl:+.2f} | Total: ${self.state['total_pnl']:+.2f}",
-                                     priority="default")
+                            self._append_fill(fill)
+                            del self.state["open_buys"][lvl_key]
+
+                            self._syslog(
+                                f"FILL #{self.state['total_fills']} "
+                                f"buy=${entry_p:.4f} sell=${sell_lvl:.4f} "
+                                f"cts={cts} bias={bias}x "
+                                f"pnl=${pnl:+.4f} "
+                                f"total=${self.state['total_pnl']:+.2f} "
+                                f"balance=${self.state['balance']:.2f}")
+
+                            ntfy(f"S{self.sys_id} {self.label} Fill #{self.state['total_fills']}",
+                                 f"${pnl:+.4f} | Total: ${self.state['total_pnl']:+.2f}",
+                                 priority="default")
                             self._save_state()
 
-                # ── Heartbeat every cycle ─────────────────────
-                self._log(f"CYCLE price=${mid:.4f} bid=${bid:.4f} ask=${ask:.4f} "
-                          f"pnl=${self.state['total_pnl']:+.2f} "
-                          f"fills={self.state['total_fills']} "
-                          f"open={len(self.state['open_buys'])} "
-                          f"bias={bias}x "
-                          f"grid=${self.state['grid_levels'][0]:.4f}-${self.state['grid_levels'][-1]:.4f} "
-                          f"1hr_candles={len(self.price_history_1h)}")
+                # ── Heartbeat ─────────────────────────────────
+                self._syslog(
+                    f"CYCLE bid=${bid:.4f} ask=${ask:.4f} "
+                    f"grid=${grid_lo:.4f}-${grid_hi:.4f} "
+                    f"open={len(self.state['open_buys'])} "
+                    f"fills={self.state['total_fills']} "
+                    f"pnl=${self.state['total_pnl']:+.2f} "
+                    f"bal=${self.state['balance']:.2f} "
+                    f"bias={bias}x "
+                    f"1hr={len(self.price_history_1h)}/300")
 
-                time.sleep(60)  # check every minute
+                time.sleep(60)
 
             except Exception as e:
                 self.state["loop_errors"] = self.state.get("loop_errors", 0) + 1
-                self._log(f"Loop error: {e}")
-                self._save_state()
+                self._syslog(f"LOOP ERROR #{self.state['loop_errors']}: {e}")
+                ntfy(f"S{self.sys_id} {self.label} ERROR",
+                     str(e), priority="urgent")
+                try:
+                    self._save_state()
+                except:
+                    pass
                 time.sleep(30)
 
     # ── Dashboard helpers ─────────────────────────────────────────
 
-    def get_fills(self):
+    def get_fills(self, last_n=None):
         if os.path.exists(self.fills_file):
             try:
-                return json.load(open(self.fills_file))
+                fills = json.load(open(self.fills_file))
+                return fills[-last_n:] if last_n else fills
             except:
                 pass
         return []
@@ -2043,122 +582,169 @@ class GridSystem:
     def get_log_tail(self, n=50):
         if os.path.exists(self.log_file):
             try:
-                lines = open(self.log_file).readlines()
-                return lines[-n:]
+                return open(self.log_file).readlines()[-n:]
             except:
                 pass
         return []
 
 
-# ── Instantiate grid systems ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# INSTANTIATE — two isolated grid systems
+# ══════════════════════════════════════════════════════════════════
 G4 = GridSystem(4)   # XRP
 G5 = GridSystem(5)   # SOL
 GRID_SYSTEMS = [G4, G5]
 
 
-# ── Grid dashboard routes ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# FLASK APP
+# ══════════════════════════════════════════════════════════════════
+app = Flask(__name__)
+
+def _auth():
+    return request.cookies.get("auth") == APP_PASSWORD
+
+@app.route("/login", methods=["POST"])
+def login():
+    from flask import make_response
+    pw = request.form.get("pw", "")
+    if pw == APP_PASSWORD:
+        r = make_response(redirect("/"))
+        r.set_cookie("auth", APP_PASSWORD, max_age=86400*30,
+                     samesite="Lax", httponly=True)
+        return r
+    return redirect("/")
+
+@app.route("/health")
+def health():
+    out = {"status": "ok", "time": ts(), "systems": {}}
+    for g in GRID_SYSTEMS:
+        with g.lock:
+            s = g.state
+        out["systems"][f"S{g.sys_id}"] = {
+            "label":       g.label,
+            "total_pnl":   s.get("total_pnl", 0),
+            "total_fills": s.get("total_fills", 0),
+            "balance":     s.get("balance", 0),
+            "last_price":  s.get("last_price"),
+            "last_update": s.get("last_update"),
+            "loop_errors": s.get("loop_errors", 0),
+            "open_buys":   len(s.get("open_buys", {})),
+            "candles_1hr": len(g.price_history_1h),
+        }
+    return Response(json.dumps(out, indent=2), mimetype="application/json")
 
 @app.route("/grid-state-s<int:sid>")
 def grid_state(sid):
-    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
-        return Response("Unauthorized", status=401)
+    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
-    if not g:
-        return Response("Not found", status=404)
-    with g.lock:
-        return Response(json.dumps(g.state, indent=2), mimetype="application/json")
+    if not g: return Response("Not found", status=404)
+    return Response(json.dumps(g.state, indent=2), mimetype="application/json")
 
 @app.route("/grid-fills-s<int:sid>")
 def grid_fills(sid):
-    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
-        return Response("Unauthorized", status=401)
+    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
-    if not g:
-        return Response("Not found", status=404)
-    fills = g.get_fills()
-    return Response(json.dumps(fills, indent=2), mimetype="application/json")
+    if not g: return Response("Not found", status=404)
+    return Response(json.dumps(g.get_fills(), indent=2), mimetype="application/json")
 
 @app.route("/grid-candles-s<int:sid>")
 def grid_candles(sid):
-    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
-        return Response("Unauthorized", status=401)
+    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
-    if not g:
-        return Response("Not found", status=404)
+    if not g: return Response("Not found", status=404)
     return Response(json.dumps(g.price_history_1h), mimetype="application/json")
 
 @app.route("/grid-log-s<int:sid>")
 def grid_log(sid):
-    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
-        return Response("Unauthorized", status=401)
+    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
-    if not g:
-        return Response("Not found", status=404)
-    lines = g.get_log_tail(100)
-    return Response("".join(lines), mimetype="text/plain")
+    if not g: return Response("Not found", status=404)
+    return Response("".join(g.get_log_tail(100)), mimetype="text/plain")
 
+# ── Dashboard ──────────────────────────────────────────────────────
+LOGIN_PAGE = """<!DOCTYPE html><html><head><title>AP3X 2.0</title>
+<meta name=viewport content='width=device-width,initial-scale=1'>
+<style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center;padding:40px;background:#0A1628;border:1px solid #1E2D45;border-radius:12px}
+input{background:#060D1A;border:1px solid #1E2D45;color:#E0E6F0;padding:12px;
+border-radius:8px;margin:10px 0;width:200px;font-size:16px;display:block}
+button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius:8px;
+cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
+h2{margin-bottom:20px}</style></head>
+<body><form method=post action=/login class=box>
+<h2>AP3X 2.0</h2>
+<input type=password name=pw placeholder='Password' autofocus>
+<button type=submit>Login</button>
+</form></body></html>"""
 
-# ── Patch dashboard to include grid cards ─────────────────────────
-# We monkey-patch the route after defining it above.
-# Rebuild the dashboard function to include grid system cards.
-
-_original_dashboard = app.view_functions["dashboard"]
-
-def _grid_card(g):
+def _sys_card(g):
     with g.lock:
         s = dict(g.state)
-    pnl      = s["total_pnl"]
-    bal      = s["balance"]
-    fills    = s["total_fills"]
-    open_pos = len(s.get("open_buys", {}))
-    pnl_col  = "#00D68F" if pnl >= 0 else "#FF4757"
-    wk_col   = "#00D68F" if s.get("weekly_pnl", 0) >= 0 else "#FF4757"
 
-    # Days running
+    pnl      = s.get("total_pnl", 0.0)
+    bal      = s.get("balance", g.capital)
+    fills    = s.get("total_fills", 0)
+    open_pos = len(s.get("open_buys", {}))
+    wk_pnl   = s.get("weekly_pnl", 0.0)
+    errors   = s.get("loop_errors", 0)
+    breakouts= s.get("total_breakouts", 0)
+    candles  = len(g.price_history_1h)
+    bias     = g.trend_bias()
+    center   = s.get("grid_center") or "—"
+    last_p   = s.get("last_price") or "—"
+
+    # Days running + $/day
     try:
         start = datetime.fromisoformat(s["start_time"])
-        days  = (datetime.now(timezone.utc) - start).total_seconds() / 86400
-        pd    = round(pnl / days, 2) if days > 0.01 else 0.0
+        days  = max((datetime.now(timezone.utc) - start).total_seconds() / 86400, 0.01)
+        pd    = round(pnl / days, 2)
     except:
-        days = 0; pd = 0.0
+        days = 0.0; pd = 0.0
 
-    # Monthly rows
-    monthly_rows = ""
+    pnl_col = "#00D68F" if pnl  >= 0 else "#FF4757"
+    wk_col  = "#00D68F" if wk_pnl >= 0 else "#FF4757"
+
+    # Monthly breakdown
+    monthly_html = ""
     for mo in sorted(s.get("monthly_pnl", {}).keys()):
-        mp    = s["monthly_pnl"][mo]
-        mc    = "#00D68F" if mp >= 0 else "#FF4757"
-        monthly_rows += (
+        mp  = s["monthly_pnl"][mo]
+        mc  = "#00D68F" if mp >= 0 else "#FF4757"
+        monthly_html += (
             f"<div style='display:flex;justify-content:space-between;"
             f"padding:5px 0;border-bottom:1px solid #1E2D45;font-size:12px'>"
             f"<span>{mo}</span>"
             f"<span style='color:{mc};font-weight:700'>${mp:+,.2f}</span>"
-            f"</div>"
-        )
-    if not monthly_rows:
-        monthly_rows = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet</div>"
+            f"</div>")
+    if not monthly_html:
+        monthly_html = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet — waiting for first grid level hit</div>"
 
-    # Recent fills
-    fills_data = g.get_fills()
-    fill_rows = ""
-    for f in fills_data[-10:][::-1]:   # last 10, newest first
-        fc = "#00D68F" if f["pnl"] >= 0 else "#FF4757"
-        fill_rows += (
+    # Recent fills (last 10, newest first)
+    fills_html = ""
+    for f in g.get_fills(last_n=10)[::-1]:
+        fc    = "#00D68F" if f.get("pnl", 0) >= 0 else "#FF4757"
+        ftype = f.get("type", "?")
+        fills_html += (
             f"<div style='border-left:3px solid {fc};padding:6px 10px;"
             f"margin-bottom:5px;background:#060D1A;border-radius:0 6px 6px 0'>"
-            f"<div style='font-size:10px;color:#4A5878'>{f['time'][5:16]} · {f['type']}</div>"
-            f"<div style='font-size:12px;font-weight:700;color:{fc}'>${f['pnl']:+,.4f}</div>"
+            f"<div style='font-size:10px;color:#4A5878'>"
+            f"{f.get('time','?')[5:16]} · {ftype}</div>"
+            f"<div style='font-size:13px;font-weight:700;color:{fc}'>"
+            f"${f.get('pnl',0):+,.4f}</div>"
             f"<div style='font-size:10px;color:#8892A4'>"
-            f"entry=${f['entry']:.4f} → exit=${f['exit']:.4f} | {f['cts']}ct"
-            f"</div></div>"
-        )
-    if not fill_rows:
-        fill_rows = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet</div>"
+            f"entry=${f.get('entry',0):.4f} → "
+            f"exit=${f.get('exit',0):.4f} | "
+            f"{f.get('cts',1)}ct | bias={f.get('bias',1)}x"
+            f"</div></div>")
+    if not fills_html:
+        fills_html = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet</div>"
 
     # Log tail
-    log_lines = g.get_log_tail(20)
+    log_lines = g.get_log_tail(25)
     log_html  = "".join(
-        f"<div class='hb-row'>{l.strip()}</div>" for l in log_lines
-    ) or "<div style='color:#4A5878;padding:8px;font-size:12px'>No logs yet</div>"
+        f"<div class=hb-row>{l.strip()}</div>" for l in log_lines
+    ) or "<div style='color:#4A5878;padding:8px;font-size:12px'>No log entries yet</div>"
 
     sid = g.sys_id
     return f"""
@@ -2170,7 +756,7 @@ def _grid_card(g):
       <span style='font-size:13px;color:#8892A4;margin-left:8px'>{g.label}</span>
     </div>
     <span style='font-size:11px;color:#4A5878;background:#060D1A;
-          padding:3px 8px;border-radius:20px'>GRID · PAPER</span>
+          padding:3px 8px;border-radius:20px'>PAPER · GRID</span>
   </div>
 
   <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px'>
@@ -2187,24 +773,27 @@ def _grid_card(g):
       <div style='font-size:15px;font-weight:800;color:{pnl_col}'>${pd:+,.2f}</div>
     </div>
     <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
-      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>FILLS</div>
-      <div style='font-size:15px;font-weight:800'>{fills}</div>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>WEEK P&amp;L</div>
+      <div style='font-size:15px;font-weight:800;color:{wk_col}'>${wk_pnl:+,.2f}</div>
     </div>
   </div>
 
-  <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
-              margin-bottom:12px;font-size:12px'>
+  <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px;font-size:11px'>
+    <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
+      <div style='color:#4A5878;font-size:10px'>FILLS</div>
+      <div style='font-weight:700'>{fills}</div>
+    </div>
     <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
       <div style='color:#4A5878;font-size:10px'>OPEN BUYS</div>
       <div style='font-weight:700;color:#00D68F'>{open_pos}</div>
     </div>
     <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
-      <div style='color:#4A5878;font-size:10px'>SPACING</div>
-      <div style='font-weight:700'>${g.spacing}</div>
+      <div style='color:#4A5878;font-size:10px'>BIAS</div>
+      <div style='font-weight:700;color:#FFB800'>{bias}x</div>
     </div>
     <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
       <div style='color:#4A5878;font-size:10px'>ERRORS</div>
-      <div style='font-weight:700;color:{"#FF4757" if s.get("loop_errors",0)>0 else "#4A5878"}'>{s.get("loop_errors",0)}</div>
+      <div style='font-weight:700;color:{"#FF4757" if errors>0 else "#4A5878"}'>{errors}</div>
     </div>
   </div>
 
@@ -2214,59 +803,146 @@ def _grid_card(g):
     <span class=tab onclick="show('s{sid}log',this,'s{sid}')">Log</span>
     <span class=tab onclick="show('s{sid}inf',this,'s{sid}')">Info</span>
   </div>
-  <div id='s{sid}mon' class='panel on'>{monthly_rows}</div>
-  <div id='s{sid}fil' class=panel>{fill_rows}</div>
-  <div id='s{sid}log' class=panel style='font-family:monospace;font-size:10px'>{log_html}</div>
+  <div id='s{sid}mon' class='panel on'>{monthly_html}</div>
+  <div id='s{sid}fil' class=panel>{fills_html}</div>
+  <div id='s{sid}log' class='panel' style='font-family:monospace;font-size:10px;word-break:break-all'>{log_html}</div>
   <div id='s{sid}inf' class=panel>
-    <div style='font-size:12px;line-height:2;color:#8892A4'>
+    <div style='font-size:12px;line-height:2.2;color:#8892A4'>
       <b style='color:#E0E6F0'>Product</b>: {g.product_id}<br>
-      <b style='color:#E0E6F0'>Contract</b>: {g.cs} units · {g.mr*100:.1f}% margin<br>
+      <b style='color:#E0E6F0'>Contract</b>: {g.cs} units · {g.mr*100:.2f}% intraday margin<br>
       <b style='color:#E0E6F0'>Spacing</b>: ${g.spacing}<br>
-      <b style='color:#E0E6F0'>Levels</b>: {g.n_grids}<br>
+      <b style='color:#E0E6F0'>Levels</b>: {g.n_grids} ({g.n_grids//2} below + {g.n_grids//2} above)<br>
       <b style='color:#E0E6F0'>Capital</b>: ${g.capital:,.2f}<br>
-      <b style='color:#E0E6F0'>Center</b>: ${s.get("grid_center") or "not set"}<br>
-      <b style='color:#E0E6F0'>Breakouts</b>: {s.get("total_breakouts",0)}<br>
-      <b style='color:#E0E6F0'>1hr candles</b>: {len(g.price_history_1h)}/300<br>
+      <b style='color:#E0E6F0'>Grid center</b>: {center}<br>
+      <b style='color:#E0E6F0'>Last price</b>: {last_p}<br>
+      <b style='color:#E0E6F0'>Breakouts</b>: {breakouts}<br>
       <b style='color:#E0E6F0'>Days running</b>: {days:.1f}<br>
-      <div style='margin-top:8px'>
-        <a href='/grid-state-s{sid}' style='color:#4A5878'>State JSON</a> &nbsp;·&nbsp;
-        <a href='/grid-fills-s{sid}' style='color:#4A5878'>Fills JSON</a> &nbsp;·&nbsp;
-        <a href='/grid-candles-s{sid}' style='color:#4A5878'>Candles JSON</a> &nbsp;·&nbsp;
-        <a href='/grid-log-s{sid}' style='color:#4A5878'>Log</a>
+      <b style='color:#E0E6F0'>1hr candles</b>: {candles}/300<br>
+      <b style='color:#E0E6F0'>Fees</b>: 0.080% per side + $0.12/ct/side<br>
+      <div style='margin-top:10px;display:flex;gap:12px;flex-wrap:wrap'>
+        <a href='/grid-state-s{sid}' style='color:#4A5878;font-size:11px'>State JSON</a>
+        <a href='/grid-fills-s{sid}' style='color:#4A5878;font-size:11px'>Fills JSON</a>
+        <a href='/grid-candles-s{sid}' style='color:#4A5878;font-size:11px'>Candles JSON</a>
+        <a href='/grid-log-s{sid}' style='color:#4A5878;font-size:11px'>Full Log</a>
       </div>
     </div>
   </div>
 </div>"""
 
+@app.route("/")
+def dashboard():
+    if not _auth():
+        return LOGIN_PAGE
 
-def _new_dashboard():
-    resp = _original_dashboard()
-    # If it's a string (authenticated, full HTML), inject grid cards before </body>
-    if isinstance(resp, str) and "</body>" in resp:
-        grid_section = (
-            "<div style='font-size:11px;color:#4A5878;margin:20px 0 10px;"
-            "padding:10px;background:#0A1628;border-radius:8px;border:1px solid #1E2D45'>"
-            "Grid Bots — Paper Trading · XRP vs SOL</div>"
-        )
-        for g in GRID_SYSTEMS:
-            grid_section += _grid_card(g)
-        resp = resp.replace("</body>", grid_section + "</body>")
-    return resp
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-app.view_functions["dashboard"] = _new_dashboard
-
-
-# ── Start grid threads inside the existing startup ─────────────────
-# Wait for the existing startup thread to complete, then add grid threads.
-def _start_grid_systems():
-    # Give the main startup a head start
-    time.sleep(5)
+    # Compare both systems
+    pnls = []
     for g in GRID_SYSTEMS:
-        t = threading.Thread(target=g.run, daemon=True, name=f"S{g.sys_id}-{g.label}")
+        with g.lock:
+            pnls.append((g.label, g.state.get("total_pnl", 0.0)))
+    winner_label = max(pnls, key=lambda x: x[1])[0] if pnls else "—"
+
+    cards = "".join(_sys_card(g) for g in GRID_SYSTEMS)
+
+    return f"""<!DOCTYPE html><html><head>
+<title>AP3X 2.0</title>
+<meta charset=utf-8>
+<meta name=viewport content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>
+<meta http-equiv=refresh content=30>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#060D1A;color:#E0E6F0;
+       font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+       padding:14px;max-width:640px;margin:0 auto;padding-bottom:40px}}
+  a{{color:#8892A4;text-decoration:none}}
+  .tabs{{display:flex;gap:4px;margin-bottom:0;overflow-x:auto;
+         -webkit-overflow-scrolling:touch;scrollbar-width:none}}
+  .tabs::-webkit-scrollbar{{display:none}}
+  .tab{{flex-shrink:0;padding:10px 14px;cursor:pointer;border-radius:8px 8px 0 0;
+        font-size:12px;font-weight:600;background:#060D1A;color:#4A5878;
+        border:1px solid #1E2D45;border-bottom:none;min-height:40px;
+        display:flex;align-items:center;touch-action:manipulation}}
+  .tab.on{{background:#0A1628;color:#E0E6F0}}
+  .panel{{display:none;background:#0A1628;border:1px solid #1E2D45;
+          border-radius:0 10px 10px 10px;padding:12px;min-height:80px}}
+  .panel.on{{display:block}}
+  .hb-row{{font-size:10px;padding:4px 0;border-bottom:1px solid #060D1A;
+           word-break:break-all;color:#8892A4}}
+  .sys-card{{}}
+</style>
+<script>
+function show(id,el,prefix){{
+  var card=el.closest('.sys-card');
+  card.querySelectorAll('.panel').forEach(function(p){{p.classList.remove('on')}});
+  card.querySelectorAll('.tab').forEach(function(t){{t.classList.remove('on')}});
+  document.getElementById(id).classList.add('on');
+  el.classList.add('on');
+}}
+</script>
+</head><body>
+<div style='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px'>
+  <div>
+    <div style='font-size:22px;font-weight:800'>AP3X <span style='color:#4A5878'>2.0</span></div>
+    <div style='font-size:12px;font-weight:700;color:#FFB800;margin-top:2px'>📄 PAPER TRADING</div>
+    <div style='font-size:11px;color:#4A5878;margin-top:2px'>Grid Bots · XRP vs SOL</div>
+  </div>
+  <div style='text-align:right;font-size:11px;color:#4A5878;line-height:1.7'>
+    {now_utc}<br>{ts_est()}
+  </div>
+</div>
+<div style='font-size:11px;color:#4A5878;margin-bottom:16px;padding:10px;
+     background:#0A1628;border-radius:8px;border:1px solid #1E2D45;
+     display:flex;justify-content:space-between'>
+  <span>S4 XRP $0.15 grid · S5 SOL $7.00 grid</span>
+  <span style='color:#00D68F;font-weight:700'>🏆 {winner_label}</span>
+</div>
+{cards}
+<div style='font-size:11px;color:#4A5878;text-align:center;margin-top:8px'>
+  <a href='/health'>Health JSON</a>
+  &nbsp;·&nbsp;
+  <a href='/grid-fills-s4'>XRP Fills</a>
+  &nbsp;·&nbsp;
+  <a href='/grid-fills-s5'>SOL Fills</a>
+</div>
+</body></html>"""
+
+
+# ══════════════════════════════════════════════════════════════════
+# STARTUP — launch grid threads
+# ══════════════════════════════════════════════════════════════════
+def startup():
+    log("🚀 AP3X 2.0 — Grid Trading | XRP + SOL | PAPER MODE")
+    log(f"   S4 XRP: {G4.product_id} | ${G4.spacing} spacing | {G4.n_grids} levels | ${G4.capital:,.0f}")
+    log(f"   S5 SOL: {G5.product_id} | ${G5.spacing} spacing | {G5.n_grids} levels | ${G5.capital:,.0f}")
+    log(f"   Fees: {FEE_PCT*100:.3f}% per side + ${FEE_FLAT}/ct/side")
+
+    # Verify Coinbase connection before starting
+    try:
+        client = get_cb_client()
+        r = client.get_best_bid_ask(product_ids=["XPP-20DEC30-CDE", "SLP-20DEC30-CDE"])
+        for pb in r.pricebooks:
+            bid = float(pb.bids[0].price) if pb.bids else "?"
+            ask = float(pb.asks[0].price) if pb.asks else "?"
+            log(f"   ✅ {pb.product_id}: bid={bid} ask={ask}")
+    except Exception as e:
+        log(f"   ⚠️ Startup price check failed: {e}")
+        ntfy("⚠️ AP3X 2.0 Startup Warning",
+             f"Price check failed: {e}", priority="high")
+
+    for g in GRID_SYSTEMS:
+        t = threading.Thread(
+            target=g.run,
+            daemon=True,
+            name=f"S{g.sys_id}-{g.label}")
         t.start()
-        log(f"✅ {g.label} (S{g.sys_id}) thread started | "
-            f"product={g.product_id} spacing=${g.spacing} grids={g.n_grids}")
+        log(f"   ✅ S{g.sys_id} ({g.label}) thread started")
         time.sleep(0.5)
 
-_grid_startup = threading.Thread(target=_start_grid_systems, daemon=True, name="grid-startup")
-_grid_startup.start()
+    log("✅ All grid systems running")
+    ntfy("✅ AP3X 2.0 Started",
+         f"S4 XRP ${G4.spacing} grid | S5 SOL ${G5.spacing} grid | PAPER MODE",
+         priority="default")
+
+# Start in background — Railway health check won't timeout
+threading.Thread(target=startup, daemon=True, name="startup").start()
