@@ -95,8 +95,10 @@ GRID_CONFIGS = {
         "product_id": "XPP-20DEC30-CDE",
         "contract":   500.0,    # 500 XRP per contract
         "margin":     0.2001,   # 20.01% intraday margin
-        "spacing":    0.15,     # $0.15 between grid levels
-        "n_grids":    50,       # 25 below + 25 above center
+        # spacing = dynamic: price/n_grids so all levels fit above zero
+        # At $1.31 → $0.026/level. Recalculated on each grid init.
+        "spacing":    None,     # set dynamically from live price
+        "n_grids":    50,       # 50 levels below entry price
         "capital":    PAPER_BALANCE,
         "color":      "#00B4D8",
     },
@@ -105,8 +107,10 @@ GRID_CONFIGS = {
         "product_id": "SLP-20DEC30-CDE",
         "contract":   5.0,      # 5 SOL per contract
         "margin":     0.20,     # 20.00% intraday margin
-        "spacing":    7.0,      # $7.00 between grid levels
-        "n_grids":    40,       # 20 below + 20 above center
+        # spacing = dynamic: price/n_grids so all levels fit above zero
+        # At $101 → $2.53/level. Recalculated on each grid init.
+        "spacing":    None,     # set dynamically from live price
+        "n_grids":    40,       # 40 levels below entry price
         "capital":    PAPER_BALANCE,
         "color":      "#9B5DE5",
     },
@@ -176,8 +180,8 @@ class GridSystem:
         self.product_id = cfg["product_id"]
         self.cs         = cfg["contract"]   # units per contract
         self.mr         = cfg["margin"]     # intraday margin rate
-        self.spacing    = cfg["spacing"]    # $ between grid levels
-        self.n_grids    = cfg["n_grids"]    # total levels
+        self.spacing    = cfg["spacing"]    # None = calculated dynamically from live price
+        self.n_grids    = cfg["n_grids"]    # total levels below entry
         self.capital    = cfg["capital"]    # starting capital
         self.color      = cfg["color"]      # dashboard color
 
@@ -203,6 +207,7 @@ class GridSystem:
             "total_breakouts": 0,
             "grid_center":     None,
             "grid_levels":     [],
+            "grid_spacing":    None,    # saved so restarts restore correct spacing
             "open_buys":       {},        # str(level) → entry_price
             "start_time":      datetime.now(timezone.utc).isoformat(),
             "last_price":      None,
@@ -219,8 +224,12 @@ class GridSystem:
             try:
                 saved = json.load(open(self.state_file))
                 state.update(saved)
+                # Restore spacing from saved state (critical for restarts)
+                if state.get("grid_spacing"):
+                    self.spacing = state["grid_spacing"]
                 self._syslog(f"State loaded: balance=${state['balance']:.2f} "
-                             f"pnl=${state['total_pnl']:+.2f} fills={state['total_fills']}")
+                             f"pnl=${state['total_pnl']:+.2f} fills={state['total_fills']} "
+                             f"spacing={self.spacing}")
             except Exception as e:
                 self._syslog(f"State load error: {e} — starting fresh")
         return state
@@ -341,9 +350,40 @@ class GridSystem:
             return round(price, 4)
         return round(price, 2)
 
+    def calc_spacing(self, price):
+        """
+        Dynamic spacing: cover price*0.50 range with n_grids levels.
+        This means grid covers a 50% drop from current price — realistic worst case.
+        Minimum spacing must be > 3x fee breakeven so every fill is profitable.
+        """
+        fee_rt   = (price * self.cs * FEE_PCT + FEE_FLAT) * 2
+        min_space = (fee_rt / self.cs) * 3  # 3x fee minimum for profit
+        # Cover 50% of price range with n_grids levels
+        ideal    = round(price * 0.50 / self.n_grids, 6)
+        spacing  = max(ideal, min_space)
+        # Round to sensible precision
+        if spacing >= 10:   return round(spacing, 1)
+        if spacing >= 1:    return round(spacing, 2)
+        if spacing >= 0.1:  return round(spacing, 3)
+        return round(spacing, 4)
+
     def build_grid(self, center):
-        return [self._round_lvl(center + (i - self.n_grids // 2) * self.spacing)
-                for i in range(self.n_grids + 1)]
+        """
+        Grid goes from center DOWN by n_grids levels.
+        We only BUY as price falls — never buy above current price.
+        Spacing is calculated dynamically so all levels are above zero
+        and every fill is profitable after fees.
+        """
+        if not self.spacing:
+            self.spacing = self.calc_spacing(center)
+        self.state["grid_spacing"] = self.spacing  # persist for restarts
+        levels = []
+        for i in range(self.n_grids + 1):
+            lvl = self._round_lvl(center - i * self.spacing)
+            if lvl <= 0:
+                break  # never go below zero
+            levels.append(lvl)
+        return levels
 
     def calc_pnl(self, entry, exit_p, contracts):
         """
@@ -418,19 +458,21 @@ class GridSystem:
                 if not self.state["grid_center"] or not self.state["grid_levels"]:
                     self.state["grid_center"] = mid
                     self.state["grid_levels"] = self.build_grid(mid)
-                    lo = self.state["grid_levels"][0]
-                    hi = self.state["grid_levels"][-1]
+                    hi = self.state["grid_levels"][0]   # top = center
+                    lo = self.state["grid_levels"][-1]  # bottom = center - n*spacing
                     self._syslog(
                         f"GRID INIT: center=${mid:.4f} "
                         f"range=${lo:.4f}-${hi:.4f} "
                         f"levels={self.n_grids}")
                     self._save_state()
 
-                grid_lo = self.state["grid_levels"][0]
-                grid_hi = self.state["grid_levels"][-1]
+                grid_lo = self.state["grid_levels"][-1]  # lowest level (last in list)
+                grid_hi = self.state["grid_levels"][0]   # center (highest = starting price)
 
-                # ── Breakout: close all open buys, recenter ───
-                if mid < grid_lo or mid > grid_hi:
+                # ── Breakout: price dropped below lowest grid level ───
+                # Upper breakout (price pumps above center): no action needed —
+                # none of our buy levels were hit, we just recenter higher
+                if mid < grid_lo or mid > grid_hi * 1.5:
                     direction = "UP" if mid > grid_hi else "DOWN"
                     self._syslog(
                         f"BREAKOUT {direction}: price=${mid:.4f} "
@@ -469,6 +511,8 @@ class GridSystem:
                     self.state["total_breakouts"] = \
                         self.state.get("total_breakouts", 0) + 1
                     self.state["grid_center"] = mid
+                    self.spacing = self.calc_spacing(mid)  # recalculate for new price
+                    self.state["grid_spacing"] = self.spacing  # persist for restarts
                     self.state["grid_levels"] = self.build_grid(mid)
                     self._syslog(
                         f"RECENTERED: closed={n_closed} positions "
@@ -489,9 +533,11 @@ class GridSystem:
                     lvl_key  = str(self._round_lvl(lvl))
                     sell_lvl = self._round_lvl(lvl + self.spacing)
 
-                    # BUY: ask has dropped to or below this level
+                    # BUY: price has fallen to this level from above
+                    # Only trigger when ask drops TO or BELOW the level
+                    # Level must be below the grid center (we only buy dips)
                     if lvl_key not in self.state["open_buys"]:
-                        if ask <= lvl:
+                        if ask <= lvl and lvl < grid_hi:
                             cts = self.contracts_for(ask, bias)
                             self.state["open_buys"][lvl_key] = round(ask, 6)
                             self._syslog(
@@ -811,7 +857,7 @@ def _sys_card(g):
       <b style='color:#E0E6F0'>Product</b>: {g.product_id}<br>
       <b style='color:#E0E6F0'>Contract</b>: {g.cs} units · {g.mr*100:.2f}% intraday margin<br>
       <b style='color:#E0E6F0'>Spacing</b>: ${g.spacing}<br>
-      <b style='color:#E0E6F0'>Levels</b>: {g.n_grids} ({g.n_grids//2} below + {g.n_grids//2} above)<br>
+      <b style='color:#E0E6F0'>Levels</b>: {g.n_grids} (downward from entry price)<br>
       <b style='color:#E0E6F0'>Capital</b>: ${g.capital:,.2f}<br>
       <b style='color:#E0E6F0'>Grid center</b>: {center}<br>
       <b style='color:#E0E6F0'>Last price</b>: {last_p}<br>
@@ -894,7 +940,7 @@ function show(id,el,prefix){{
 <div style='font-size:11px;color:#4A5878;margin-bottom:16px;padding:10px;
      background:#0A1628;border-radius:8px;border:1px solid #1E2D45;
      display:flex;justify-content:space-between'>
-  <span>S4 XRP $0.15 grid · S5 SOL $7.00 grid</span>
+  <span>S4 XRP Grid · S5 SOL Grid · dynamic spacing</span>
   <span style='color:#00D68F;font-weight:700'>🏆 {winner_label}</span>
 </div>
 {cards}
