@@ -194,8 +194,6 @@ class TradingSystem:
             with self.lock:
                 for k, v in data.items():
                     if k in self.state:
-                        if k == "balance" and PAPER_MODE:
-                            continue
                         self.state[k] = v
             log(f"[S{self.sys_id}] State restored | trades={self.state['total_trades']} pnl=${self.state['total_pnl']:+.2f}")
         except Exception as e:
@@ -608,7 +606,8 @@ class TradingSystem:
         self.total_usdc            = _start
         self.load_state()
 
-        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | {'PAPER $2,000' if PAPER_MODE else f'LIVE ${_start:,.2f}'}")
+        _display_bal = self.state["balance"]
+        log(f"[S{self.sys_id}] 🚀 Started — {self.label} | {'PAPER' if PAPER_MODE else 'LIVE'} ${_display_bal:,.2f}")
         log(f"[S{self.sys_id}] Strategy: RSI({RSI_PERIOD}/{RSI_ENTRY}/{RSI_EXIT}/{RSI_TRAIL_TRIG}→{RSI_TRAIL_EXIT}) + MTF")
         log(f"[S{self.sys_id}] Source: {self.source}")
 
@@ -1659,3 +1658,615 @@ def startup():
 # Prevents Railway health check timeout during 14-second candle preload
 _startup_thread = threading.Thread(target=startup, daemon=True, name="startup")
 _startup_thread.start()
+
+# ══════════════════════════════════════════════════════════════════
+# GRID SYSTEMS — S4 (XRP) and S5 (SOL)
+# Completely independent from S1/S2/S3 RSI systems
+# Each has own state file, log, fills, P&L tracking
+# Paper mode only — simulates fills at real live bid/ask
+# ══════════════════════════════════════════════════════════════════
+
+GRID_CONFIGS = {
+    4: {
+        "label":      "XRP Grid",
+        "product_id": "XPP-20DEC30-CDE",
+        "contract":   500.0,
+        "margin":     0.2001,
+        "spacing":    0.15,
+        "n_grids":    50,
+        "capital":    float(os.environ.get("PAPER_BALANCE", "2000")),
+        "color":      "#00B4D8",
+    },
+    5: {
+        "label":      "SOL Grid",
+        "product_id": "SLP-20DEC30-CDE",
+        "contract":   5.0,
+        "margin":     0.20,
+        "spacing":    7.0,
+        "n_grids":    40,
+        "capital":    float(os.environ.get("PAPER_BALANCE", "2000")),
+        "color":      "#9B5DE5",
+    },
+}
+
+class GridSystem:
+    """
+    Fully self-contained grid bot.
+    Runs as a daemon thread.
+    Completely isolated from RSI systems S1/S2/S3.
+    State persists to /tmp/grid_state_s{N}.json
+    Candle history saved to /tmp/grid_candles_s{N}.json
+    All fills saved to /tmp/grid_fills_s{N}.json
+    """
+
+    def __init__(self, sys_id):
+        cfg = GRID_CONFIGS[sys_id]
+        self.sys_id     = sys_id
+        self.label      = cfg["label"]
+        self.product_id = cfg["product_id"]
+        self.cs         = cfg["contract"]
+        self.mr         = cfg["margin"]
+        self.spacing    = cfg["spacing"]
+        self.n_grids    = cfg["n_grids"]
+        self.capital    = cfg["capital"]
+        self.color      = cfg["color"]
+
+        # Files — all unique, never shared with RSI systems
+        self.state_file   = f"/tmp/grid_state_s{sys_id}.json"
+        self.fills_file   = f"/tmp/grid_fills_s{sys_id}.json"   # every fill saved
+        self.candles_file = f"/tmp/grid_candles_s{sys_id}.json" # 1hr price history
+        self.log_file     = f"/tmp/grid_log_s{sys_id}.txt"
+
+        self.lock = threading.Lock()
+
+        # Live state
+        self.state = self._load_state()
+        self.price_history_1h = self._load_candles()  # list of close prices, 1hr
+
+    # ── Persistence ──────────────────────────────────────────────
+
+    def _load_state(self):
+        default = {
+            "balance":      self.capital,
+            "total_pnl":    0.0,
+            "total_fills":  0,
+            "total_breakouts": 0,
+            "grid_center":  None,
+            "grid_levels":  [],
+            "open_buys":    {},       # str(level) → entry_price
+            "start_time":   datetime.now(timezone.utc).isoformat(),
+            "last_price":   None,
+            "last_update":  None,
+            "monthly_pnl":  {},       # "YYYY-MM" → float
+            "weekly_pnl":   0.0,
+            "week":         None,
+            "loop_errors":  0,
+        }
+        if os.path.exists(self.state_file):
+            try:
+                saved = json.load(open(self.state_file))
+                default.update(saved)
+            except Exception as e:
+                self._log(f"State load error: {e} — using fresh state")
+        return default
+
+    def _save_state(self):
+        try:
+            self.state["last_update"] = datetime.now(timezone.utc).isoformat()
+            json.dump(self.state, open(self.state_file, "w"), indent=2)
+        except Exception as e:
+            self._log(f"State save error: {e}")
+
+    def _load_candles(self):
+        if os.path.exists(self.candles_file):
+            try:
+                return json.load(open(self.candles_file))
+            except:
+                pass
+        return []
+
+    def _save_candles(self):
+        try:
+            # Keep last 300 1hr prices — enough for EMA200
+            json.dump(self.price_history_1h[-300:], open(self.candles_file, "w"))
+        except Exception as e:
+            self._log(f"Candle save error: {e}")
+
+    def _save_fill(self, fill):
+        """Append every fill to fills_file for permanent record + sim analysis"""
+        try:
+            fills = []
+            if os.path.exists(self.fills_file):
+                fills = json.load(open(self.fills_file))
+            fills.append(fill)
+            json.dump(fills, open(self.fills_file, "w"), indent=2)
+        except Exception as e:
+            self._log(f"Fill save error: {e}")
+
+    def _log(self, msg):
+        line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} [S{self.sys_id}/{self.label}] {msg}"
+        log(line)  # shared app log
+        try:
+            with open(self.log_file, "a") as f:
+                f.write(line + "\n")
+        except:
+            pass
+
+    # ── Price feed ───────────────────────────────────────────────
+
+    def get_bid_ask(self):
+        """Fetch live bid/ask from Coinbase — retries 3x"""
+        for attempt in range(3):
+            try:
+                client = get_cb_client()
+                r = client.get_best_bid_ask(product_ids=[self.product_id])
+                for p in r.pricebooks:
+                    if p.product_id == self.product_id:
+                        bid = float(p.bids[0].price) if p.bids else None
+                        ask = float(p.asks[0].price) if p.asks else None
+                        if bid and ask:
+                            return bid, ask, (bid + ask) / 2.0
+            except Exception as e:
+                self._log(f"Price fetch attempt {attempt+1}/3: {e}")
+                time.sleep(2)
+        return None, None, None
+
+    # ── EMA trend bias ───────────────────────────────────────────
+
+    def _ema(self, prices, period):
+        if len(prices) < period:
+            return None
+        k = 2.0 / (period + 1)
+        val = sum(prices[:period]) / period
+        for p in prices[period:]:
+            val = p * k + val * (1 - k)
+        return val
+
+    def get_trend_bias(self):
+        """
+        Uses 1hr candle history for EMA20/50/200 trend filter.
+        Returns 3x (strong uptrend), 2x (moderate), 1x (neutral/down).
+        Needs 200+ candles — falls back to 1x while building history.
+        """
+        if len(self.price_history_1h) < 200:
+            return 1.0
+        e20  = self._ema(self.price_history_1h, 20)
+        e50  = self._ema(self.price_history_1h, 50)
+        e200 = self._ema(self.price_history_1h, 200)
+        cp   = self.price_history_1h[-1]
+        if e20 and e50 and e200:
+            if cp > e20 > e50 > e200:
+                return 3.0
+            if cp > e50:
+                return 2.0
+        return 1.0
+
+    # ── Grid logic ───────────────────────────────────────────────
+
+    def build_grid(self, center):
+        return [round(center + (i - self.n_grids // 2) * self.spacing,
+                      6 if self.spacing < 1 else 2)
+                for i in range(self.n_grids + 1)]
+
+    def fee_rt(self, price, contracts):
+        """Round-trip fee for N contracts at given price"""
+        sz = contracts * self.cs
+        return round((price * sz * FEE_PCT + FEE_FLAT * contracts) * 2, 4)
+
+    def net_pnl(self, entry, exit_p, contracts):
+        sz = contracts * self.cs
+        gross = (exit_p - entry) * sz
+        fee = self.fee_rt(entry, contracts) / 2 + self.fee_rt(exit_p, contracts) / 2
+        # More precise: fee each side separately
+        fee = (entry * sz * FEE_PCT + FEE_FLAT * contracts) + \
+              (exit_p * sz * FEE_PCT + FEE_FLAT * contracts)
+        return round(gross - fee, 4)
+
+    def contracts_for_level(self, price, bias=1.0):
+        cpg = self.state["balance"] / self.n_grids
+        margin_per_ct = price * self.cs * self.mr
+        if margin_per_ct <= 0:
+            return 1
+        return max(1, min(10, int(cpg * bias / margin_per_ct)))
+
+    # ── Weekly reset ─────────────────────────────────────────────
+
+    def check_weekly_reset(self):
+        wk = get_week()
+        if self.state.get("week") != wk:
+            self.state["weekly_pnl"] = 0.0
+            self.state["week"] = wk
+
+    # ── Main loop ────────────────────────────────────────────────
+
+    def run(self):
+        self._log(f"Started | product={self.product_id} spacing=${self.spacing} "
+                  f"grids={self.n_grids} capital=${self.capital}")
+        last_1h_ts = 0
+
+        while True:
+            try:
+                bid, ask, mid = self.get_bid_ask()
+                if not bid or not ask or not mid:
+                    time.sleep(15)
+                    continue
+
+                now = datetime.now(timezone.utc)
+                self.state["last_price"] = mid
+                self.check_weekly_reset()
+
+                # ── Update 1hr candle history ─────────────────
+                ts_now = int(time.time())
+                if ts_now - last_1h_ts >= 3600:
+                    self.price_history_1h.append(mid)
+                    if len(self.price_history_1h) > 300:
+                        self.price_history_1h.pop(0)
+                    self._save_candles()
+                    last_1h_ts = ts_now
+                    self._log(f"1hr candle added: price=${mid:.4f} history={len(self.price_history_1h)} candles")
+
+                bias = self.get_trend_bias()
+
+                # ── Initialize grid ───────────────────────────
+                if not self.state["grid_center"] or not self.state["grid_levels"]:
+                    self.state["grid_center"] = mid
+                    self.state["grid_levels"] = self.build_grid(mid)
+                    self._log(f"Grid initialized: center=${mid:.4f} "
+                              f"lo=${self.state['grid_levels'][0]:.4f} "
+                              f"hi=${self.state['grid_levels'][-1]:.4f}")
+                    self._save_state()
+
+                grid_lo = self.state["grid_levels"][0]
+                grid_hi = self.state["grid_levels"][-1]
+
+                # ── Breakout — close all, recenter ────────────
+                if mid < grid_lo or mid > grid_hi:
+                    self._log(f"BREAKOUT: price=${mid:.4f} grid=${grid_lo:.4f}-${grid_hi:.4f} "
+                              f"open_buys={len(self.state['open_buys'])}")
+                    for lvl_str, entry_p in list(self.state["open_buys"].items()):
+                        cts  = self.contracts_for_level(entry_p)
+                        pnl  = self.net_pnl(entry_p, mid, cts)
+                        mo   = now.strftime("%Y-%m")
+                        self.state["total_pnl"]        += pnl
+                        self.state["weekly_pnl"]       += pnl
+                        self.state["balance"]          += pnl
+                        self.state["monthly_pnl"][mo]   = round(
+                            self.state["monthly_pnl"].get(mo, 0) + pnl, 4)
+                        fill = {
+                            "time":    now.isoformat(),
+                            "type":    "BREAKOUT_CLOSE",
+                            "level":   float(lvl_str),
+                            "entry":   entry_p,
+                            "exit":    mid,
+                            "cts":     cts,
+                            "pnl":     pnl,
+                            "balance": round(self.state["balance"], 4),
+                        }
+                        self._save_fill(fill)
+                        direction = "up" if mid > grid_hi else "down"
+                        self._log(f"  Breakout close ({direction}): "
+                                  f"entry=${entry_p:.4f} exit=${mid:.4f} "
+                                  f"cts={cts} pnl=${pnl:+.4f}")
+
+                    self.state["open_buys"] = {}
+                    self.state["total_breakouts"] = self.state.get("total_breakouts", 0) + 1
+                    self.state["grid_center"] = mid
+                    self.state["grid_levels"] = self.build_grid(mid)
+                    self._log(f"Recentered: new grid ${self.state['grid_levels'][0]:.4f}"
+                              f"-${self.state['grid_levels'][-1]:.4f}")
+                    self._save_state()
+                    time.sleep(5)
+                    continue
+
+                # ── Check every grid level ─────────────────────
+                for lvl in self.state["grid_levels"]:
+                    lvl_str  = str(round(lvl, 6 if self.spacing < 1 else 2))
+                    sell_lvl = round(lvl + self.spacing,
+                                     6 if self.spacing < 1 else 2)
+
+                    # BUY: ask has dropped to this level
+                    if lvl_str not in self.state["open_buys"]:
+                        if ask <= lvl:
+                            cts = self.contracts_for_level(ask, bias)
+                            self.state["open_buys"][lvl_str] = ask
+                            self._log(f"BUY @ ${ask:.4f} level=${lvl:.4f} "
+                                      f"cts={cts} bias={bias}x "
+                                      f"open={len(self.state['open_buys'])}")
+                            self._save_state()
+
+                    # SELL: bid has risen to sell level (EXACT grid level exit)
+                    if lvl_str in self.state["open_buys"]:
+                        if bid >= sell_lvl:
+                            entry_p = self.state["open_buys"][lvl_str]
+                            cts     = self.contracts_for_level(entry_p, bias)
+                            pnl     = self.net_pnl(entry_p, sell_lvl, cts)
+                            mo      = now.strftime("%Y-%m")
+
+                            self.state["total_pnl"]       += pnl
+                            self.state["weekly_pnl"]      += pnl
+                            self.state["balance"]         += pnl
+                            self.state["total_fills"]     += 1
+                            self.state["monthly_pnl"][mo]  = round(
+                                self.state["monthly_pnl"].get(mo, 0) + pnl, 4)
+
+                            fill = {
+                                "time":      now.isoformat(),
+                                "type":      "GRID_FILL",
+                                "buy_level": lvl,
+                                "sell_level":sell_lvl,
+                                "entry":     entry_p,
+                                "exit":      sell_lvl,
+                                "cts":       cts,
+                                "bias":      bias,
+                                "pnl":       pnl,
+                                "balance":   round(self.state["balance"], 4),
+                            }
+                            self._save_fill(fill)
+                            del self.state["open_buys"][lvl_str]
+                            self._log(f"FILL #{self.state['total_fills']}: "
+                                      f"buy=${entry_p:.4f} sell=${sell_lvl:.4f} "
+                                      f"cts={cts} bias={bias}x pnl=${pnl:+.4f} "
+                                      f"total=${self.state['total_pnl']:+.2f}")
+                            if pnl > 0:
+                                ntfy(f"S{self.sys_id} {self.label} Fill",
+                                     f"${pnl:+.2f} | Total: ${self.state['total_pnl']:+.2f}",
+                                     priority="default")
+                            self._save_state()
+
+                # ── Heartbeat every cycle ─────────────────────
+                self._log(f"CYCLE price=${mid:.4f} bid=${bid:.4f} ask=${ask:.4f} "
+                          f"pnl=${self.state['total_pnl']:+.2f} "
+                          f"fills={self.state['total_fills']} "
+                          f"open={len(self.state['open_buys'])} "
+                          f"bias={bias}x "
+                          f"grid=${self.state['grid_levels'][0]:.4f}-${self.state['grid_levels'][-1]:.4f} "
+                          f"1hr_candles={len(self.price_history_1h)}")
+
+                time.sleep(60)  # check every minute
+
+            except Exception as e:
+                self.state["loop_errors"] = self.state.get("loop_errors", 0) + 1
+                self._log(f"Loop error: {e}")
+                self._save_state()
+                time.sleep(30)
+
+    # ── Dashboard helpers ─────────────────────────────────────────
+
+    def get_fills(self):
+        if os.path.exists(self.fills_file):
+            try:
+                return json.load(open(self.fills_file))
+            except:
+                pass
+        return []
+
+    def get_log_tail(self, n=50):
+        if os.path.exists(self.log_file):
+            try:
+                lines = open(self.log_file).readlines()
+                return lines[-n:]
+            except:
+                pass
+        return []
+
+
+# ── Instantiate grid systems ──────────────────────────────────────
+G4 = GridSystem(4)   # XRP
+G5 = GridSystem(5)   # SOL
+GRID_SYSTEMS = [G4, G5]
+
+
+# ── Grid dashboard routes ─────────────────────────────────────────
+
+@app.route("/grid-state-s<int:sid>")
+def grid_state(sid):
+    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
+        return Response("Unauthorized", status=401)
+    g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
+    if not g:
+        return Response("Not found", status=404)
+    with g.lock:
+        return Response(json.dumps(g.state, indent=2), mimetype="application/json")
+
+@app.route("/grid-fills-s<int:sid>")
+def grid_fills(sid):
+    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
+        return Response("Unauthorized", status=401)
+    g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
+    if not g:
+        return Response("Not found", status=404)
+    fills = g.get_fills()
+    return Response(json.dumps(fills, indent=2), mimetype="application/json")
+
+@app.route("/grid-candles-s<int:sid>")
+def grid_candles(sid):
+    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
+        return Response("Unauthorized", status=401)
+    g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
+    if not g:
+        return Response("Not found", status=404)
+    return Response(json.dumps(g.price_history_1h), mimetype="application/json")
+
+@app.route("/grid-log-s<int:sid>")
+def grid_log(sid):
+    if request.cookies.get("auth") != os.environ.get("APP_PASSWORD","3757"):
+        return Response("Unauthorized", status=401)
+    g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
+    if not g:
+        return Response("Not found", status=404)
+    lines = g.get_log_tail(100)
+    return Response("".join(lines), mimetype="text/plain")
+
+
+# ── Patch dashboard to include grid cards ─────────────────────────
+# We monkey-patch the route after defining it above.
+# Rebuild the dashboard function to include grid system cards.
+
+_original_dashboard = app.view_functions["dashboard"]
+
+def _grid_card(g):
+    with g.lock:
+        s = dict(g.state)
+    pnl      = s["total_pnl"]
+    bal      = s["balance"]
+    fills    = s["total_fills"]
+    open_pos = len(s.get("open_buys", {}))
+    pnl_col  = "#00D68F" if pnl >= 0 else "#FF4757"
+    wk_col   = "#00D68F" if s.get("weekly_pnl", 0) >= 0 else "#FF4757"
+
+    # Days running
+    try:
+        start = datetime.fromisoformat(s["start_time"])
+        days  = (datetime.now(timezone.utc) - start).total_seconds() / 86400
+        pd    = round(pnl / days, 2) if days > 0.01 else 0.0
+    except:
+        days = 0; pd = 0.0
+
+    # Monthly rows
+    monthly_rows = ""
+    for mo in sorted(s.get("monthly_pnl", {}).keys()):
+        mp    = s["monthly_pnl"][mo]
+        mc    = "#00D68F" if mp >= 0 else "#FF4757"
+        monthly_rows += (
+            f"<div style='display:flex;justify-content:space-between;"
+            f"padding:5px 0;border-bottom:1px solid #1E2D45;font-size:12px'>"
+            f"<span>{mo}</span>"
+            f"<span style='color:{mc};font-weight:700'>${mp:+,.2f}</span>"
+            f"</div>"
+        )
+    if not monthly_rows:
+        monthly_rows = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet</div>"
+
+    # Recent fills
+    fills_data = g.get_fills()
+    fill_rows = ""
+    for f in fills_data[-10:][::-1]:   # last 10, newest first
+        fc = "#00D68F" if f["pnl"] >= 0 else "#FF4757"
+        fill_rows += (
+            f"<div style='border-left:3px solid {fc};padding:6px 10px;"
+            f"margin-bottom:5px;background:#060D1A;border-radius:0 6px 6px 0'>"
+            f"<div style='font-size:10px;color:#4A5878'>{f['time'][5:16]} · {f['type']}</div>"
+            f"<div style='font-size:12px;font-weight:700;color:{fc}'>${f['pnl']:+,.4f}</div>"
+            f"<div style='font-size:10px;color:#8892A4'>"
+            f"entry=${f['entry']:.4f} → exit=${f['exit']:.4f} | {f['cts']}ct"
+            f"</div></div>"
+        )
+    if not fill_rows:
+        fill_rows = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet</div>"
+
+    # Log tail
+    log_lines = g.get_log_tail(20)
+    log_html  = "".join(
+        f"<div class='hb-row'>{l.strip()}</div>" for l in log_lines
+    ) or "<div style='color:#4A5878;padding:8px;font-size:12px'>No logs yet</div>"
+
+    sid = g.sys_id
+    return f"""
+<div class='sys-card' style='background:#0A1628;border:2px solid {g.color};
+     border-radius:12px;padding:16px;margin-bottom:20px'>
+  <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'>
+    <div>
+      <span style='font-size:16px;font-weight:800;color:{g.color}'>S{sid}</span>
+      <span style='font-size:13px;color:#8892A4;margin-left:8px'>{g.label}</span>
+    </div>
+    <span style='font-size:11px;color:#4A5878;background:#060D1A;
+          padding:3px 8px;border-radius:20px'>GRID · PAPER</span>
+  </div>
+
+  <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px'>
+    <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>BALANCE</div>
+      <div style='font-size:15px;font-weight:800'>${bal:,.2f}</div>
+    </div>
+    <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>TOTAL P&amp;L</div>
+      <div style='font-size:15px;font-weight:800;color:{pnl_col}'>${pnl:+,.2f}</div>
+    </div>
+    <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>$/DAY</div>
+      <div style='font-size:15px;font-weight:800;color:{pnl_col}'>${pd:+,.2f}</div>
+    </div>
+    <div style='text-align:center;background:#060D1A;border-radius:8px;padding:8px'>
+      <div style='font-size:10px;color:#4A5878;margin-bottom:2px'>FILLS</div>
+      <div style='font-size:15px;font-weight:800'>{fills}</div>
+    </div>
+  </div>
+
+  <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
+              margin-bottom:12px;font-size:12px'>
+    <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
+      <div style='color:#4A5878;font-size:10px'>OPEN BUYS</div>
+      <div style='font-weight:700;color:#00D68F'>{open_pos}</div>
+    </div>
+    <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
+      <div style='color:#4A5878;font-size:10px'>SPACING</div>
+      <div style='font-weight:700'>${g.spacing}</div>
+    </div>
+    <div style='background:#060D1A;border-radius:6px;padding:6px;text-align:center'>
+      <div style='color:#4A5878;font-size:10px'>ERRORS</div>
+      <div style='font-weight:700;color:{"#FF4757" if s.get("loop_errors",0)>0 else "#4A5878"}'>{s.get("loop_errors",0)}</div>
+    </div>
+  </div>
+
+  <div class=tabs>
+    <span class='tab on' onclick="show('s{sid}mon',this,'s{sid}')">Monthly</span>
+    <span class=tab onclick="show('s{sid}fil',this,'s{sid}')">Fills</span>
+    <span class=tab onclick="show('s{sid}log',this,'s{sid}')">Log</span>
+    <span class=tab onclick="show('s{sid}inf',this,'s{sid}')">Info</span>
+  </div>
+  <div id='s{sid}mon' class='panel on'>{monthly_rows}</div>
+  <div id='s{sid}fil' class=panel>{fill_rows}</div>
+  <div id='s{sid}log' class=panel style='font-family:monospace;font-size:10px'>{log_html}</div>
+  <div id='s{sid}inf' class=panel>
+    <div style='font-size:12px;line-height:2;color:#8892A4'>
+      <b style='color:#E0E6F0'>Product</b>: {g.product_id}<br>
+      <b style='color:#E0E6F0'>Contract</b>: {g.cs} units · {g.mr*100:.1f}% margin<br>
+      <b style='color:#E0E6F0'>Spacing</b>: ${g.spacing}<br>
+      <b style='color:#E0E6F0'>Levels</b>: {g.n_grids}<br>
+      <b style='color:#E0E6F0'>Capital</b>: ${g.capital:,.2f}<br>
+      <b style='color:#E0E6F0'>Center</b>: ${s.get("grid_center") or "not set"}<br>
+      <b style='color:#E0E6F0'>Breakouts</b>: {s.get("total_breakouts",0)}<br>
+      <b style='color:#E0E6F0'>1hr candles</b>: {len(g.price_history_1h)}/300<br>
+      <b style='color:#E0E6F0'>Days running</b>: {days:.1f}<br>
+      <div style='margin-top:8px'>
+        <a href='/grid-state-s{sid}' style='color:#4A5878'>State JSON</a> &nbsp;·&nbsp;
+        <a href='/grid-fills-s{sid}' style='color:#4A5878'>Fills JSON</a> &nbsp;·&nbsp;
+        <a href='/grid-candles-s{sid}' style='color:#4A5878'>Candles JSON</a> &nbsp;·&nbsp;
+        <a href='/grid-log-s{sid}' style='color:#4A5878'>Log</a>
+      </div>
+    </div>
+  </div>
+</div>"""
+
+
+def _new_dashboard():
+    resp = _original_dashboard()
+    # If it's a string (authenticated, full HTML), inject grid cards before </body>
+    if isinstance(resp, str) and "</body>" in resp:
+        grid_section = (
+            "<div style='font-size:11px;color:#4A5878;margin:20px 0 10px;"
+            "padding:10px;background:#0A1628;border-radius:8px;border:1px solid #1E2D45'>"
+            "Grid Bots — Paper Trading · XRP vs SOL</div>"
+        )
+        for g in GRID_SYSTEMS:
+            grid_section += _grid_card(g)
+        resp = resp.replace("</body>", grid_section + "</body>")
+    return resp
+
+app.view_functions["dashboard"] = _new_dashboard
+
+
+# ── Start grid threads inside the existing startup ─────────────────
+# Wait for the existing startup thread to complete, then add grid threads.
+def _start_grid_systems():
+    # Give the main startup a head start
+    time.sleep(5)
+    for g in GRID_SYSTEMS:
+        t = threading.Thread(target=g.run, daemon=True, name=f"S{g.sys_id}-{g.label}")
+        t.start()
+        log(f"✅ {g.label} (S{g.sys_id}) thread started | "
+            f"product={g.product_id} spacing=${g.spacing} grids={g.n_grids}")
+        time.sleep(0.5)
+
+_grid_startup = threading.Thread(target=_start_grid_systems, daemon=True, name="grid-startup")
+_grid_startup.start()
