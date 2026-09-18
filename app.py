@@ -472,7 +472,7 @@ class GridSystem:
                 # ── Breakout: price dropped below lowest grid level ───
                 # Upper breakout (price pumps above center): no action needed —
                 # none of our buy levels were hit, we just recenter higher
-                if mid < grid_lo or mid > grid_hi * 1.5:
+                if mid < grid_lo or mid > grid_hi * 1.02:
                     direction = "UP" if mid > grid_hi else "DOWN"
                     self._syslog(
                         f"BREAKOUT {direction}: price=${mid:.4f} "
@@ -625,10 +625,11 @@ class GridSystem:
                 pass
         return []
 
-    def get_log_tail(self, n=50):
+    def get_log_tail(self, n=None):
         if os.path.exists(self.log_file):
             try:
-                return open(self.log_file).readlines()[-n:]
+                lines = open(self.log_file).readlines()
+                return lines[-n:] if n else lines
             except:
                 pass
         return []
@@ -647,19 +648,62 @@ GRID_SYSTEMS = [G4, G5]
 # ══════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
-def _auth():
-    return request.cookies.get("auth") == APP_PASSWORD
+@app.route("/monitor")
+def monitor():
+    """
+    Public endpoint — no auth required.
+    Returns full state, last 20 fills, and last 100 log lines per system.
+    Claude fetches this directly to monitor live performance.
+    """
+    out = {
+        "status": "ok",
+        "time":   ts(),
+        "systems": {}
+    }
+    for g in GRID_SYSTEMS:
+        with g.lock:
+            s = dict(g.state)
+        try:
+            start = datetime.fromisoformat(s["start_time"])
+            days  = max((datetime.now(timezone.utc) - start).total_seconds() / 86400, 0.01)
+            pd    = round(s["total_pnl"] / days, 2)
+        except:
+            days = 0.0; pd = 0.0
 
-@app.route("/login", methods=["POST"])
-def login():
-    from flask import make_response
-    pw = request.form.get("pw", "")
-    if pw == APP_PASSWORD:
-        r = make_response(redirect("/"))
-        r.set_cookie("auth", APP_PASSWORD, max_age=86400*30,
-                     samesite="Lax", httponly=True)
-        return r
-    return redirect("/")
+        out["systems"][f"S{g.sys_id}"] = {
+            # Core metrics
+            "label":           g.label,
+            "product_id":      g.product_id,
+            "balance":         round(s.get("balance", 0), 4),
+            "total_pnl":       round(s.get("total_pnl", 0), 4),
+            "per_day":         pd,
+            "total_fills":     s.get("total_fills", 0),
+            "total_breakouts": s.get("total_breakouts", 0),
+            "open_buys":       len(s.get("open_buys", {})),
+            "loop_errors":     s.get("loop_errors", 0),
+            # Grid info
+            "last_price":      s.get("last_price"),
+            "grid_center":     s.get("grid_center"),
+            "grid_spacing":    s.get("grid_spacing"),
+            "grid_range":      [
+                s["grid_levels"][-1] if s.get("grid_levels") else None,
+                s["grid_levels"][0]  if s.get("grid_levels") else None,
+            ],
+            "grid_levels_count": len(s.get("grid_levels", [])),
+            # Timing
+            "last_update":     s.get("last_update"),
+            "start_time":      s.get("start_time"),
+            "days_running":    round(days, 2),
+            "candles_1hr":     len(g.price_history_1h),
+            # Weekly/monthly
+            "weekly_pnl":      round(s.get("weekly_pnl", 0), 4),
+            "monthly_pnl":     s.get("monthly_pnl", {}),
+            # Last 20 fills
+            "recent_fills":    g.get_fills(last_n=20),
+            # Last 100 log lines
+            "log_tail":        [l.strip() for l in g.get_log_tail()],
+        }
+    return Response(json.dumps(out, indent=2), mimetype="application/json")
 
 @app.route("/health")
 def health():
@@ -682,48 +726,30 @@ def health():
 
 @app.route("/grid-state-s<int:sid>")
 def grid_state(sid):
-    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
     if not g: return Response("Not found", status=404)
     return Response(json.dumps(g.state, indent=2), mimetype="application/json")
 
 @app.route("/grid-fills-s<int:sid>")
 def grid_fills(sid):
-    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
     if not g: return Response("Not found", status=404)
     return Response(json.dumps(g.get_fills(), indent=2), mimetype="application/json")
 
 @app.route("/grid-candles-s<int:sid>")
 def grid_candles(sid):
-    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
     if not g: return Response("Not found", status=404)
     return Response(json.dumps(g.price_history_1h), mimetype="application/json")
 
 @app.route("/grid-log-s<int:sid>")
 def grid_log(sid):
-    if not _auth(): return Response("Unauthorized", status=401)
     g = next((g for g in GRID_SYSTEMS if g.sys_id == sid), None)
     if not g: return Response("Not found", status=404)
-    return Response("".join(g.get_log_tail(100)), mimetype="text/plain")
+    return Response("".join(g.get_log_tail()), mimetype="text/plain")
 
 # ── Dashboard ──────────────────────────────────────────────────────
-LOGIN_PAGE = """<!DOCTYPE html><html><head><title>AP3X 2.0</title>
-<meta name=viewport content='width=device-width,initial-scale=1'>
-<style>body{background:#060D1A;color:#E0E6F0;font-family:-apple-system,sans-serif;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{text-align:center;padding:40px;background:#0A1628;border:1px solid #1E2D45;border-radius:12px}
-input{background:#060D1A;border:1px solid #1E2D45;color:#E0E6F0;padding:12px;
-border-radius:8px;margin:10px 0;width:200px;font-size:16px;display:block}
-button{background:#00D68F;color:#000;border:none;padding:12px 24px;border-radius:8px;
-cursor:pointer;font-weight:700;font-size:16px;width:200px;margin-top:8px}
-h2{margin-bottom:20px}</style></head>
-<body><form method=post action=/login class=box>
-<h2>AP3X 2.0</h2>
-<input type=password name=pw placeholder='Password' autofocus>
-<button type=submit>Login</button>
-</form></body></html>"""
+
 
 def _sys_card(g):
     with g.lock:
@@ -787,7 +813,7 @@ def _sys_card(g):
         fills_html = "<div style='color:#4A5878;padding:8px;font-size:12px'>No fills yet</div>"
 
     # Log tail
-    log_lines = g.get_log_tail(25)
+    log_lines = g.get_log_tail()
     log_html  = "".join(
         f"<div class=hb-row>{l.strip()}</div>" for l in log_lines
     ) or "<div style='color:#4A5878;padding:8px;font-size:12px'>No log entries yet</div>"
@@ -877,9 +903,6 @@ def _sys_card(g):
 
 @app.route("/")
 def dashboard():
-    if not _auth():
-        return LOGIN_PAGE
-
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # Compare both systems
